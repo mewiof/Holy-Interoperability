@@ -95,9 +95,14 @@ bool decode(const uint8_t* code, size_t size, uint32_t pc, Instruction* out) {
     inst.words = 2;
     inst.op = (w >> 16) & 0x7F;
     inst.dst = w & 0xFF;
+    inst.neg_hi = (w >> 8) & 0x7;
+    inst.opsel = (w >> 11) & 0x7;
+    inst.opsel_hi = static_cast<uint8_t>(((w1 >> 27) & 0x3) | (((w >> 14) & 1) << 2));
+    inst.clamp = (w >> 15) & 1;
     inst.src[0] = w1 & 0x1FF;
     inst.src[1] = (w1 >> 9) & 0x1FF;
     inst.src[2] = (w1 >> 18) & 0x1FF;
+    inst.neg = (w1 >> 29) & 0x7;
     if (uses_literal(inst, 3)) inst.words = 3;
   } else if (top6 == 0x32) {  // VINTRP
     inst.encoding = Encoding::VINTRP;

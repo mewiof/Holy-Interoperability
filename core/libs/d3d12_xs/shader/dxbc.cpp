@@ -17,6 +17,7 @@ constexpr uint32_t kExtended = 1u << 31;
 
 constexpr uint32_t type_bits(uint32_t type) { return type << 12; }
 constexpr uint32_t dimension(uint32_t count) { return count << 20; }
+constexpr uint32_t dimension_bits(uint32_t count) { return count << 20; }
 // Representation of index n: 0 immediate, 2 relative.
 constexpr uint32_t relative_index(uint32_t n) { return 2u << (22 + 3 * n); }
 
@@ -88,6 +89,36 @@ Operand uav(uint32_t id, uint32_t index, Access access) {
 Operand srv_xyzw(uint32_t id, uint32_t index) {
   return {swizzle_xxxx() | (0xE4u << 4) | type_bits(kResource) | dimension(2), id, index};
 }
+Operand temp_dst_mask(uint32_t index, uint32_t mask) {
+  return {kFourComponents | kMaskMode | (mask << 4) | type_bits(kTemp) | dimension(1), index};
+}
+Operand temp_xyzw(uint32_t index) {
+  return {kFourComponents | kSwizzleMode | (0xE4u << 4) | type_bits(kTemp) | dimension(1), index};
+}
+
+namespace {
+Operand indexed(uint32_t type, uint32_t components, uint32_t id, uint32_t temp_index) {
+  Operand out{kExtended | components | type_bits(type) | dimension(2) | relative_index(1),
+              1u | (1u << 17),  // modifier token: non-uniform index
+              id};
+  const Operand rel = temp(temp_index);
+  out.insert(out.end(), rel.begin(), rel.end());
+  return out;
+}
+}  // namespace
+
+Operand texture_indexed(uint32_t id, uint32_t temp_index) {
+  return indexed(kResource, swizzle_xxxx() | (0xE4u << 4), id, temp_index);
+}
+Operand typed_uav_indexed(uint32_t id, uint32_t temp_index, bool store) {
+  return indexed(kUav, store ? (kFourComponents | kMaskMode | (0xFu << 4)) : (swizzle_xxxx() | (0xE4u << 4)), id,
+                 temp_index);
+}
+Operand sampler_indexed(uint32_t id, uint32_t temp_index) { return indexed(kSampler, 0, id, temp_index); }
+Operand sampler_indexed_select(uint32_t id, uint32_t temp_index, uint32_t component) {
+  return indexed(kSampler, select(component), id, temp_index);
+}
+
 Operand group_shared(uint32_t id, Access access) {
   uint32_t components = access == Access::Load ? swizzle_xxxx() : access == Access::Store ? mask_x() : 0u;
   return {components | type_bits(kGroupShared) | dimension(1), id};
@@ -120,6 +151,24 @@ void Program::dcl_resource_raw_range(uint32_t id, uint32_t first, uint32_t last,
   tokens_.push_back(kDclResourceRaw | (6u << 24));
   tokens_.insert(tokens_.end(),
                  {swizzle_xxxx() | (0xE4u << 4) | type_bits(kResource) | dimension(3), id, first, last, space});
+}
+
+void Program::dcl_texture_range(uint32_t id, ResourceDimension dimension, uint32_t space) {
+  tokens_.push_back(kDclResource | (static_cast<uint32_t>(dimension) << 11) | (7u << 24));
+  tokens_.insert(tokens_.end(), {swizzle_xxxx() | (0xE4u << 4) | type_bits(kResource) | dimension_bits(3), id, 0u,
+                                 0xFFFFFFFFu, 0x5555u, space});
+}
+
+void Program::dcl_typed_uav_range(uint32_t id, ResourceDimension dimension, uint32_t space) {
+  tokens_.push_back(kDclUavTyped | (static_cast<uint32_t>(dimension) << 11) | (7u << 24));
+  tokens_.insert(tokens_.end(), {swizzle_xxxx() | (0xE4u << 4) | type_bits(kUav) | dimension_bits(3), id, 0u,
+                                 0xFFFFFFFFu, 0x5555u, space});
+}
+
+void Program::dcl_sampler_range(uint32_t id, uint32_t space) {
+  tokens_.push_back(kDclSampler | (6u << 24));
+  tokens_.insert(tokens_.end(), {swizzle_xxxx() | (0xE4u << 4) | type_bits(kSampler) | dimension_bits(3), id, 0u,
+                                 0xFFFFFFFFu, space});
 }
 
 void Program::dcl_input(OperandType type, uint32_t mask) {

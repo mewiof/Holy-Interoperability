@@ -17,6 +17,8 @@ namespace holy::d3d12::dxbc {
 
 enum Opcode : uint32_t {
   kAdd = 0, kAnd = 1, kBreak = 2, kBreakc = 3, kCase = 6, kDefault = 10, kDiv = 14, kElse = 18, kEndif = 21,
+  kLd = 45, kResinfo = 61, kGather4 = 109, kGather4C = 126, kGather4Po = 127, kGather4PoC = 128, kSample = 69, kSampleC = 70, kSampleCLz = 71, kSampleL = 72, kSampleB = 74,
+  kLdUavTyped = 163, kStoreUavTyped = 164, kDclResource = 88, kDclSampler = 90, kDclUavTyped = 156,
   kEndloop = 22, kEndswitch = 23, kEq = 24, kExp = 25, kFrc = 26, kFtoi = 27, kFtou = 28, kGe = 29, kIadd = 30,
   kIf = 31, kIeq = 32, kIge = 33, kIlt = 34, kImad = 35, kImax = 36, kImin = 37, kImul = 38, kIne = 39,
   kIneg = 40, kIshl = 41, kIshr = 42, kItof = 43, kLog = 47, kLoop = 48, kLt = 49, kMad = 50, kMin = 51,
@@ -44,8 +46,8 @@ inline constexpr uint32_t kSyncUavGlobal = 1u << 14;
 
 // Operand types.
 enum OperandType : uint32_t {
-  kTemp = 0, kInput = 1, kOutput = 2, kImmediate32 = 4, kResource = 7, kConstantBuffer = 8, kOutputDepth = 12,
-  kNull = 13,
+  kTemp = 0, kInput = 1, kOutput = 2, kImmediate32 = 4, kSampler = 6, kResource = 7, kConstantBuffer = 8,
+  kOutputDepth = 12, kNull = 13,
   kUav = 30, kGroupShared = 31,
   kThreadId = 32, kThreadGroupId = 33, kThreadIdInGroup = 34, kThreadIdInGroupFlattened = 36,
 };
@@ -96,6 +98,21 @@ Operand group_shared(uint32_t id, Access access);
 Operand uav(uint32_t id, uint32_t index, Access access);
 Operand srv_xyzw(uint32_t id, uint32_t index);
 
+// rN with a write mask, and rN.xyzw as a four-component source.
+Operand temp_dst_mask(uint32_t index, uint32_t mask);
+Operand temp_xyzw(uint32_t index);
+// Tn[temp.x], Un[temp.x] (typed, .xyzw) and Sn[temp.x], all non-uniform.
+Operand texture_indexed(uint32_t id, uint32_t temp_index);
+Operand typed_uav_indexed(uint32_t id, uint32_t temp_index, bool store);
+Operand sampler_indexed(uint32_t id, uint32_t temp_index);
+// Sn[temp.x].c: the sampler of a gather, selecting the gathered component.
+Operand sampler_indexed_select(uint32_t id, uint32_t temp_index, uint32_t component);
+
+// Resource dimensions of declarations.
+enum ResourceDimension : uint32_t {
+  kTexture1D = 2, kTexture2D = 3, kTexture3D = 5, kTextureCube = 6, kTexture1DArray = 7, kTexture2DArray = 8,
+};
+
 class Program {
  public:
   // Version 5.1 of the given program type.
@@ -108,6 +125,10 @@ class Program {
   void dcl_constant_buffer(uint32_t id, uint32_t space, uint32_t vectors, bool dynamic);
   void dcl_uav_raw_range(uint32_t id, uint32_t first, uint32_t last, uint32_t space);
   void dcl_resource_raw_range(uint32_t id, uint32_t first, uint32_t last, uint32_t space);
+  // Float textures and typed UAVs of a dimension, and samplers, at [0, unbounded).
+  void dcl_texture_range(uint32_t id, ResourceDimension dimension, uint32_t space);
+  void dcl_typed_uav_range(uint32_t id, ResourceDimension dimension, uint32_t space);
+  void dcl_sampler_range(uint32_t id, uint32_t space);
   void dcl_input(OperandType type, uint32_t mask);
   void dcl_temps(uint32_t count);
   void dcl_tgsm_raw(uint32_t id, uint32_t bytes);

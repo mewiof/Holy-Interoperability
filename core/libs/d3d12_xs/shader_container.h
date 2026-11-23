@@ -3,7 +3,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
+
+#include "core/libs/d3d12_xs/shader/translate.h"
 
 namespace holy::d3d12 {
 
@@ -32,5 +35,45 @@ bool native_compute_program(const void* blob, size_t size, NativeComputeProgram*
 
 // The documented DXBC container checksum of `container` (written to digest).
 void dxbc_checksum(const uint8_t* container, size_t size, uint8_t digest[16]);
+
+// The compute registers of a pipeline created from native code (device slot
+// 67): dword 3 the thread group width | height << 16, dword 4 its depth,
+// dword 6 COMPUTE_PGM_RSRC2 (user SGPR count, group id and group information
+// enables, LDS size).
+// Observed layout; the RSRC2 fields follow the public RDNA register layout.
+inline constexpr size_t kNativeComputeRegisterBytes = 28;
+bool native_compute_registers(const uint32_t* registers, size_t size, ComputeShaderInfo* info, std::string* error);
+
+// A graphics pipeline created from native code (device slot 57). Observed
+// description: the root signature, then (pointer, size) pairs until a null
+// pointer: a block of render state registers, a pipeline block, and a
+// (code, metadata) quadruple (code, code size, metadata, metadata size) per
+// stage, in no fixed stage order. The stage is told by the code
+// (native_graphics_stage). Metadata: dword 1 its size less 12, dword 3 high
+// half the number of 32-byte records of kind 0x41 that follow.
+//
+// Render state block (dword offsets), whose values follow the public RDNA
+// register layouts: 0x1E CB_TARGET_MASK, 0x28 PA_SU_SC_MODE_CNTL, 0x34-0x3B
+// CB_BLEND0-7_CONTROL. Pipeline block: dword 3 the render target count,
+// bytes 16-23 one DXGI format per render target, dword 6 zero in every
+// pipeline seen (assumed: the depth format), 7 the sample mask, 9 byte 2 the
+// primitive topology type, 10 the sample count.
+struct NativeGraphicsDescription {
+  const uint8_t* vertex_code = nullptr;
+  size_t vertex_size = 0;
+  const uint8_t* pixel_code = nullptr;
+  size_t pixel_size = 0;
+  uint32_t render_targets = 0;
+  uint32_t formats[8] = {};
+  uint32_t sample_mask = 0;
+  uint32_t sample_count = 1;
+  uint32_t topology_type = 0;
+  uint32_t target_mask = 0;
+  uint32_t mode_control = 0;
+  uint32_t blend[8] = {};
+};
+inline constexpr size_t kNativeRenderStateBytes = 0x18C;
+inline constexpr size_t kNativePipelineBlockBytes = 0x30;
+bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription* out, std::string* error);
 
 }  // namespace holy::d3d12

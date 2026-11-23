@@ -39,6 +39,9 @@ constexpr uint32_t kOutputRegisters = 35;
 constexpr uint32_t kDepthRegister = 34;
 constexpr uint32_t kNoRegister = 0xFFFFFFFFu;
 constexpr uint32_t kEndBlock = 0xFFFFFFFFu;  // "next block" once the program has ended
+// Operand code standing for the value another lane exchanged (cross-lane
+// operations); outside the 9-bit operand range.
+constexpr uint16_t kExchangeOperand = 0x200;
 constexpr uint32_t kNoView = 0xFFFFFFFFu;
 
 Operand R(uint32_t r) { return dxbc::temp(r); }
@@ -167,6 +170,7 @@ class Translator {
 
   // 32-bit source.
   Operand src(const Instruction& inst, uint16_t code) {
+    if (code == kExchangeOperand) return R(exchange_reg_);
     if (code <= 105) return R(code);
     if (code >= rdna::kVgpr0) return R(vreg(code - rdna::kVgpr0));
     switch (code) {
@@ -428,8 +432,18 @@ class Translator {
   bool emit_vector(const Instruction& inst);
   bool emit_flat(const Instruction& inst);
   bool emit_mubuf(const Instruction& inst);
+  bool typed_load(uint32_t fmt, uint32_t components, uint32_t view, uint32_t at, uint32_t data);
   bool emit_ds(const Instruction& inst);
   bool emit_export(const Instruction& inst);
+  bool emit_image(const Instruction& inst);
+  bool emit_vop3p(const Instruction& inst);
+  // Cross-lane operations (compute programs): each lane stores the source
+  // value and its EXEC bit in group shared memory; after a group barrier the
+  // continuation reads the source lane's.
+  static bool cross_lane(const Instruction& inst);
+  static bool read_first_lane(const Instruction& inst);
+  void exchange_write(const Instruction& inst);
+  bool exchange_read(const Instruction& inst);
   bool emit_interp(const Instruction& inst);
   // Ends the program: the dispatcher leaves its loop (a single structured
   // exit; host drivers have refused programs that return from inside it).
@@ -466,6 +480,12 @@ class Translator {
   Stage stage_ = Stage::Compute;
   ShaderInterface iface_;
   uint8_t written_[kOutputRegisters] = {};  // components exported per output register
+  uint32_t exchange_reg_ = 0;    // temp holding the exchanged value while an instruction is emitted
+  bool exchange_ = false;        // the exchange area is used
+  uint32_t exchange_parity_ = 0; // which of the two exchange buffers the next exchange uses
+  uint32_t textures_used_ = 0;  // ImageSlot bits
+  uint32_t uavs_used_ = 0;
+  bool samplers_used_ = false;
 };
 
 bool Translator::emit_sop2(const Instruction& inst) {
@@ -706,6 +726,26 @@ bool Translator::emit_sop1(const Instruction& inst) {
       set_s64(d, r0, r1);
       return true;
     }
+    case 9: case 10: {
+      // s_wqm_b32/b64: every group of four bits with any bit set becomes 0xF.
+      auto quads = [&](const Operand& v) {
+        const Operand x = copy(v);
+        const Operand any = band(bor(bor(x, shr(x, I(1))), bor(shr(x, I(2)), shr(x, I(3)))), I(0x11111111u));
+        return mul_lo(any, I(15));
+      };
+      if (inst.op == 9) {
+        const Operand r = quads(a);
+        scc_nonzero(r);
+        set_s(d, r);
+        return true;
+      }
+      Operand lo, hi;
+      src64(inst, inst.src[0], &lo, &hi);
+      const Operand r0 = copy(quads(lo)), r1 = copy(quads(hi));
+      scc_nonzero(bor(r0, r1));
+      set_s64(d, r0, r1);
+      return true;
+    }
     case 11: set_s(d, op1(dx::kBfrev, a)); return true;
     case 15: { const Operand r = op1(dx::kCountbits, a); scc_nonzero(r); set_s(d, r); return true; }
     case 19: set_s(d, op1(dx::kFirstbitLo, a)); return true;
@@ -780,7 +820,7 @@ bool Translator::emit_smem(const Instruction& inst) {
   const uint16_t base = inst.src[0];
   // Offset: immediate plus an SGPR unless the field names null.
   Operand offset = I(static_cast<uint32_t>(inst.imm));
-  if (inst.src[1] != rdna::kM0 && inst.src[1] != rdna::kNull) offset = add(offset, src(inst, inst.src[1]));
+  if (inst.src[1] != rdna::kNull) offset = add(offset, src(inst, inst.src[1]));
   if (inst.op <= 4) {
     const int count = kCounts[inst.op];
     auto [lo, hi] = add64(R(base), band(R(base + 1u), I(0xFFFF)), offset, true);
@@ -815,7 +855,7 @@ bool Translator::emit_smem(const Instruction& inst) {
 bool Translator::emit_flat(const Instruction& inst) {
   // Address: 64-bit VGPR pair, or SGPR pair base plus 32-bit VGPR offset.
   const uint16_t vaddr = inst.src[0];
-  const bool saddr = inst.src[2] != 0x7D && inst.src[2] != rdna::kNull;
+  const bool saddr = inst.src[2] != rdna::kNull;
   use_vgpr(vaddr, saddr ? 1 : 2);
   const uint32_t data = inst.src[1] - rdna::kVgpr0;
   const uint32_t dst = inst.dst;
@@ -877,12 +917,101 @@ bool Translator::emit_flat(const Instruction& inst) {
   return ok;
 }
 
+// RDNA 2 unified buffer formats (public instruction set reference): the
+// component widths, low bits first, and the numeric type. Names in the
+// reference list components high bits first ("10_11_11" is x 11, y 11, z 10).
+namespace {
+enum class Numeric : uint8_t { Unorm, Snorm, Uscaled, Sscaled, Uint, Sint, Float };
+struct BufferFormat {
+  uint8_t bits[4];  // 0: component absent
+};
+// Formats 1-77 come in groups sharing a layout; the numeric type follows
+// the order unorm, snorm, uscaled, sscaled, uint, sint, float within a group.
+bool buffer_format(uint32_t fmt, BufferFormat* layout, Numeric* numeric) {
+  struct Group {
+    uint8_t first, count;
+    uint8_t bits[4];
+    const Numeric* types;
+  };
+  static const Numeric kAll[] = {Numeric::Unorm, Numeric::Snorm, Numeric::Uscaled, Numeric::Sscaled,
+                                 Numeric::Uint,  Numeric::Sint,  Numeric::Float};
+  static const Numeric kInt[] = {Numeric::Unorm, Numeric::Snorm, Numeric::Uscaled,
+                                 Numeric::Sscaled, Numeric::Uint, Numeric::Sint};
+  static const Numeric kWide[] = {Numeric::Uint, Numeric::Sint, Numeric::Float};
+  static const Group kGroups[] = {
+      {1, 6, {8, 0, 0, 0}, kInt},           {7, 7, {16, 0, 0, 0}, kAll},
+      {14, 6, {8, 8, 0, 0}, kInt},          {20, 3, {32, 0, 0, 0}, kWide},
+      {23, 7, {16, 16, 0, 0}, kAll},        {30, 7, {11, 11, 10, 0}, kAll},
+      {37, 7, {10, 11, 11, 0}, kAll},       {44, 6, {2, 10, 10, 10}, kInt},
+      {50, 6, {10, 10, 10, 2}, kInt},       {56, 6, {8, 8, 8, 8}, kInt},
+      {62, 3, {32, 32, 0, 0}, kWide},       {65, 7, {16, 16, 16, 16}, kAll},
+      {72, 3, {32, 32, 32, 0}, kWide},      {75, 3, {32, 32, 32, 32}, kWide},
+  };
+  for (const Group& g : kGroups) {
+    if (fmt >= g.first && fmt < g.first + g.count) {
+      for (int i = 0; i < 4; ++i) layout->bits[i] = g.bits[i];
+      *numeric = g.types[fmt - g.first];
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+
+bool Translator::typed_load(uint32_t fmt, uint32_t components, uint32_t view, uint32_t at, uint32_t data) {
+  BufferFormat layout;
+  Numeric numeric;
+  if (!buffer_format(fmt, &layout, &numeric)) return fail(format("typed buffer format %u", fmt));
+  const bool integer = numeric == Numeric::Uint || numeric == Numeric::Sint;
+  uint32_t bit = 0;
+  for (uint32_t c = 0; c < components; ++c) {
+    const uint32_t width = layout.bits[c];
+    const uint32_t dest = vreg(data + c);
+    const uint32_t mark = scratch_;
+    if (width == 0) {
+      // Absent components read as 0, and w as one.
+      put(dest, c == 3 ? (integer ? I(1) : dxbc::immf(1.0f)) : I(0));
+      continue;
+    }
+    const Operand word = read(view, add(R(at), I((bit / 32) * 4)));
+    const uint32_t shift = bit % 32;
+    Operand v = width == 32 ? word : ubfe(I(width), I(shift), word);
+    const bool sign = numeric == Numeric::Snorm || numeric == Numeric::Sscaled || numeric == Numeric::Sint;
+    if (sign && width < 32) v = ibfe(I(width), I(shift), word);
+    switch (numeric) {
+      case Numeric::Uint: case Numeric::Sint: break;
+      case Numeric::Unorm:
+        v = op2(dx::kMul, op1(dx::kUtof, v), dxbc::immf(1.0f / static_cast<float>((1ull << width) - 1)));
+        break;
+      case Numeric::Snorm:
+        v = op2(dx::kMax, op2(dx::kMul, op1(dx::kItof, v), dxbc::immf(1.0f / static_cast<float>((1ull << (width - 1)) - 1))),
+                dxbc::immf(-1.0f));
+        break;
+      case Numeric::Uscaled: v = op1(dx::kUtof, v); break;
+      case Numeric::Sscaled: v = op1(dx::kItof, v); break;
+      case Numeric::Float:
+        if (width == 16) {
+          v = op1(dx::kF16tof32, v);
+        } else if (width == 11 || width == 10) {
+          // Unsigned small floats: 5-bit exponent and 6 or 5 mantissa bits,
+          // the half-float layout without sign and with fewer mantissa bits.
+          v = op1(dx::kF16tof32, shl(v, I(width == 11 ? 4 : 5)));
+        }
+        break;
+    }
+    put(dest, v);
+    scratch_ = mark;
+    bit += width;
+  }
+  return true;
+}
+
 bool Translator::emit_mubuf(const Instruction& inst) {
   const uint32_t r = inst.src[2];
   const uint32_t vaddr = inst.src[0] - rdna::kVgpr0;
   const uint32_t data = inst.src[1] - rdna::kVgpr0;
   Operand offset = I(static_cast<uint32_t>(inst.imm));
-  if (inst.src[3] != rdna::kNull && inst.src[3] != rdna::kM0 && inst.src[3] != 0x80) {
+  if (inst.src[3] != rdna::kNull && inst.src[3] != 0x80) {
     offset = add(offset, src(inst, inst.src[3]));
   }
   Operand index = I(0);
@@ -918,27 +1047,13 @@ bool Translator::emit_mubuf(const Instruction& inst) {
   };
   bool ok = true;
   if (inst.encoding == Encoding::MTBUF) {
-    // Typed loads: element format from the instruction (RDNA2 buffer format
-    // numbers: 1 8_UNORM, 5 8_UINT, 7 16_UNORM, 11 16_UINT, 13 16_FLOAT,
-    // 20 32_UINT, 21 32_SINT, 22 32_FLOAT; component count from the opcode).
+    // Typed loads: element format from the instruction, component count
+    // from the opcode.
     const uint32_t components = (inst.op & 3) + 1;
-    const uint32_t fmt = inst.ext;
     if (inst.op >= 4) {
       ok = fail("typed buffer store");
-    } else if (fmt == 20 || fmt == 21 || fmt == 22) {
-      load(static_cast<int>(components));
-    } else if (components != 1) {
-      ok = fail(format("typed buffer format %u with %u components", fmt, components));
     } else {
-      const Operand word = read(view, R(at));
-      switch (fmt) {
-        case 5: put(vreg(data), band(word, I(0xFF))); break;
-        case 1: put(vreg(data), op2(dx::kMul, op1(dx::kUtof, band(word, I(0xFF))), dxbc::immf(1.0f / 255.0f))); break;
-        case 11: put(vreg(data), band(word, I(0xFFFF))); break;
-        case 7: put(vreg(data), op2(dx::kMul, op1(dx::kUtof, band(word, I(0xFFFF))), dxbc::immf(1.0f / 65535.0f))); break;
-        case 13: put(vreg(data), op1(dx::kF16tof32, word)); break;
-        default: ok = fail(format("typed buffer format %u", fmt)); break;
-      }
+      ok = typed_load(inst.ext, components, view, at, data);
     }
     end_if();
     return ok;
@@ -1040,7 +1155,7 @@ bool Translator::emit_ds(const Instruction& inst) {
 
 bool Translator::emit_vector(const Instruction& inst) {
   if (inst.src[0] == rdna::kDpp16 || inst.src[0] == rdna::kDpp8 || inst.src[0] == rdna::kDpp8Fi) {
-    return fail("cross-lane operand (DPP)");
+    return fail("cross-lane operand (DPP) outside a compute program");
   }
   const bool sdwa = inst.src[0] == rdna::kSdwa;
   Instruction work = inst;
@@ -1106,7 +1221,7 @@ bool Translator::emit_vector(const Instruction& inst) {
     const uint16_t base = op & 0xF0;
     const int index = op & 0xF;
     bool exec_write = false;
-    auto icmp = [&](bool is_signed) {
+    auto icmp_of = [&](bool is_signed, const Operand& a, const Operand& b, int index) {
       const uint32_t lt = is_signed ? dx::kIlt : dx::kUlt;
       const uint32_t ge = is_signed ? dx::kIge : dx::kUge;
       switch (index) {
@@ -1119,6 +1234,21 @@ bool Translator::emit_vector(const Instruction& inst) {
         case 6: return op2(ge, a, b);
         default: return I(0xFFFFFFFFu);
       }
+    };
+    auto icmp = [&](bool is_signed) { return icmp_of(is_signed, a, b, index); };
+    // Class test: the class bit of a float with `ebits` exponent and `mbits`
+    // mantissa bits (in the low bits of u) selected in the mask b.
+    auto class_test = [&](const Operand& u, uint32_t ebits, uint32_t mbits) {
+      const uint32_t emax = (1u << ebits) - 1;
+      const Operand sign = nonzero(ubfe(I(1), I(ebits + mbits), u));
+      const Operand e = ubfe(I(ebits), I(mbits), u);
+      const Operand m = band(u, I((1u << mbits) - 1));
+      const Operand m_zero = eq(m, I(0));
+      const Operand e0 = select(m_zero, select(sign, I(5), I(6)), select(sign, I(4), I(7)));
+      const Operand emaxed =
+          select(m_zero, select(sign, I(2), I(9)), select(band(m, I(1u << (mbits - 1))), I(1), I(0)));
+      const Operand bit = select(eq(e, I(0)), e0, select(eq(e, I(emax)), emaxed, select(sign, I(3), I(8))));
+      return nonzero(band(shr(b, bit), I(1)));
     };
     if (op < 0x20) {
       exec_write = op >= 0x10;
@@ -1151,17 +1281,13 @@ bool Translator::emit_vector(const Instruction& inst) {
         cond = icmp(true);
       } else if (index == 8) {
         // v_cmp_class_f32: class bit of src0 selected in the src1 mask.
-        const Operand u = in_temp(f(0));
-        const Operand sign = nonzero(shr(u, I(31)));
-        const Operand e = ubfe(I(8), I(23), u);
-        const Operand m = band(u, I(0x7FFFFF));
-        const Operand m_zero = eq(m, I(0));
-        const Operand e0 = select(m_zero, select(sign, I(5), I(6)), select(sign, I(4), I(7)));
-        const Operand e255 = select(m_zero, select(sign, I(2), I(9)), select(band(m, I(0x400000)), I(1), I(0)));
-        const Operand bit = select(eq(e, I(0)), e0, select(eq(e, I(255)), e255, select(sign, I(3), I(8))));
-        cond = nonzero(band(shr(b, bit), I(1)));
+        cond = class_test(in_temp(f(0)), 8, 23);
+      } else if (index == 15) {
+        // v_cmp_class_f16, on the low half of src0.
+        cond = class_test(band(a, I(0xFFFF)), 5, 10);
       } else {
-        return fail(format("VOPC op 0x%x", op));
+        // 9-14: signed 16-bit compares (lt, eq, le, gt, ne, ge) of the low halves.
+        cond = icmp_of(true, ibfe(I(16), I(0), a), ibfe(I(16), I(0), b), index - 8);
       }
     } else if (base == 0xC0 || base == 0xD0) {
       exec_write = base == 0xD0;
@@ -1266,7 +1392,9 @@ bool Translator::emit_vector(const Instruction& inst) {
       case 0: return true;
       case 1: return set(a);
       case 2:
-        // Assumed uniform: the lane's own value (exact when all lanes agree).
+        // Graphics stages (compute programs read the first active lane
+        // through an exchange): assumed uniform, the lane's own value (exact
+        // when all lanes agree).
         set_s(inst.dst, a);
         return true;
       case 5: return setf(op1(dx::kItof, a));
@@ -1309,6 +1437,14 @@ bool Translator::emit_vector(const Instruction& inst) {
         const Operand u = in_temp(f(0));
         const Operand m = bor(band(u, I(0x807FFFFFu)), I(0x3F000000u));
         return setf(select(op2(dx::kEq, u, dxbc::immf(0.0f)), dxbc::immf(0.0f), m));
+      }
+      case 101: {
+        // v_swap_b32: vdst and the VGPR src0 exchange values.
+        if (work.src[0] < rdna::kVgpr0) return fail("v_swap_b32 with a scalar operand");
+        const uint32_t other = vreg(work.src[0]);
+        const Operand old = copy(dval);
+        put(other, select(on, old, R(other)));
+        return set(a);
       }
       default: return fail(format("VOP1 op %u", op));
     }
@@ -1397,6 +1533,12 @@ bool Translator::emit_vector(const Instruction& inst) {
     case 0x362: return setf(fmul(f(0), op1(dx::kExp, op1(dx::kItof, b))));
     case 0x363: return set(shl(add(shl(I(1), a), I(0xFFFFFFFFu)), b));
     case 0x364: return set(add(op1(dx::kCountbits, a), b));
+    case 0x361: {
+      // v_writelane_b32: the lane named by src1 gets src0, whatever EXEC says.
+      const Operand lane = band(b, I(info_.wave_size - 1));
+      put(dreg, select(eq(R(kLaneR), lane), a, dval));
+      return true;
+    }
     case 0x365: case 0x366:
       // Only the lane-index idiom (full mask) is expressible per lane.
       if (work.src[0] != 193) return fail("v_mbcnt with a lane mask");
@@ -1461,6 +1603,343 @@ bool Translator::emit_export(const Instruction& inst) {
   return fail(format("pixel export target %u", target));
 }
 
+// Image instructions. Descriptor registers: the resource index is dword 0
+// of the image descriptor (s[srsrc]), the sampler index dword 0 of the
+// sampler descriptor (s[ssamp]). Address registers in the hardware order:
+// bias or depth reference first, then the coordinates, then the LOD.
+bool Translator::emit_image(const Instruction& inst) {
+  const uint32_t op = inst.op;
+  if ((inst.raw[1] >> 31) & 1) return fail("16-bit image data");
+  const uint32_t nsa = (inst.raw[0] >> 1) & 3;
+  if (nsa > 1) return fail("image address list longer than five registers");
+  struct Dim {
+    uint32_t coords;
+    uint32_t slot;
+  };
+  static const Dim kDims[8] = {{1, kImage1D}, {2, kImage2D}, {3, kImage3D}, {3, 0xFF}, {2, kImage1DArray},
+                               {3, kImage2DArray}, {3, 0xFF}, {4, 0xFF}};
+  const Dim dim = kDims[inst.dim & 7];
+  if (dim.slot == 0xFF) return fail(format("image dimension %u (cube or multisampled)", inst.dim));
+  auto address = [&](uint32_t i) {
+    if (i == 0 || !nsa) return R(vreg(inst.src[0] - rdna::kVgpr0 + i));
+    return R(vreg((inst.ext >> (8 * (i - 1))) & 0xFF));
+  };
+  const uint32_t data = inst.src[1] - rdna::kVgpr0;
+  const Operand index = copy(R(inst.src[2]));
+  const uint32_t index_reg = kScratch + scratch_ - 1;
+  // A temp holding the address components packed (coordinates, then extra).
+  auto pack = [&](uint32_t first, uint32_t count, const Operand* extra) {
+    const uint32_t t = fresh();
+    for (uint32_t c = 0; c < count; ++c) emit(dx::kMov, {dxbc::temp_dst_mask(t, 1u << c), address(first + c)});
+    if (extra) emit(dx::kMov, {dxbc::temp_dst_mask(t, 1u << count), *extra});
+    for (uint32_t c = count + (extra ? 1 : 0); c < 4; ++c) emit(dx::kMov, {dxbc::temp_dst_mask(t, 1u << c), I(0)});
+    return t;
+  };
+  auto results = [&](uint32_t result) {
+    uint32_t k = 0;
+    for (uint32_t c = 0; c < 4; ++c) {
+      if (!(inst.dmask & (1u << c))) continue;
+      const uint32_t d = vreg(data + k++);
+      put(d, select(active(), dxbc::temp(result, c), R(d)));
+    }
+  };
+  const uint32_t texture_id = 10 + dim.slot, uav_id = 2 + dim.slot;
+  if (op != 8 && op != 9) textures_used_ |= 1u << dim.slot;
+  switch (op) {
+    case 0: case 1: {  // image_load, image_load_mip: integer coordinates (+ mip)
+      const Operand mip = op == 1 ? address(dim.coords) : I(0);
+      const uint32_t coords = pack(0, dim.coords, &mip);
+      const uint32_t result = fresh();
+      emit(dx::kLd, {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg)});
+      results(result);
+      return true;
+    }
+    case 8: case 9: {  // image_store, image_store_mip
+      uavs_used_ |= 1u << dim.slot;
+      if (op == 9) {
+        // The view selects the mip level; only level 0 of it is expressible.
+        if_nz(ne(address(dim.coords), I(0)));
+        emit(dx::kMov, {D(index_reg), I(0xFFFFFFFFu)});  // out of the heap: the store is dropped
+        end_if();
+      }
+      const uint32_t coords = pack(0, dim.coords, nullptr);
+      const uint32_t value = fresh();
+      uint32_t k = 0;
+      for (uint32_t c = 0; c < 4; ++c) {
+        const Operand v = (inst.dmask & (1u << c)) ? R(vreg(data + k++)) : I(0);
+        emit(dx::kMov, {dxbc::temp_dst_mask(value, 1u << c), v});
+      }
+      if_nz(active());
+      emit(dx::kStoreUavTyped,
+           {dxbc::typed_uav_indexed(uav_id, index_reg, true), dxbc::temp_xyzw(coords), dxbc::temp_xyzw(value)});
+      end_if();
+      return true;
+    }
+    case 14: {  // image_get_resinfo: width, height, depth or layers, mip levels of the given level
+      const uint32_t result = fresh();
+      emit(dx::kResinfo, {D(result), address(0), dxbc::texture_indexed(texture_id, index_reg)}, 2u << 11);
+      // resinfo_uint gives width, height, depth/elements, levels.
+      uint32_t k = 0;
+      for (uint32_t c = 0; c < 4; ++c) {
+        if (!(inst.dmask & (1u << c))) continue;
+        const uint32_t d = vreg(data + k++);
+        put(d, select(active(), dxbc::temp(result, c), R(d)));
+      }
+      return true;
+    }
+    default: break;
+  }
+  // Sampling (loads and stores take integer coordinates whatever the
+  // unnormalised bit says).
+  if ((inst.raw[0] >> 12) & 1) return fail("unnormalised image coordinates");
+  samplers_used_ = true;
+  const Operand sampler_index = copy(R(inst.src[3]));
+  const uint32_t sampler_reg = kScratch + scratch_ - 1;
+  const bool pixel = stage_ == Stage::Pixel;
+  // Gathers (level 0 whatever the variant asks, as on the desktop): the
+  // offsets (6-bit signed x in bits 0-5, y in bits 8-13), then the depth
+  // reference, then the coordinates; dmask names the gathered component.
+  const bool gather = op == 64 || op == 71 || op == 72 || op == 79 || op == 80 || op == 87 || op == 88 || op == 95;
+  if (gather) {
+    const bool offsets = op >= 80;
+    const bool compare = op == 72 || op == 79 || op == 88 || op == 95;
+    uint32_t component = 0;
+    while (component < 4 && !(inst.dmask & (1u << component))) ++component;
+    if (component == 4 || (inst.dmask & ~(1u << component))) return fail("gather of several components");
+    const uint32_t at = (offsets ? 1 : 0) + (compare ? 1 : 0);
+    const uint32_t coords = pack(at, dim.coords, nullptr);
+    const uint32_t result = fresh();
+    std::vector<Operand> operands = {D(result), dxbc::temp_xyzw(coords)};
+    if (offsets) {
+      const uint32_t offset = fresh();
+      emit(dx::kIbfe, {dxbc::temp_dst_mask(offset, 1), I(6), I(0), address(0)});
+      emit(dx::kIbfe, {dxbc::temp_dst_mask(offset, 2), I(6), I(8), address(0)});
+      emit(dx::kMov, {dxbc::temp_dst_mask(offset, 0xC), I(0)});
+      operands.push_back(dxbc::temp_xyzw(offset));
+    }
+    operands.push_back(dxbc::texture_indexed(texture_id, index_reg));
+    operands.push_back(dxbc::sampler_indexed_select(0, sampler_reg, component));
+    if (compare) operands.push_back(address(offsets ? 1 : 0));
+    const uint32_t opcode = offsets ? (compare ? dx::kGather4PoC : dx::kGather4Po) : (compare ? dx::kGather4C : dx::kGather4);
+    emit(opcode, operands);
+    // All four gathered texels come back, in registers data .. data + 3.
+    for (uint32_t c = 0; c < 4; ++c) {
+      const uint32_t d = vreg(data + c);
+      put(d, select(active(), dxbc::temp(result, c), R(d)));
+    }
+    return true;
+  }
+  uint32_t first = 0;
+  Operand extra = I(0);
+  uint32_t opcode = 0;
+  bool with_extra = false;
+  switch (op) {
+    case 32: opcode = pixel ? dx::kSample : dx::kSampleL; break;             // image_sample
+    case 36: opcode = dx::kSampleL; with_extra = true; break;               // image_sample_l
+    case 37: opcode = pixel ? dx::kSampleB : dx::kSampleL; first = 1; break;  // image_sample_b
+    case 39: opcode = dx::kSampleL; break;                                   // image_sample_lz
+    case 40: opcode = pixel ? dx::kSampleC : dx::kSampleCLz; first = 1; break;  // image_sample_c
+    case 47: opcode = dx::kSampleCLz; first = 1; break;                      // image_sample_c_lz
+    default: return fail(format("image instruction %u", op));
+  }
+  const uint32_t coords = pack(first, dim.coords, nullptr);
+  const uint32_t result = fresh();
+  std::vector<Operand> operands = {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
+                                   dxbc::sampler_indexed(0, sampler_reg)};
+  if (opcode == dx::kSampleL) {
+    // Explicit level: the last address (image_sample_l), the bias as a level
+    // outside pixel shaders, else 0.
+    operands.push_back(with_extra ? address(first + dim.coords) : op == 37 ? address(0) : dxbc::immf(0.0f));
+  } else if (opcode == dx::kSampleB) {
+    operands.push_back(address(0));
+  } else if (opcode == dx::kSampleC || opcode == dx::kSampleCLz) {
+    operands.push_back(address(0));  // depth reference
+  }
+  (void)extra;
+  (void)sampler_index;
+  (void)index;
+  emit(opcode, operands);
+  results(result);
+  return true;
+}
+
+// Packed and mixed-precision operations (VOP3P).
+bool Translator::emit_vop3p(const Instruction& inst) {
+  const uint32_t d = vreg(inst.dst);
+  switch (inst.op) {
+    case 32: case 33: case 34: {
+      // v_fma_mix_f32, v_fma_mixlo_f16, v_fma_mixhi_f16: each source is f32
+      // (opsel_hi clear) or the f16 half opsel names; neg_hi is |x|.
+      Operand s[3];
+      for (int i = 0; i < 3; ++i) {
+        Operand v = src(inst, inst.src[i]);
+        if ((inst.opsel_hi >> i) & 1) {
+          v = op1(dx::kF16tof32, (inst.opsel >> i) & 1 ? shr(v, I(16)) : band(v, I(0xFFFF)));
+        }
+        if (((inst.neg_hi | inst.neg) >> i) & 1) {
+          v = in_temp(v);
+          if ((inst.neg_hi >> i) & 1) v = dxbc::abs(v);
+          if ((inst.neg >> i) & 1) v = dxbc::neg(v);
+        }
+        s[i] = v;
+      }
+      Operand r = op3(dx::kMad, s[0], s[1], s[2]);
+      if (inst.clamp) r = op1(dx::kMov, r, dxbc::kSaturate);
+      if (inst.op == 32) {
+        put(d, select(active(), r, R(d)));
+        return true;
+      }
+      const Operand half = op1(dx::kF32tof16, r);
+      const Operand merged = inst.op == 33 ? op4(dx::kBfi, I(16), I(0), half, R(d))
+                                           : op4(dx::kBfi, I(16), I(16), half, R(d));
+      put(d, select(active(), merged, R(d)));
+      return true;
+    }
+    default: return fail(format("VOP3P op %u", inst.op));
+  }
+}
+
+bool Translator::cross_lane(const Instruction& inst) {
+  const bool vector = inst.encoding == Encoding::VOP1 || inst.encoding == Encoding::VOP2 ||
+                      inst.encoding == Encoding::VOPC;
+  if (vector && (inst.src[0] == rdna::kDpp16 || inst.src[0] == rdna::kDpp8 || inst.src[0] == rdna::kDpp8Fi)) {
+    return true;
+  }
+  return inst.encoding == Encoding::VOP3 && (inst.op == 0x360 || inst.op == 0x377 || inst.op == 0x378);
+}
+
+bool Translator::read_first_lane(const Instruction& inst) {
+  return (inst.encoding == Encoding::VOP1 && inst.op == 2 && inst.src[0] != rdna::kSdwa) ||
+         (inst.encoding == Encoding::VOP3 && inst.op == 0x182);
+}
+
+namespace {
+// The VGPR whose value an exchange carries.
+uint16_t exchanged_vgpr(const Instruction& inst) {
+  if (inst.encoding == Encoding::VOP3 || (inst.encoding == Encoding::VOP1 && inst.op == 2)) return inst.src[0];
+  return static_cast<uint16_t>(rdna::kVgpr0 + (inst.ext & 0xFF));
+}
+}  // namespace
+
+void Translator::exchange_write(const Instruction& inst) {
+  exchange_ = true;
+  const uint32_t buffer = exchange_parity_ * info_.threads[0] * info_.threads[1] * info_.threads[2] * 8;
+  const Operand address =
+      add(shl(dxbc::input(dxbc::kThreadIdInGroupFlattened, 0), I(3)), I(buffer));
+  emit(dx::kStoreRaw, {dxbc::group_shared(1, dxbc::Access::Store), address, src(inst, exchanged_vgpr(inst))});
+  emit(dx::kStoreRaw, {dxbc::group_shared(1, dxbc::Access::Store), add(address, I(4)), active()});
+}
+
+bool Translator::exchange_read(const Instruction& inst) {
+  const uint32_t buffer = exchange_parity_ * info_.threads[0] * info_.threads[1] * info_.threads[2] * 8;
+  exchange_parity_ ^= 1;
+  const Operand lane = R(kLaneR);
+  // Source lane and whether this lane writes, per operation.
+  Operand source, valid = I(0xFFFFFFFFu), write = I(0xFFFFFFFFu);
+  bool fetch_inactive = false, bound_zero = false;
+  const bool first_lane = read_first_lane(inst);
+  if (first_lane) {
+    // v_readfirstlane_b32: the lowest lane EXEC enables (lane 0 when none).
+    const Operand hi = info_.wave_size == 64
+                           ? add(op1(dx::kFirstbitLo, R(kExecHiR)), I(32))
+                           : I(0);
+    const Operand from_hi = select(nonzero(R(kExecHiR)), hi, I(0));
+    source = select(nonzero(R(kExecLoR)), op1(dx::kFirstbitLo, R(kExecLoR)), from_hi);
+    fetch_inactive = true;
+  } else if (inst.encoding == Encoding::VOP3 && inst.op == 0x360) {
+    // v_readlane_b32 sdst, vsrc, lane: every lane reads the same lane.
+    source = band(src(inst, inst.src[1]), I(info_.wave_size - 1));
+    fetch_inactive = true;
+  } else if (inst.encoding == Encoding::VOP3) {
+    // v_permlane16 / v_permlanex16: 4-bit selects from src1 (lanes 0-7 of a
+    // row) and src2 (lanes 8-15); x16 reads the other row of each pair.
+    const Operand in_row = band(lane, I(15));
+    const Operand word = select(ult(in_row, I(8)), src(inst, inst.src[1]), src(inst, inst.src[2]));
+    const Operand pick = ubfe(I(4), shl(band(in_row, I(7)), I(2)), word);
+    Operand row = band(lane, I(~15u));
+    if (inst.op == 0x378) row = bxor(row, I(16));
+    source = add(row, pick);
+    fetch_inactive = (inst.opsel & 1) != 0;
+    bound_zero = (inst.opsel & 2) != 0;
+  } else if (inst.src[0] == rdna::kDpp8 || inst.src[0] == rdna::kDpp8Fi) {
+    const uint32_t selects = inst.ext >> 8;
+    source = add(band(lane, I(~7u)), ubfe(I(3), mul_lo(I(3), band(lane, I(7))), I(selects)));
+    fetch_inactive = inst.src[0] == rdna::kDpp8Fi;
+    bound_zero = true;
+  } else {
+    const uint32_t control = (inst.ext >> 8) & 0x1FF;
+    fetch_inactive = (inst.ext >> 18) & 1;
+    bound_zero = (inst.ext >> 19) & 1;
+    if ((inst.ext >> 22) & 3) return fail("DPP source 1 modifiers");
+    const Operand row = band(lane, I(~15u)), in_row = band(lane, I(15));
+    const uint32_t n = control & 15;
+    if (control < 0x100) {
+      const Operand shift = shl(band(lane, I(3)), I(1));
+      source = add(band(lane, I(~3u)), band(shr(I(control), shift), I(3)));
+    } else if (control >= 0x101 && control <= 0x10F) {
+      source = add(lane, I(n));
+      valid = ult(add(in_row, I(n)), I(16));
+    } else if (control >= 0x111 && control <= 0x11F) {
+      source = sub(lane, I(n));
+      valid = op2(dx::kUge, in_row, I(n));
+    } else if (control >= 0x121 && control <= 0x12F) {
+      source = add(row, band(sub(in_row, I(n)), I(15)));
+    } else if (control == 0x140) {
+      source = add(row, sub(I(15), in_row));
+    } else if (control == 0x141) {
+      source = add(band(lane, I(~7u)), sub(I(7), band(lane, I(7))));
+    } else if (control >= 0x150 && control <= 0x15F) {
+      source = add(row, I(n));
+    } else if (control >= 0x160 && control <= 0x16F) {
+      source = add(row, bxor(in_row, I(n)));
+    } else {
+      return fail(format("DPP control 0x%x", control));
+    }
+    const uint32_t bank_mask = (inst.ext >> 24) & 15, row_mask = (inst.ext >> 28) & 15;
+    const Operand row_bit = band(shr(I(row_mask), shr(lane, I(4))), I(1));
+    const Operand bank_bit = band(shr(I(bank_mask), band(shr(lane, I(2)), I(3))), I(1));
+    write = nonzero(band(row_bit, bank_bit));
+  }
+  // Read the source lane's value and EXEC bit (lanes of this wave only).
+  const Operand wave_base = sub(dxbc::input(dxbc::kThreadIdInGroupFlattened, 0), lane);
+  const Operand address = add(shl(add(wave_base, source), I(3)), I(buffer));
+  const uint32_t value = fresh(), source_active = fresh();
+  emit(dx::kLdRaw, {D(value), address, dxbc::group_shared(1, dxbc::Access::Load)});
+  emit(dx::kLdRaw, {D(source_active), add(address, I(4)), dxbc::group_shared(1, dxbc::Access::Load)});
+  if (!fetch_inactive) valid = band(valid, nonzero(R(source_active)));
+  if (bound_zero) {
+    put(value, select(valid, R(value), I(0)));
+  } else {
+    write = band(write, valid);
+  }
+  if (first_lane || (inst.encoding == Encoding::VOP3 && inst.op == 0x360)) {
+    set_s(inst.dst, R(value));
+    return true;
+  }
+  if (inst.encoding != Encoding::VOP3 && inst.src[0] == rdna::kDpp16) {
+    if ((inst.ext >> 21) & 1) put(value, band(R(value), I(0x7FFFFFFFu)));  // |src0|
+    if ((inst.ext >> 20) & 1) put(value, bxor(R(value), I(0x80000000u)));  // -src0
+  }
+  // The operation itself, with src0 the exchanged value, in lanes that write.
+  const uint32_t saved = fresh();
+  put(saved, R(kExecLoR));
+  put(kExecLoR, band(R(kExecLoR), bit01(write)));
+  exchange_reg_ = value;
+  Instruction work = inst;
+  bool ok;
+  if (inst.encoding == Encoding::VOP3) {
+    // v_permlane: vdst = the exchanged value.
+    const uint32_t d = vreg(inst.dst);
+    put(d, select(active(), R(value), R(d)));
+    ok = true;
+  } else {
+    work.src[0] = kExchangeOperand;
+    ok = emit_vector(work);
+  }
+  put(kExecLoR, R(saved));
+  return ok;
+}
+
 bool Translator::emit_interp(const Instruction& inst) {
   if (stage_ != Stage::Pixel) return fail("interpolation outside a pixel shader");
   const uint32_t attribute = static_cast<uint32_t>(inst.imm), channel = inst.src[1] & 3;
@@ -1495,6 +1974,8 @@ bool Translator::emit(const Instruction& inst) {
       if (stage_ != Stage::Compute) return fail("group shared memory in a graphics stage");
       return emit_ds(inst);
     case Encoding::EXP: return emit_export(inst);
+    case Encoding::MIMG: return emit_image(inst);
+    case Encoding::VOP3P: return emit_vop3p(inst);
     case Encoding::VINTRP: return emit_interp(inst);
     default: return fail(rdna::mnemonic(inst));
   }
@@ -1577,6 +2058,25 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
         default: continue;  // waits, priorities, messages, prefetch hints
       }
     }
+    if (cross_lane(inst) || (stage_ == Stage::Compute && read_first_lane(inst))) {
+      if (stage_ != Stage::Compute) {
+        *error = format("at 0x%x: cross-lane operation outside a compute program", inst.pc);
+        return false;
+      }
+      exchange_write(inst);
+      barrier_ = true;
+      put(kNextR, I(inst.pc + 2));
+      put(kBarrierR, I(1));
+      blocks.back().second = std::move(p_);
+      p_ = dxbc::Program();
+      blocks.emplace_back(inst.pc + 2, dxbc::Program());
+      scratch_ = 0;
+      if (!exchange_read(inst) || !error_.empty()) {
+        *error = format("at 0x%x: %s", inst.pc, error_.c_str());
+        return false;
+      }
+      continue;
+    }
     if (!emit(inst)) {
       *error = format("at 0x%x: %s", inst.pc, error_.c_str());
       return false;
@@ -1621,6 +2121,14 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   program.dcl_global_flags(1);  // refactoring allowed
   program.dcl_constant_buffer(0, kTranslatedSpace, kSystemVectors, true);
   program.dcl_uav_raw_range(0, 0, kRegionTableSize - 1, kTranslatedSpace);
+  static const dxbc::ResourceDimension kSlotDimension[6] = {dxbc::kTexture2D, dxbc::kTexture2DArray,
+                                                             dxbc::kTexture3D, dxbc::kTextureCube,
+                                                             dxbc::kTexture1D, dxbc::kTexture1DArray};
+  if (samplers_used_) program.dcl_sampler_range(0, kTextureSpace);
+  for (uint32_t slot = 0; slot < 6; ++slot) {
+    if (textures_used_ & (1u << slot)) program.dcl_texture_range(10 + slot, kSlotDimension[slot], kTextureSpace + slot);
+    if (uavs_used_ & (1u << slot)) program.dcl_typed_uav_range(2 + slot, kSlotDimension[slot], kTextureSpace + slot);
+  }
   if (stage_ == Stage::Compute) {
     program.dcl_input(dxbc::kThreadGroupId, 0x7);
     program.dcl_input(dxbc::kThreadIdInGroup, 0x7);
@@ -1658,7 +2166,12 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   for (uint8_t mask : written_) any_output = any_output || mask != 0;
   program.dcl_temps(any_output ? kOutputBase + 4 * kOutputRegisters : kVgprBase + vgprs_);
   if (stage_ == Stage::Compute) {
-    if (lds_) program.dcl_tgsm_raw(0, info_.lds_bytes > 32768 ? 32768 : info_.lds_bytes);
+    // Group shared memory: the program's (up to the host's 32 KiB, less the
+    // exchange area) and the exchange area (two buffers of 8 bytes a thread).
+    const uint32_t exchange = exchange_ ? 2 * 8 * info_.threads[0] * info_.threads[1] * info_.threads[2] : 0;
+    const uint32_t lds_limit = 32768 - exchange;
+    if (lds_) program.dcl_tgsm_raw(0, info_.lds_bytes > lds_limit ? lds_limit : info_.lds_bytes);
+    if (exchange_) program.dcl_tgsm_raw(1, exchange);
     program.dcl_thread_group(info_.threads[0], info_.threads[1], info_.threads[2]);
   }
   auto init = [&](uint32_t reg, const Operand& value) { program.emit(dx::kMov, {D(reg), value}); };
@@ -1689,6 +2202,17 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
     for (uint32_t axis = 0; axis < 3; ++axis) {
       if (info_.tgid_enabled[axis]) init(next_sgpr++, dxbc::input(dxbc::kThreadGroupId, axis));
     }
+    if (info_.tg_size_enabled) {
+      // Thread group information: waves in the group (bits 0-5) and this
+      // lane's wave within it (bits 6-11).
+      const uint32_t threads = info_.threads[0] * info_.threads[1] * info_.threads[2];
+      const uint32_t waves = (threads + info_.wave_size - 1) / info_.wave_size;
+      const uint32_t reg = next_sgpr++;
+      program.emit(dx::kUshr, {D(reg), dxbc::input(dxbc::kThreadIdInGroupFlattened, 0),
+                               I(info_.wave_size == 64 ? 6 : 5)});
+      program.emit(dx::kIshl, {D(reg), R(reg), I(6)});
+      program.emit(dx::kOr, {D(reg), R(reg), I(waves & 0x3F)});
+    }
     for (uint32_t axis = 0; axis < 3; ++axis) init(kVgprBase + axis, dxbc::input(dxbc::kThreadIdInGroup, axis));
     program.emit(dx::kAnd, {D(kLaneR), dxbc::input(dxbc::kThreadIdInGroupFlattened, 0), I(info_.wave_size - 1)});
   } else {
@@ -1716,7 +2240,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   if (barrier_) {
     program.emit(dx::kIeq, {D(kScratch), R(kNextR), I(kEndBlock)});
     program.emit(dx::kBreakc, {R(kScratch)}, dxbc::kTestNonZero);
-    program.emit(dx::kSync, {}, dxbc::kSyncThreads | dxbc::kSyncGroupMemory | dxbc::kSyncUavGroup);
+    program.emit(dx::kSync, {}, dxbc::kSyncThreads | dxbc::kSyncGroupMemory | dxbc::kSyncUavGlobal);
     program.emit(dx::kEndloop, {});
   }
   epilogue(program);
@@ -1730,6 +2254,25 @@ bool translate_compute(const uint8_t* code, size_t size, const ComputeShaderInfo
                        std::string* error) {
   Translator translator(code, size, info);
   return translator.run(dxbc, error);
+}
+
+bool native_graphics_stage(const uint8_t* code, size_t size, GraphicsStage* stage) {
+  bool vertex = false, pixel = false;
+  rdna::Instruction inst;
+  for (uint32_t pc = 0; rdna::decode(code, size, pc, &inst); pc += 4 * inst.words) {
+    if (inst.encoding == Encoding::EXP) {
+      // Targets: 0-7 colour, 8 depth, 9 null, 12-15 position, 32+ parameters.
+      if (inst.target >= 12 && inst.target <= 15) vertex = true;
+      if (inst.target <= 9) pixel = true;
+    } else if (inst.encoding == Encoding::VINTRP) {
+      pixel = true;
+    } else if (inst.encoding == Encoding::SOPP && inst.op == 31) {
+      break;  // s_code_end
+    }
+  }
+  if (vertex == pixel) return false;
+  *stage = vertex ? GraphicsStage::Vertex : GraphicsStage::Pixel;
+  return true;
 }
 
 bool translate_graphics(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,

@@ -57,9 +57,7 @@ Uploader* uploader(Device* device) {
   return instance;
 }
 
-}  // namespace
-
-ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address) {
+lib::TextureShape shape_of(const D3D12_RESOURCE_DESC& desc) {
   lib::TextureShape shape;
   shape.dimension = static_cast<uint32_t>(desc.Dimension);
   shape.width = desc.Width;
@@ -67,7 +65,46 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   shape.depth_or_array = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
   shape.mips = desc.MipLevels ? desc.MipLevels : 1;
   shape.format = static_cast<uint32_t>(desc.Format);
-  const Key key{address, shape.dimension, shape.width, shape.height, shape.depth_or_array, shape.mips, shape.format};
+  return shape;
+}
+
+Key key_of(uint64_t address, const lib::TextureShape& shape) {
+  return Key{address, shape.dimension, shape.width, shape.height, shape.depth_or_array, shape.mips, shape.format};
+}
+
+}  // namespace
+
+ID3D12Resource* placed_texture(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address,
+                               UINT initial_layout, const D3D12_CLEAR_VALUE* clear) {
+  const lib::TextureShape shape = shape_of(desc);
+  const Key key = key_of(address, shape);
+  D3D12_RESOURCE_DESC host_desc = desktop_resource_desc(desc);
+  host_desc.Alignment = 0;
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  ID3D12Resource* texture = nullptr;
+  const HRESULT hr = create_host_committed(device, heap, D3D12_HEAP_FLAG_NONE, host_desc, initial_layout, clear,
+                                           &texture);
+  LIB_LOG(hr < 0 ? lib::kError : lib::kDebug, "d3d12",
+          "placed texture dim %d %llux%ux%u, %u mips, format %u, flags 0x%x at %p -> 0x%08lX", desc.Dimension,
+          static_cast<unsigned long long>(desc.Width), desc.Height, desc.DepthOrArraySize, desc.MipLevels,
+          desc.Format, desc.Flags, reinterpret_cast<void*>(address), static_cast<unsigned long>(hr));
+  if (FAILED(hr)) return nullptr;
+  std::lock_guard<std::mutex> guard(g_lock);
+  auto found = textures().find(key);
+  if (found != textures().end()) {
+    found->second->Release();
+    found->second = texture;
+  } else {
+    textures().emplace(key, texture);
+  }
+  texture->AddRef();
+  return texture;
+}
+
+ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address) {
+  const lib::TextureShape shape = shape_of(desc);
+  const Key key = key_of(address, shape);
 
   std::lock_guard<std::mutex> guard(g_lock);
   auto found = textures().find(key);
@@ -76,8 +113,10 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   const uint64_t size = lib::texture_size(shape);
   Backing backing;
   if (!size || !locate(device, address, &backing) || !backing.whole || backing.contiguous < size) {
-    LIB_LOG(lib::kError, "d3d12", "texture of format %u at %p (0x%llx bytes) lies in no contiguous GPU memory",
-            shape.format, reinterpret_cast<void*>(address), static_cast<unsigned long long>(size));
+    LIB_LOG(lib::kError, "d3d12",
+            "texture dim %u %llux%ux%u, %u mips, format %u at %p (0x%llx bytes) lies in no contiguous GPU memory",
+            shape.dimension, static_cast<unsigned long long>(shape.width), shape.height, shape.depth_or_array,
+            shape.mips, shape.format, reinterpret_cast<void*>(address), static_cast<unsigned long long>(size));
     return nullptr;
   }
   Uploader* up = uploader(device);

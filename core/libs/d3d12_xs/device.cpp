@@ -19,8 +19,10 @@
 #include <intrin.h>
 #include <psapi.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -28,6 +30,7 @@
 #include "core/libs/d3d12_xs/descriptors.h"
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/frame_pacing.h"
+#include "core/libs/d3d12_xs/present.h"
 #include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/d3d12_xs/shader_container.h"
@@ -110,9 +113,49 @@ HRESULT STDMETHODCALLTYPE get_device_of_child(Wrapper*, REFIID, void** device) {
   return S_OK;
 }
 
+// Observed: fence slot 12 (past the desktop ID3D12Fence1 methods) returns a
+// pointer through which titles read the fence's current value directly,
+// treating all ones as a removed device. Host model: a cell per fence, kept
+// at the host fence's completed value by a thread that waits for each
+// further completion.
+struct FenceCell {
+  ID3D12Fence* fence;
+  volatile uint64_t value;
+};
+
+DWORD WINAPI watch_fence(void* context) {
+  auto* cell = static_cast<FenceCell*>(context);
+  const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  for (;;) {
+    const uint64_t seen = cell->fence->GetCompletedValue();
+    cell->value = seen;
+    if (seen == UINT64_MAX) break;  // device removed
+    if (FAILED(cell->fence->SetEventOnCompletion(seen + 1, event))) break;
+    WaitForSingleObject(event, INFINITE);
+  }
+  CloseHandle(event);
+  return 0;
+}
+
+const volatile uint64_t* STDMETHODCALLTYPE fence_value_address(Wrapper* self) {
+  static std::mutex lock;
+  static auto* cells = new std::map<Wrapper*, FenceCell*>();
+  std::lock_guard<std::mutex> guard(lock);
+  auto found = cells->find(self);
+  if (found != cells->end()) return &found->second->value;
+  auto* cell = new FenceCell{static_cast<ID3D12Fence*>(self->host), 0};
+  cell->fence->AddRef();
+  cell->value = cell->fence->GetCompletedValue();
+  const HANDLE thread = CreateThread(nullptr, 64 * 1024, &watch_fence, cell, 0, nullptr);
+  if (thread) CloseHandle(thread);
+  cells->emplace(self, cell);
+  return &cell->value;
+}
+
 const auto kFenceVtable = [] {
   auto table = make_forwarding_vtable(12);
   table[7] = reinterpret_cast<void*>(&get_device_of_child);
+  table[12] = reinterpret_cast<void*>(&fence_value_address);
   return table;
 }();
 
@@ -131,11 +174,25 @@ HRESULT STDMETHODCALLTYPE create_fence(Device* self, UINT64 initial, D3D12_FENCE
 //
 // Observed: device slot 9 is CreateCommandAllocator(type, riid, out), as on
 // the desktop; allocators keep the desktop order (slot 8 Reset).
+//
+// Observed: allocator slot 9 takes a title function, a context pointer and
+// zero; the result is not checked. The function allocates title memory: it
+// takes the size as its fourth argument, the log2 alignment as its fifth and
+// the context as its seventh, and returns the memory. Assumed: the console
+// allocator obtains its command-buffer memory through it. Host allocators
+// manage their own memory, so the function is recorded and never called.
 const lib::VtableInfo kAllocatorInfo{kLibrary, "ID3D12CommandAllocatorX"};
+
+HRESULT STDMETHODCALLTYPE allocator_set_memory_callback(Wrapper*, void* function, void* context, UINT64 flags) {
+  LIB_LOG(lib::kDebug, "d3d12", "command allocator memory callback %p (context %p, 0x%llx): not needed on the host",
+          function, context, static_cast<unsigned long long>(flags));
+  return S_OK;
+}
 
 const auto kAllocatorVtable = [] {
   auto table = make_forwarding_vtable(9);
   table[7] = reinterpret_cast<void*>(&get_device_of_child);
+  table[9] = reinterpret_cast<void*>(&allocator_set_memory_callback);
   return table;
 }();
 
@@ -163,12 +220,42 @@ HRESULT STDMETHODCALLTYPE schedule_frame_event_x(Device*, UINT type, UINT64 offs
   return schedule_frame_event(type, offset_us, flags);
 }
 
-// Slot 15: GetDescriptorHandleIncrementSize(type), as on the desktop.
-UINT STDMETHODCALLTYPE get_descriptor_handle_increment_size(Device* self, D3D12_DESCRIPTOR_HEAP_TYPE type) {
-  if (static_cast<uint32_t>(type) >= D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES) {
-    LIB_LOG(lib::kError, "d3d12", "descriptor increment for heap type %u", static_cast<unsigned>(type));
+// Observed: slot 80 has the shape of WaitFrameEventX(type, timeout_ms, target,
+// flags, token*) of the public sample code. Titles call it with type 0 (the
+// interval origin), a zero timeout and flags 2, require success and keep the
+// token it writes; and with type 2, an infinite timeout and a pointer to the
+// token of an earlier frame, to wait for that frame. Assumed: flag bit 1 asks
+// for the current frame's token without waiting for the next origin; event 2
+// of a frame is reached when its present has been carried out.
+HRESULT STDMETHODCALLTYPE wait_frame_event_x(Device*, UINT type, UINT timeout_ms, const void* target, UINT flags,
+                                             UINT64* token) {
+  if (!token) return E_POINTER;
+  if (target) {
+    HolyUnimplementedFrom(kLibrary, "WaitFrameEventX(with a target output)", _ReturnAddress());
+    return E_NOTIMPL;
   }
-  return self->host->GetDescriptorHandleIncrementSize(type);
+  if (type == 0) {
+    if (flags & 2) {
+      *token = next_frame_token();
+      return S_OK;
+    }
+    uint64_t ignored = 0;
+    const HRESULT hr = wait_frame_event(0, timeout_ms, &ignored);
+    if (SUCCEEDED(hr)) *token = next_frame_token();
+    return hr;
+  }
+  if (type == 2) return wait_for_presented(*token, timeout_ms);
+  LIB_LOG(lib::kError, "d3d12", "WaitFrameEventX type %u flags 0x%x", type, flags);
+  HolyUnimplementedFrom(kLibrary, "WaitFrameEventX(event type)", _ReturnAddress());
+  return E_NOTIMPL;
+}
+
+// Slot 15: GetDescriptorHandleIncrementSize(type), as on the desktop.
+UINT STDMETHODCALLTYPE get_descriptor_handle_increment_size(Device*, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+  if (static_cast<uint32_t>(type) >= D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES) {
+    LIB_LOG(lib::kDebug, "d3d12", "descriptor increment for heap type %u", static_cast<unsigned>(type));
+  }
+  return kTitleDescriptorBytes;
 }
 
 HRESULT STDMETHODCALLTYPE create_placed_resource(Device* self, D3D12_GPU_VIRTUAL_ADDRESS address,
@@ -183,13 +270,23 @@ HRESULT STDMETHODCALLTYPE create_descriptor_heap_x(Device* self, const D3D12_DES
 }
 
 // Slot 25: GetResourceAllocationInfo(visible_mask, count, descs), as on the
-// desktop; the 16-byte result comes back through the result pointer. Flag bits
-// the desktop does not define are dropped.
+// desktop; the 16-byte result comes back through the result pointer, for the
+// description the host takes (desktop_resource_desc).
 D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE get_resource_allocation_info(
     D3D12_RESOURCE_ALLOCATION_INFO* result, Device* self, UINT, UINT count, const D3D12_RESOURCE_DESC* descs) {
-  std::vector<D3D12_RESOURCE_DESC> host(descs, descs + count);
-  for (D3D12_RESOURCE_DESC& desc : host) desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(desc.Flags & 0x1FF);
+  std::vector<D3D12_RESOURCE_DESC> host;
+  for (UINT i = 0; i < count; ++i) host.push_back(desktop_resource_desc(descs[i]));
   *result = self->host->GetResourceAllocationInfo(0, count, host.data());
+  if (result->SizeInBytes == UINT64_MAX) {
+    for (UINT i = 0; i < count; ++i) {
+      const D3D12_RESOURCE_DESC& d = descs[i];
+      LIB_LOG(lib::kError, "d3d12",
+              "allocation info refused: dim %d align 0x%llx %llux%ux%u mips %u fmt %d samples %u/%u layout %d flags 0x%x",
+              d.Dimension, static_cast<unsigned long long>(d.Alignment), static_cast<unsigned long long>(d.Width),
+              d.Height, d.DepthOrArraySize, d.MipLevels, d.Format, d.SampleDesc.Count, d.SampleDesc.Quality, d.Layout,
+              d.Flags);
+    }
+  }
   if (count && HolyLogEnabled(lib::kDebug)) {
     LIB_LOG(lib::kDebug, "d3d12", "allocation info dim %d %llux%u fmt %d mips %u flags 0x%x -> 0x%llx align 0x%llx",
             descs[0].Dimension, static_cast<unsigned long long>(descs[0].Width), descs[0].Height, descs[0].Format,
@@ -199,11 +296,37 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE get_resource_allocation_info(
   return result;
 }
 
+// Observed: slot 108 is the desktop GetResourceAllocationInfo1(visible_mask,
+// count, descs, infos): the result through the result pointer, and an
+// optional array of per-resource offsets, alignments and sizes. Titles call
+// it with a small-resource alignment and retry without when the alignment
+// that comes back differs; a size of 4 GiB or more is fatal to them.
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE get_resource_allocation_info1(
+    D3D12_RESOURCE_ALLOCATION_INFO* result, Device* self, UINT, UINT count, const D3D12_RESOURCE_DESC* descs,
+    D3D12_RESOURCE_ALLOCATION_INFO1* infos) {
+  std::vector<D3D12_RESOURCE_DESC> host;
+  for (UINT i = 0; i < count; ++i) host.push_back(desktop_resource_desc(descs[i]));
+  ID3D12Device4* device4 = nullptr;
+  if (FAILED(self->host->QueryInterface(IID_PPV_ARGS(&device4)))) {
+    *result = {UINT64_MAX, 0};
+    LIB_LOG(lib::kError, "d3d12", "the host device has no GetResourceAllocationInfo1");
+    return result;
+  }
+  *result = device4->GetResourceAllocationInfo1(0, count, host.data(), infos);
+  device4->Release();
+  if (result->SizeInBytes == UINT64_MAX) {
+    LIB_LOG(lib::kError, "d3d12", "allocation info (slot 108) refused for %u descriptions, first dim %d fmt %d",
+            count, count ? descs[0].Dimension : 0, count ? descs[0].Format : 0);
+  }
+  return result;
+}
+
 HRESULT STDMETHODCALLTYPE create_committed_resource_x(Device* self, const D3D12_HEAP_PROPERTIES* properties,
                                                       D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC* desc,
                                                       UINT state, const D3D12_CLEAR_VALUE* clear, void*, UINT,
                                                       const void*, REFIID, void** resource) {
-  return create_committed_resource(self, properties, flags, desc, state, clear, resource);
+  // The shape of CreateCommittedResource3: `state` is an initial layout.
+  return create_committed_resource(self, properties, flags, desc, state, true, clear, resource);
 }
 
 // Observed: device slot 27 takes the desktop CreateCommittedResource
@@ -213,7 +336,7 @@ HRESULT STDMETHODCALLTYPE create_committed_resource_desktop(Device* self, const 
                                                             D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC* desc,
                                                             UINT state, const D3D12_CLEAR_VALUE* clear, REFIID,
                                                             void** resource) {
-  return create_committed_resource(self, properties, flags, desc, state, clear, resource);
+  return create_committed_resource(self, properties, flags, desc, state, false, clear, resource);
 }
 
 // --- root signatures -----------------------------------------------------------------
@@ -467,7 +590,9 @@ const auto kPipelineVtable = [] {
 
 // The root signature of translated pipelines: the region views (u0-u63,
 // space 8) as a descriptor table, the system constants (b0, space 8) as a
-// root constant buffer view.
+// root constant buffer view, and the bound shader-visible heaps whole (from
+// index 0) as texture and typed UAV arrays of each image dimension (spaces
+// kTextureSpace + slot) and as the sampler array (kTextureSpace).
 }  // namespace
 
 ID3D12RootSignature* translated_root_signature(Device* device) {
@@ -475,12 +600,24 @@ ID3D12RootSignature* translated_root_signature(Device* device) {
   std::lock_guard<std::mutex> guard(lock);
   if (device->translated_root) return device->translated_root;
   D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, kRegionTableSize, 0, kTranslatedSpace, 0};
-  D3D12_ROOT_PARAMETER parameters[2]{};
-  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameters[0].DescriptorTable = {1, &range};
-  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-  parameters[1].Descriptor = {0, kTranslatedSpace};
-  const D3D12_ROOT_SIGNATURE_DESC desc{2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  constexpr uint32_t kSlots = 6;  // ImageSlot values 0-5
+  D3D12_DESCRIPTOR_RANGE images[2 * kSlots]{};
+  for (uint32_t slot = 0; slot < kSlots; ++slot) {
+    images[slot] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, kTextureSpace + slot, 0};
+    images[kSlots + slot] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UINT_MAX, 0, kTextureSpace + slot, 0};
+  }
+  D3D12_DESCRIPTOR_RANGE samplers{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, kTextureSpace, 0};
+  D3D12_ROOT_PARAMETER parameters[kTranslatedRootParameters]{};
+  parameters[kRootRegions].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[kRootRegions].DescriptorTable = {1, &range};
+  parameters[kRootSystem].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  parameters[kRootSystem].Descriptor = {0, kTranslatedSpace};
+  parameters[kRootImages].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[kRootImages].DescriptorTable = {2 * kSlots, images};
+  parameters[kRootSamplers].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[kRootSamplers].DescriptorTable = {1, &samplers};
+  const D3D12_ROOT_SIGNATURE_DESC desc{kTranslatedRootParameters, parameters, 0, nullptr,
+                                       D3D12_ROOT_SIGNATURE_FLAG_NONE};
   ID3DBlob* blob = nullptr;
   ID3DBlob* errors = nullptr;
   HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
@@ -498,26 +635,16 @@ ID3D12RootSignature* translated_root_signature(Device* device) {
 
 namespace {
 
-// A compute pipeline from the shader's native code, translated to host
-// bytecode (see shader/translate.h).
-HRESULT create_translated_compute_pipeline(Device* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
-                                           void** pipeline, const void* caller) {
-  LIB_LOG(lib::kDebug, "d3d12", "translating a compute shader of %llu bytes",
-          static_cast<unsigned long long>(desc->CS.BytecodeLength));
-  NativeComputeProgram program;
-  if (!native_compute_program(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, &program)) {
-    dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
-    HolyUnimplementedFrom(kLibrary, "compute pipeline: unreadable native program", caller);
-    return E_NOTIMPL;
-  }
-  ComputeShaderInfo info;
-  for (int axis = 0; axis < 3; ++axis) info.threads[axis] = program.threads[axis];
+// A compute pipeline from native code, translated to host bytecode (see
+// shader/translate.h). `dump` is what is saved when that fails.
+HRESULT create_compute_pipeline_from_code(Device* self, const uint8_t* code, size_t size,
+                                          const ComputeShaderInfo& info, const void* dump, size_t dump_size,
+                                          void** pipeline, const void* caller) {
   std::vector<uint8_t> bytecode;
   std::string error;
   const ULONGLONG start = GetTickCount64();
-  if (!translate_compute(program.block.data() + program.code_offset, program.block.size() - program.code_offset,
-                         info, &bytecode, &error)) {
-    dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
+  if (!translate_compute(code, size, info, &bytecode, &error)) {
+    dump_shader(dump, dump_size, "compute");
     LIB_LOG(lib::kError, "d3d12", "native compute shader not translatable: %s", error.c_str());
     HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), caller);
     return E_NOTIMPL;
@@ -537,13 +664,31 @@ HRESULT create_translated_compute_pipeline(Device* self, const D3D12_COMPUTE_PIP
           static_cast<unsigned long long>(GetTickCount64() - start), static_cast<unsigned long>(hr),
           static_cast<unsigned long long>(memory.PrivateUsage >> 20));
   if (FAILED(hr)) {
-    dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
+    dump_shader(dump, dump_size, "compute");
     return hr;
   }
   Wrapper* wrapper = wrap(state, &kPipelineInfo, kPipelineVtable.data());
   wrapper->flags = kTranslatedPipeline;
   *pipeline = wrapper;
   return S_OK;
+}
+
+// A compute pipeline from the native code inside a shader container.
+HRESULT create_translated_compute_pipeline(Device* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+                                           void** pipeline, const void* caller) {
+  LIB_LOG(lib::kDebug, "d3d12", "translating a compute shader of %llu bytes",
+          static_cast<unsigned long long>(desc->CS.BytecodeLength));
+  NativeComputeProgram program;
+  if (!native_compute_program(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, &program)) {
+    dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
+    HolyUnimplementedFrom(kLibrary, "compute pipeline: unreadable native program", caller);
+    return E_NOTIMPL;
+  }
+  ComputeShaderInfo info;
+  for (int axis = 0; axis < 3; ++axis) info.threads[axis] = program.threads[axis];
+  return create_compute_pipeline_from_code(self, program.block.data() + program.code_offset,
+                                           program.block.size() - program.code_offset, info,
+                                           desc->CS.pShaderBytecode, desc->CS.BytecodeLength, pipeline, caller);
 }
 
 // Observed: device slot 62 takes a D3D12_COMPUTE_PIPELINE_STATE_DESC, two
@@ -602,19 +747,193 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(Device* self, const D3D12_PIPELI
 }
 
 // Observed: device slot 67 takes (description, pipeline interface id, out)
-// and returns an HRESULT. The description starts with the root signature,
-// followed by (pointer, size) pairs: 28 bytes of what look like register
-// settings (an 8x8 thread group among them), 20 bytes not understood, and
-// native GPU code behind a short header. It creates compute pipelines from
-// native code given directly; not supported yet (the code seen uses image
-// and cross-lane instructions, which the translation lacks).
-HRESULT STDMETHODCALLTYPE create_native_pipeline(Device*, const uint64_t* desc, REFIID, void** out) {
-  if (out) *out = nullptr;
-  if (desc && desc[5] && desc[6] && desc[6] < 0x100000) {
-    dump_shader(reinterpret_cast<const void*>(desc[5]), desc[6], "native compute");
+// and returns an HRESULT. The description is the root signature followed by
+// (pointer, size) pairs: 28 bytes of compute registers
+// (native_compute_registers), 20 bytes not understood, and the native code
+// (it starts with no-operation instructions carrying literals). It creates a
+// compute pipeline from native code given directly.
+HRESULT STDMETHODCALLTYPE create_native_pipeline(Device* self, const uint64_t* desc, REFIID, void** out) {
+  if (!out || !desc) return E_POINTER;
+  *out = nullptr;
+  const auto* registers = reinterpret_cast<const uint32_t*>(desc[1]);
+  const auto* code = reinterpret_cast<const uint8_t*>(desc[5]);
+  const size_t code_size = desc[6];
+  if (!registers || !code || !code_size) {
+    HolyUnimplementedFrom(kLibrary, "compute pipeline from native code: unexpected description", _ReturnAddress());
+    return E_NOTIMPL;
   }
-  HolyUnimplementedFrom(kLibrary, "compute pipeline from native code (device slot 67)", _ReturnAddress());
-  return E_NOTIMPL;
+  ComputeShaderInfo info;
+  std::string error;
+  if (!native_compute_registers(registers, desc[2], &info, &error)) {
+    dump_shader(code, code_size, "native compute");
+    HolyUnimplementedFrom(kLibrary, ("compute pipeline from native code: " + error).c_str(), _ReturnAddress());
+    return E_NOTIMPL;
+  }
+  LIB_LOG(lib::kDebug, "d3d12", "native compute pipeline: %u x %u x %u threads, %u user SGPRs, rsrc2 0x%08X",
+          info.threads[0], info.threads[1], info.threads[2], info.user_sgprs, registers[6]);
+  return create_compute_pipeline_from_code(self, code, code_size, info, code, code_size, out, _ReturnAddress());
+}
+
+// Blend factors and functions by their public RDNA encodings
+// (CB_BLENDn_CONTROL); alpha factors use the alpha form of colour factors.
+D3D12_BLEND blend_factor(uint32_t factor, bool alpha) {
+  static const D3D12_BLEND kColour[] = {
+      D3D12_BLEND_ZERO, D3D12_BLEND_ONE, D3D12_BLEND_SRC_COLOR, D3D12_BLEND_INV_SRC_COLOR, D3D12_BLEND_SRC_ALPHA,
+      D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_DEST_COLOR,
+      D3D12_BLEND_INV_DEST_COLOR, D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_ZERO, D3D12_BLEND_ZERO,
+      D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_SRC1_COLOR, D3D12_BLEND_INV_SRC1_COLOR,
+      D3D12_BLEND_SRC1_ALPHA, D3D12_BLEND_INV_SRC1_ALPHA, D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR};
+  D3D12_BLEND out = factor < std::size(kColour) ? kColour[factor] : D3D12_BLEND_ZERO;
+  if (alpha) {
+    switch (out) {
+      case D3D12_BLEND_SRC_COLOR: return D3D12_BLEND_SRC_ALPHA;
+      case D3D12_BLEND_INV_SRC_COLOR: return D3D12_BLEND_INV_SRC_ALPHA;
+      case D3D12_BLEND_DEST_COLOR: return D3D12_BLEND_DEST_ALPHA;
+      case D3D12_BLEND_INV_DEST_COLOR: return D3D12_BLEND_INV_DEST_ALPHA;
+      case D3D12_BLEND_SRC1_COLOR: return D3D12_BLEND_SRC1_ALPHA;
+      case D3D12_BLEND_INV_SRC1_COLOR: return D3D12_BLEND_INV_SRC1_ALPHA;
+      default: return out;
+    }
+  }
+  return out;
+}
+
+D3D12_BLEND_OP blend_function(uint32_t function) {
+  switch (function) {
+    case 1: return D3D12_BLEND_OP_SUBTRACT;
+    case 2: return D3D12_BLEND_OP_MIN;
+    case 3: return D3D12_BLEND_OP_MAX;
+    case 4: return D3D12_BLEND_OP_REV_SUBTRACT;
+    default: return D3D12_BLEND_OP_ADD;
+  }
+}
+
+// Observed: device slot 57 takes (description, pipeline interface id, out)
+// and returns an HRESULT; it creates a graphics pipeline from native code
+// (NativeGraphicsDescription in shader_container.h).
+HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const uint64_t* desc, REFIID, void** out) {
+  if (!out || !desc) return E_POINTER;
+  *out = nullptr;
+  NativeGraphicsDescription native;
+  std::string error;
+  if (HolyLogEnabled(lib::kDebug)) {
+    // The root signature and each stage's metadata, for studying bindings.
+    void* root_host = desc[0] ? static_cast<void*>(host_of<ID3D12RootSignature>(reinterpret_cast<void*>(desc[0]))) : nullptr;
+    for (size_t i = 5; i + 3 < 5 + 2 * 6 && desc[i]; i += 4) {
+      std::string text;
+      const auto* m = reinterpret_cast<const uint32_t*>(desc[i + 2]);
+      for (size_t w = 0; m && w < desc[i + 3] / 4; ++w) {
+        char h[12];
+        std::snprintf(h, sizeof(h), "%s%08x", (w >= 4 && (w - 4) % 8 == 0) ? " | " : " ", m[w]);
+        text += h;
+      }
+      GraphicsStage stage = GraphicsStage::Vertex;
+      native_graphics_stage(reinterpret_cast<const uint8_t*>(desc[i]), desc[i + 1], &stage);
+      LIB_LOG(lib::kDebug, "d3d12", "native pipeline: root signature %p, %s %016llx, metadata:%s", root_host,
+              stage == GraphicsStage::Vertex ? "VS" : "PS",
+              static_cast<unsigned long long>(shader_hash(reinterpret_cast<const void*>(desc[i]), desc[i + 1])),
+              text.c_str());
+      dump_shader(reinterpret_cast<const void*>(desc[i]), desc[i + 1], "native graphics");
+    }
+  }
+  if (!native_graphics_description(desc, &native, &error)) {
+    if (desc[5] && desc[6]) dump_shader(reinterpret_cast<const void*>(desc[5]), desc[6], "native graphics");
+    HolyUnimplementedFrom(kLibrary, ("graphics pipeline from native code: " + error).c_str(), _ReturnAddress());
+    return E_NOTIMPL;
+  }
+  std::vector<uint8_t> vs, ps;
+  ShaderInterface vs_link, ps_link;
+  auto translate = [&](const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* bytecode,
+                       ShaderInterface* link) {
+    if (translate_graphics(code, size, stage, bytecode, link, &error)) return true;
+    dump_shader(code, size, "native graphics");
+    LIB_LOG(lib::kError, "d3d12", "native %s shader not translatable: %s",
+            stage == GraphicsStage::Vertex ? "vertex" : "pixel", error.c_str());
+    HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), _ReturnAddress());
+    return false;
+  };
+  if (!translate(native.vertex_code, native.vertex_size, GraphicsStage::Vertex, &vs, &vs_link)) return E_NOTIMPL;
+  if (native.pixel_code && !translate(native.pixel_code, native.pixel_size, GraphicsStage::Pixel, &ps, &ps_link)) {
+    return E_NOTIMPL;
+  }
+  if ((ps_link.params & ~vs_link.params) != 0) {
+    LIB_LOG(lib::kError, "d3d12", "pixel shader reads attributes 0x%x the vertex shader does not export (0x%x)",
+            ps_link.params, vs_link.params);
+    return E_INVALIDARG;
+  }
+  ID3D12RootSignature* root = translated_root_signature(self);
+  if (!root) return E_FAIL;
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC host{};
+  host.pRootSignature = root;
+  host.VS = {vs.data(), vs.size()};
+  if (!ps.empty()) host.PS = {ps.data(), ps.size()};
+  host.BlendState.IndependentBlendEnable = TRUE;
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint32_t b = native.blend[i];
+    D3D12_RENDER_TARGET_BLEND_DESC& target = host.BlendState.RenderTarget[i];
+    target.BlendEnable = (b >> 30) & 1;
+    const bool separate = (b >> 29) & 1;
+    target.SrcBlend = blend_factor(b & 0x1F, false);
+    target.BlendOp = blend_function((b >> 5) & 7);
+    target.DestBlend = blend_factor((b >> 8) & 0x1F, false);
+    target.SrcBlendAlpha = blend_factor(separate ? (b >> 16) & 0x1F : b & 0x1F, true);
+    target.BlendOpAlpha = blend_function(separate ? (b >> 21) & 7 : (b >> 5) & 7);
+    target.DestBlendAlpha = blend_factor(separate ? (b >> 24) & 0x1F : (b >> 8) & 0x1F, true);
+    target.LogicOp = D3D12_LOGIC_OP_NOOP;
+    target.RenderTargetWriteMask = static_cast<UINT8>((native.target_mask >> (4 * i)) & 0xF);
+  }
+  host.SampleMask = native.sample_mask;
+  // PA_SU_SC_MODE_CNTL: CULL_FRONT bit 0, CULL_BACK bit 1, FACE bit 2 (set:
+  // clockwise is front). Depth clipping and the depth bias are assumed off
+  // and zero (their registers are not established).
+  const uint32_t mode = native.mode_control;
+  host.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  host.RasterizerState.CullMode = (mode & 3) == 1   ? D3D12_CULL_MODE_FRONT
+                                  : (mode & 3) == 2 ? D3D12_CULL_MODE_BACK
+                                                    : D3D12_CULL_MODE_NONE;
+  host.RasterizerState.FrontCounterClockwise = ((mode >> 2) & 1) == 0;
+  host.RasterizerState.DepthClipEnable = TRUE;
+  host.DepthStencilState.DepthEnable = FALSE;
+  host.PrimitiveTopologyType = static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(native.topology_type);
+  host.NumRenderTargets = native.render_targets;
+  for (uint32_t i = 0; i < native.render_targets; ++i) host.RTVFormats[i] = static_cast<DXGI_FORMAT>(native.formats[i]);
+  host.SampleDesc = {native.sample_count, 0};
+  // As a desktop stream, recorded so pipelines can be derived from it.
+  std::vector<uint8_t> stream;
+  stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &host.pRootSignature, sizeof(void*));
+  stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &host.VS, sizeof(host.VS));
+  if (!ps.empty()) stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &host.PS, sizeof(host.PS));
+  stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &host.BlendState, sizeof(host.BlendState));
+  stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &host.SampleMask, sizeof(UINT));
+  stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &host.RasterizerState,
+                sizeof(host.RasterizerState));
+  stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &host.DepthStencilState,
+                sizeof(host.DepthStencilState));
+  stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &host.PrimitiveTopologyType,
+                sizeof(UINT));
+  D3D12_RT_FORMAT_ARRAY formats{};
+  formats.NumRenderTargets = host.NumRenderTargets;
+  for (uint32_t i = 0; i < 8; ++i) formats.RTFormats[i] = host.RTVFormats[i];
+  stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &formats, sizeof(formats));
+  stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &host.SampleDesc, sizeof(host.SampleDesc));
+  std::vector<std::vector<uint8_t>> blobs;
+  blobs.push_back(std::move(vs));
+  if (!ps.empty()) blobs.push_back(std::move(ps));
+  const HRESULT hr = create_recorded_pipeline(self, std::move(stream), std::move(blobs), true, &kPipelineInfo,
+                                              kPipelineVtable.data(), out);
+  LIB_LOG(lib::kDebug, "d3d12",
+          "native graphics pipeline: target format %u, blend 0x%08X, mode 0x%08X, vertex exports 0x%x, pixel reads "
+          "0x%x -> 0x%08lX",
+          native.formats[0], native.blend[0], mode, vs_link.params, ps_link.params, static_cast<unsigned long>(hr));
+  if (FAILED(hr)) dump_shader(native.vertex_code, native.vertex_size, "native graphics");
+  return hr;
+}
+
+// Device slot 55: a pipeline derived from another (pipeline_stream.cpp).
+HRESULT STDMETHODCALLTYPE create_derived_pipeline_x(Device* self, const void* base, UINT count, const uint8_t* entries,
+                                                    REFIID, void** out) {
+  return create_derived_pipeline(self, base, count, entries, &kPipelineInfo, kPipelineVtable.data(), out,
+                                 _ReturnAddress());
 }
 
 const auto kDeviceVtable = [] {
@@ -639,9 +958,12 @@ const auto kDeviceVtable = [] {
   table[26] = reinterpret_cast<void*>(&get_custom_heap_properties);
   table[27] = reinterpret_cast<void*>(&create_committed_resource_desktop);
   table[36] = reinterpret_cast<void*>(&create_fence);
+  table[80] = reinterpret_cast<void*>(&wait_frame_event_x);
   table[39] = reinterpret_cast<void*>(&create_query_heap);
   table[41] = reinterpret_cast<void*>(&create_command_signature);
   table[48] = reinterpret_cast<void*>(&create_queue_x);
+  table[55] = reinterpret_cast<void*>(&create_derived_pipeline_x);
+  table[57] = reinterpret_cast<void*>(&create_native_graphics_pipeline);
   table[61] = reinterpret_cast<void*>(&create_sampler_x);
   table[62] = reinterpret_cast<void*>(&create_compute_pipeline_state_x);
   table[67] = reinterpret_cast<void*>(&create_native_pipeline);
@@ -651,6 +973,7 @@ const auto kDeviceVtable = [] {
   table[86] = reinterpret_cast<void*>(&create_pipeline_state);
   table[78] = reinterpret_cast<void*>(&set_frame_interval_x);
   table[79] = reinterpret_cast<void*>(&schedule_frame_event_x);
+  table[108] = reinterpret_cast<void*>(&get_resource_allocation_info1);
   table[127] = reinterpret_cast<void*>(&create_committed_resource_x);
   table[133] = reinterpret_cast<void*>(&create_placed_resource);
   return table;
@@ -693,6 +1016,24 @@ Device* create_device(const void* parameters) {
   device->host = host;
   g_device = device;
   LIB_LOG(lib::kInfo, "d3d12", "host Direct3D 12 device created");
+  if (HolyLogEnabled(lib::kDebug)) {
+    // The debug layer's warnings and errors go to the log as they happen.
+    ID3D12InfoQueue1* queue = nullptr;
+    if (SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&queue)))) {
+      DWORD cookie = 0;
+      queue->RegisterMessageCallback(
+          [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id, LPCSTR text, void*) {
+            static std::atomic<int> budget{400};
+            // 680: a pipeline with depth state and no depth format (expected
+            // for translated pipelines whose depth format is not known).
+            if (severity > D3D12_MESSAGE_SEVERITY_WARNING || id == 680 || budget.fetch_sub(1) <= 0) return;
+            LIB_LOG(severity <= D3D12_MESSAGE_SEVERITY_ERROR ? lib::kError : lib::kWarn, "d3d12",
+                    "debug layer (%d): %s", static_cast<int>(id), text);
+          },
+          D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
+      queue->Release();
+    }
+  }
   return device;
 }
 

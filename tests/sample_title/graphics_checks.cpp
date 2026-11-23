@@ -73,5 +73,55 @@ void test_graphics() {
             list,
         "the device creates a command list");
   check(list && call<HRESULT>(list, 9) == S_OK, "a new command list closes");
+  if (list) {
+    // Titles write commands themselves while the cursor (0x18) is below the
+    // limit (0x30): the list must keep them equal so every call is a method.
+    const auto* fields = static_cast<const uint64_t*>(list);
+    check(fields[3] >= fields[6], "a command list offers no command space titles would write into");
+  }
+  if (allocator) {
+    check(call<HRESULT>(allocator, 9, static_cast<void*>(nullptr), static_cast<void*>(nullptr), UINT64{0}) == S_OK,
+          "a command allocator accepts a memory callback");
+  }
+  if (list && allocator) {
+    check(call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK &&
+              call<HRESULT>(list, 9) == S_OK,
+          "a closed command list resets with an allocator and closes again");
+  }
+  if (queue && list && fence) {
+    void* lists[] = {list};
+    call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+    UINT64 frequency = 0;
+    check(call<HRESULT>(queue, 18, &frequency) == S_OK && frequency > 0, "a queue reports its timestamp frequency");
+    const auto* value = call<const volatile uint64_t*>(fence, 12);
+    check(value && *value == 9, "a fence's value can be read through the address it gives");
+    check(call<HRESULT>(queue, 16, fence, UINT64{12}) == S_OK, "a queue signals a fence");
+    for (int i = 0; value && *value != 12 && i < 2000; ++i) Sleep(1);
+    check(value && *value == 12, "a fence's value address follows the GPU's signals");
+  }
+  // Frame tokens: the current frame's without waiting (flag 2), and a wait for
+  // a frame no present has reached yet returns at once.
+  UINT64 token = 0;
+  check(call<HRESULT>(device, 80, 0u, 0u, static_cast<const void*>(nullptr), 2u, &token) == S_OK && token != 0,
+        "WaitFrameEventX hands out a frame token");
+  check(call<HRESULT>(device, 80, 2u, 0u, static_cast<const void*>(nullptr), 0u, &token) == S_OK,
+        "waiting for a frame before anything was presented returns");
+  // Slot 108: GetResourceAllocationInfo1, result through the result pointer.
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 100000;
+  buffer.Height = 1;
+  buffer.DepthOrArraySize = 1;
+  buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  D3D12_RESOURCE_ALLOCATION_INFO info{};
+  D3D12_RESOURCE_ALLOCATION_INFO1 info1{};
+  using InfoFn = D3D12_RESOURCE_ALLOCATION_INFO*(STDMETHODCALLTYPE*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT,
+                                                                      UINT, const D3D12_RESOURCE_DESC*,
+                                                                      D3D12_RESOURCE_ALLOCATION_INFO1*);
+  reinterpret_cast<InfoFn>((*static_cast<void***>(device))[108])(&info, device, 1, 1, &buffer, &info1);
+  check(info.SizeInBytes >= 100000 && info1.SizeInBytes == info.SizeInBytes,
+        "GetResourceAllocationInfo1 reports sizes for each description and in total");
   test_graphics_resources(device);
 }

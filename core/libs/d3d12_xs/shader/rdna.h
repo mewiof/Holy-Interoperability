@@ -16,13 +16,13 @@ enum class Encoding : uint8_t {
   Unknown,
 };
 
-// Operand codes (9 bits): 0-105 SGPRs, 106/107 VCC, 124 null, 125 M0,
+// Operand codes (9 bits): 0-105 SGPRs, 106/107 VCC, 124 M0, 125 null,
 // 126/127 EXEC, 128-208 integer constants, 240-248 float constants,
 // 253 SCC, 255 literal, 256-511 VGPRs.
 inline constexpr uint16_t kVccLo = 106;
 inline constexpr uint16_t kVccHi = 107;
-inline constexpr uint16_t kNull = 124;
-inline constexpr uint16_t kM0 = 125;
+inline constexpr uint16_t kM0 = 124;
+inline constexpr uint16_t kNull = 125;
 inline constexpr uint16_t kExecLo = 126;
 inline constexpr uint16_t kExecHi = 127;
 inline constexpr uint16_t kScc = 253;
@@ -48,6 +48,9 @@ struct Instruction {
   uint32_t raw[3] = {};  // the instruction words
   // VOP3 modifiers
   uint8_t abs = 0, neg = 0, omod = 0, opsel = 0;
+  // VOP3P: per-source high-half selects (opsel_hi) and high-half negates
+  // (neg_hi; absolute value for the mixed-precision operations).
+  uint8_t opsel_hi = 0, neg_hi = 0;
   bool clamp = false;
   // memory instruction fields
   bool glc = false, offen = false, idxen = false;

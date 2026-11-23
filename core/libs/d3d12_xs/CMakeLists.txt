@@ -3,6 +3,8 @@ holy_add_system_library(holy_lib_d3d12_xs
   SOURCES
     command_list.cpp
     d3d12_xs.cpp
+    descriptor_memory.cpp
+    descriptor_memory.h
     descriptors.cpp
     descriptors.h
     device.cpp
@@ -16,7 +18,10 @@ holy_add_system_library(holy_lib_d3d12_xs
     gpu_memory.h
     pipeline_stream.cpp
     pipeline_stream.h
+    present.cpp
+    present.h
     resource.cpp
+    shader/descriptor_layout.h
     shader/dxbc.cpp
     shader/dxbc.h
     ../inflate.cpp
@@ -34,4 +39,4 @@ holy_add_system_library(holy_lib_d3d12_xs
     views.cpp
     views.h
     queue.cpp
-  LIBS d3d12 dxgi psapi holy_lib_xmem)
+  LIBS d3d12 dxgi psapi user32 holy_lib_xmem)

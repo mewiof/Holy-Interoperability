@@ -32,6 +32,9 @@ struct ComputeShaderInfo {
   // 64-bit scalar operations, 32 otherwise).
   uint32_t wave_size = 0;
   bool tgid_enabled[3] = {true, true, true};
+  // The thread group information SGPR after the group ids: the number of
+  // waves in the group (bits 0-5) and the wave's index in it (bits 6-11).
+  bool tg_size_enabled = false;
   uint32_t lds_bytes = 32768;  // declared group shared memory (host limit 32 KiB)
 };
 
@@ -46,6 +49,15 @@ inline constexpr uint32_t kSystemRegionVector = 0;   // [64] base lo, base hi, s
 inline constexpr uint32_t kSystemUserVector = 64;    // [4]  initial user SGPRs
 inline constexpr uint32_t kSystemCountsVector = 68;  // x = region count
 inline constexpr uint32_t kSystemVectors = 69;
+
+// Image instructions address the bound shader-visible heaps through the
+// index in descriptor dword 0 (shader/descriptor_layout.h): float texture
+// arrays [0, unbounded) of each dimension in spaces kTextureSpace + slot,
+// typed UAV arrays likewise, and the sampler array in kTextureSpace.
+inline constexpr uint32_t kTextureSpace = 9;
+enum ImageSlot : uint32_t {
+  kImage2D = 0, kImage2DArray = 1, kImage3D = 2, kImage1D = 4, kImage1DArray = 5,
+};
 
 bool translate_compute(const uint8_t* code, size_t size, const ComputeShaderInfo& info, std::vector<uint8_t>* dxbc,
                        std::string* error);
@@ -67,6 +79,11 @@ struct ShaderInterface {
   bool position = false;     // vertex: exports a position
   bool depth = false;        // pixel: writes depth
 };
+
+// The stage a graphics program was built for, from its exports (position
+// exports: vertex; colour, depth or null exports and attribute
+// interpolation: pixel). False when the code shows neither.
+bool native_graphics_stage(const uint8_t* code, size_t size, GraphicsStage* stage);
 
 bool translate_graphics(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,
                         ShaderInterface* link, std::string* error);

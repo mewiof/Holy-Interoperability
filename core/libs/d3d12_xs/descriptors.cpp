@@ -10,10 +10,17 @@
 // type 4. Observed: the title's hook selects callbacks by allocator id (bits
 // 16-23) and the preset is registered for allocator id 0x80.
 //
+// Observed: native code reads descriptors from memory in 32-byte slots
+// (descriptor tables at consecutive 0x20 offsets).
+//
 // Host model: the heap's CPU memory comes from XMemAlloc in the same way and
-// CPU handles are addresses in it; each heap is backed by a host heap of the
-// same type and size, and every API call taking a CPU handle translates it to
-// the host heap by offset. GPU handles are the host heap's.
+// CPU handles are addresses in it, 32 bytes per descriptor whatever the
+// host's increment; each heap is backed by a host heap of the same type and
+// size, and every API call taking a handle translates it to the host heap by
+// index. A shader-visible heap's GPU start, as titles see it, is the same
+// address (console GPU addresses are CPU addresses): GPU handles translate
+// back to the host heap, and translated native code reads the descriptors
+// the view functions write into that memory (descriptor_memory.h).
 #include "core/libs/d3d12_xs/descriptors.h"
 
 #include <map>
@@ -77,7 +84,7 @@ uint64_t STDMETHODCALLTYPE heap_get_cpu_start(DescriptorHeap* self) {
   return self->title_cpu;
 }
 uint64_t STDMETHODCALLTYPE heap_get_gpu_start(DescriptorHeap* self) {
-  return self->host_gpu;
+  return self->host_gpu ? self->title_cpu : 0;
 }
 
 const auto kHeapVtable = [] {
@@ -112,7 +119,7 @@ HRESULT create_descriptor_heap(Device* device, const D3D12_DESCRIPTOR_HEAP_DESC*
   if (FAILED(hr)) return hr;
 
   const UINT increment = device->host->GetDescriptorHandleIncrementSize(desc->Type);
-  const uint64_t bytes = static_cast<uint64_t>(desc->NumDescriptors) * increment;
+  const uint64_t bytes = static_cast<uint64_t>(desc->NumDescriptors) * kTitleDescriptorBytes;
   void* memory = XMemAlloc(static_cast<SIZE_T>(bytes), kDescriptorHeapAttributes);
   if (!memory) {
     host->Release();
@@ -139,18 +146,33 @@ HRESULT create_descriptor_heap(Device* device, const D3D12_DESCRIPTOR_HEAP_DESC*
   return S_OK;
 }
 
-D3D12_CPU_DESCRIPTOR_HANDLE host_cpu_handle(uint64_t title_handle) {
+bool find_descriptor(uint64_t title_handle, DescriptorLocation* out) {
   std::lock_guard<std::mutex> lock(g_lock);
   auto it = heaps_by_end().upper_bound(title_handle);
-  if (it == heaps_by_end().end() || title_handle < it->second->title_cpu) return {0};
-  const DescriptorHeap* heap = it->second;
-  const uint64_t index = (title_handle - heap->title_cpu) / heap->increment;
+  if (it == heaps_by_end().end() || title_handle < it->second->title_cpu) return false;
+  DescriptorHeap* heap = it->second;
+  const uint64_t index = (title_handle - heap->title_cpu) / kTitleDescriptorBytes;
   if (index >= heap->host_count) {
     LIB_LOG(lib::kError, "d3d12", "descriptor %llu is past the host heap's %u descriptors",
             static_cast<unsigned long long>(index), heap->host_count);
-    return {0};
+    return false;
   }
-  return {static_cast<SIZE_T>(heap->host_cpu + (title_handle - heap->title_cpu))};
+  out->heap = heap;
+  out->index = static_cast<uint32_t>(index);
+  out->title = heap->title_cpu + index * kTitleDescriptorBytes;
+  return true;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE host_cpu_handle(uint64_t title_handle) {
+  DescriptorLocation where;
+  if (!find_descriptor(title_handle, &where)) return {0};
+  return {static_cast<SIZE_T>(where.heap->host_cpu + static_cast<uint64_t>(where.index) * where.heap->increment)};
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE host_gpu_handle(uint64_t title_handle) {
+  DescriptorLocation where;
+  if (!find_descriptor(title_handle, &where) || !where.heap->host_gpu) return {0};
+  return {where.heap->host_gpu + static_cast<uint64_t>(where.index) * where.heap->increment};
 }
 
 ID3D12DescriptorHeap* host_heap(const void* heap) {

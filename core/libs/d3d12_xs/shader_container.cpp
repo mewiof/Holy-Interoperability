@@ -16,6 +16,8 @@
 // digests of console containers byte for byte.
 #include "core/libs/d3d12_xs/shader_container.h"
 
+#include <cstdio>
+
 #include <algorithm>
 #include <cstring>
 
@@ -303,6 +305,92 @@ bool native_compute_program(const void* blob, size_t size, NativeComputeProgram*
   if (!find_parts(blob, size, &parts) || !parts.psv || parts.psv_size < 52 || read32(parts.psv) < 48) return false;
   for (int axis = 0; axis < 3; ++axis) out->threads[axis] = read32(parts.psv + 40 + 4 * axis);
   return native_program(blob, size, out);
+}
+
+bool native_compute_registers(const uint32_t* registers, size_t size, ComputeShaderInfo* info, std::string* error) {
+  if (size < kNativeComputeRegisterBytes) {
+    *error = "register block too short";
+    return false;
+  }
+  const uint32_t rsrc2 = registers[6];
+  // COMPUTE_PGM_RSRC2 (public RDNA register layout).
+  if (rsrc2 & 1) {
+    *error = "scratch memory";
+    return false;
+  }
+  info->threads[0] = registers[3] & 0xFFFF;
+  info->threads[1] = registers[3] >> 16;
+  info->threads[2] = registers[4];
+  if (!info->threads[0] || !info->threads[1] || !info->threads[2] ||
+      info->threads[0] * info->threads[1] * info->threads[2] > 1024) {
+    *error = "thread group shape";
+    return false;
+  }
+  info->user_sgprs = (rsrc2 >> 1) & 31;
+  for (uint32_t axis = 0; axis < 3; ++axis) info->tgid_enabled[axis] = ((rsrc2 >> (7 + axis)) & 1) != 0;
+  info->tg_size_enabled = ((rsrc2 >> 10) & 1) != 0;
+  const uint32_t lds = ((rsrc2 >> 15) & 0x1FF) * 512;  // granularity 128 dwords
+  if (lds) info->lds_bytes = lds;
+  return true;
+}
+
+bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription* out, std::string* error) {
+  *out = {};
+  const auto* state = reinterpret_cast<const uint32_t*>(desc[1]);
+  const auto* pipeline = reinterpret_cast<const uint32_t*>(desc[3]);
+  if (!state || desc[2] < kNativeRenderStateBytes || !pipeline || desc[4] < kNativePipelineBlockBytes) {
+    *error = "unexpected description blocks";
+    return false;
+  }
+  for (size_t i = 5; i + 3 < 5 + 2 * 6 && desc[i]; i += 4) {
+    const auto* code = reinterpret_cast<const uint8_t*>(desc[i]);
+    const auto* meta = reinterpret_cast<const uint32_t*>(desc[i + 2]);
+    if (!desc[i + 1] || !meta || desc[i + 3] < 16) {
+      *error = "unexpected stage blocks";
+      return false;
+    }
+    GraphicsStage stage;
+    if (!native_graphics_stage(code, desc[i + 1], &stage)) {
+      *error = "a stage that is neither a vertex nor a pixel program";
+      return false;
+    }
+    if (stage == GraphicsStage::Vertex && !out->vertex_code) {
+      out->vertex_code = code;
+      out->vertex_size = desc[i + 1];
+    } else if (stage == GraphicsStage::Pixel && !out->pixel_code) {
+      out->pixel_code = code;
+      out->pixel_size = desc[i + 1];
+    } else {
+      *error = "two programs for one stage";
+      return false;
+    }
+  }
+  if (!out->vertex_code) {
+    *error = "no vertex stage";
+    return false;
+  }
+  out->render_targets = pipeline[3];
+  if (out->render_targets > 8) {
+    *error = "more than eight render targets";
+    return false;
+  }
+  // Bytes 16-23: one DXGI format per render target (titles leave values in
+  // the bytes past the target count).
+  const auto* format_bytes = reinterpret_cast<const uint8_t*>(pipeline + 4);
+  for (uint32_t i = 0; i < out->render_targets; ++i) out->formats[i] = format_bytes[i];
+  if (pipeline[6]) {
+    char text[64];
+    std::snprintf(text, sizeof(text), "a depth format (assumed in dword 6: 0x%x)", pipeline[6]);
+    *error = text;
+    return false;
+  }
+  out->sample_mask = pipeline[7];
+  out->topology_type = (pipeline[9] >> 16) & 0xFF;
+  out->sample_count = pipeline[10] ? pipeline[10] : 1;
+  out->target_mask = state[0x1E];
+  out->mode_control = state[0x28];
+  for (int i = 0; i < 8; ++i) out->blend[i] = state[0x34 + i];
+  return true;
 }
 
 }  // namespace holy::d3d12

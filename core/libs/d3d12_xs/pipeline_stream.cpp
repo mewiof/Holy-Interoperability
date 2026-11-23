@@ -14,6 +14,9 @@
 #include <intrin.h>
 
 #include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -168,7 +171,8 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
                               vertex ? GraphicsStage::Vertex : GraphicsStage::Pixel, &out,
                               vertex ? &vs_link : &ps_link, &error)) {
         dump_shader(bytecode.pShaderBytecode, bytecode.BytecodeLength, "pipeline");
-        LIB_LOG(lib::kError, "d3d12", "native %s shader not translatable: %s", vertex ? "vertex" : "pixel",
+        LIB_LOG(lib::kError, "d3d12", "native %s shader %016llx not translatable: %s", vertex ? "vertex" : "pixel",
+                static_cast<unsigned long long>(shader_hash(bytecode.pShaderBytecode, bytecode.BytecodeLength)),
                 error.empty() ? "unreadable native program" : error.c_str());
         HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), caller);
         return E_NOTIMPL;
@@ -197,22 +201,208 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
     LIB_LOG(lib::kDebug, "d3d12", "translated vertex shader exports 0x%x; pixel shader reads 0x%x, writes targets 0x%x",
             vs_link.params, ps_link.params, ps_link.targets);
   }
+  const HRESULT hr = create_recorded_pipeline(device, std::move(copy), std::move(shaders), translated, info, vtable,
+                                              pipeline);
+  LIB_LOG(lib::kDebug, "d3d12", "pipeline stream of %llu bytes (subobjects %s) -> 0x%08lX",
+          static_cast<unsigned long long>(desc->SizeInBytes), summary.c_str(), static_cast<unsigned long>(hr));
+  if (FAILED(hr)) discard_host_caches_after_run();
+  return hr;
+}
+
+// --- recipes: how graphics pipelines were made, to derive others from them ---
+
+namespace {
+
+struct Recipe {
+  std::vector<uint8_t> stream;  // the host stream (host root signature, host bytecode)
+  // What the stream points at, shared by recipes derived from this one.
+  std::shared_ptr<std::vector<std::vector<uint8_t>>> blobs;
+  std::shared_ptr<std::vector<D3D12_INPUT_ELEMENT_DESC>> elements;
+  std::shared_ptr<std::vector<std::string>> names;
+  bool translated = false;
+};
+
+std::mutex g_recipe_lock;
+std::map<const void*, std::shared_ptr<Recipe>>& recipes() {
+  static auto* map = new std::map<const void*, std::shared_ptr<Recipe>>();
+  return *map;
+}
+
+// Calls `visit(type, inner offset, size)` for each subobject; false if the
+// stream holds a type that is not a desktop one.
+template <typename Visit>
+bool walk(const std::vector<uint8_t>& stream, Visit visit) {
+  for (size_t at = 0; at + 4 <= stream.size();) {
+    uint32_t type;
+    std::memcpy(&type, stream.data() + at, 4);
+    SubobjectLayout layout;
+    if (!layout_of(type, &layout)) return false;
+    const size_t inner = align_up(at + 4, layout.align);
+    if (inner + layout.size > stream.size()) return false;
+    visit(type, inner, layout.size);
+    at = align_up(inner + layout.size, sizeof(void*));
+  }
+  return true;
+}
+
+// Takes copies of what the stream points at in title memory (the input
+// layout); false if it points at title memory the recipe cannot copy
+// (stream output, view instancing).
+bool own_pointers(Recipe* recipe) {
+  bool ok = true;
+  recipe->elements = std::make_shared<std::vector<D3D12_INPUT_ELEMENT_DESC>>();
+  recipe->names = std::make_shared<std::vector<std::string>>();
+  walk(recipe->stream, [&](uint32_t type, size_t inner, size_t) {
+    if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
+      D3D12_INPUT_LAYOUT_DESC layout;
+      std::memcpy(&layout, recipe->stream.data() + inner, sizeof(layout));
+      if (!layout.NumElements || !layout.pInputElementDescs) return;
+      recipe->names->reserve(layout.NumElements);
+      for (UINT i = 0; i < layout.NumElements; ++i) {
+        recipe->names->push_back(layout.pInputElementDescs[i].SemanticName ? layout.pInputElementDescs[i].SemanticName
+                                                                           : "");
+      }
+      for (UINT i = 0; i < layout.NumElements; ++i) {
+        D3D12_INPUT_ELEMENT_DESC e = layout.pInputElementDescs[i];
+        e.SemanticName = (*recipe->names)[i].c_str();
+        recipe->elements->push_back(e);
+      }
+      layout.pInputElementDescs = recipe->elements->data();
+      std::memcpy(recipe->stream.data() + inner, &layout, sizeof(layout));
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT) {
+      D3D12_STREAM_OUTPUT_DESC so;
+      std::memcpy(&so, recipe->stream.data() + inner, sizeof(so));
+      if (so.NumEntries) ok = false;
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING) {
+      D3D12_VIEW_INSTANCING_DESC vi;
+      std::memcpy(&vi, recipe->stream.data() + inner, sizeof(vi));
+      if (vi.ViewInstanceCount) ok = false;
+    }
+  });
+  return ok;
+}
+
+HRESULT create_from_recipe(Device* device, std::shared_ptr<Recipe> recipe, const lib::VtableInfo* info,
+                           void* const* vtable, void** pipeline) {
   ID3D12Device2* device2 = nullptr;
   if (FAILED(device->host->QueryInterface(IID_PPV_ARGS(&device2)))) return E_NOINTERFACE;
-  const D3D12_PIPELINE_STATE_STREAM_DESC host_desc{copy.size(), copy.data()};
+  const D3D12_PIPELINE_STATE_STREAM_DESC host_desc{recipe->stream.size(), recipe->stream.data()};
   ID3D12PipelineState* state = nullptr;
   const HRESULT hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
   device2->Release();
-  LIB_LOG(lib::kDebug, "d3d12", "pipeline stream of %llu bytes (subobjects %s) -> 0x%08lX",
-          static_cast<unsigned long long>(desc->SizeInBytes), summary.c_str(), static_cast<unsigned long>(hr));
   if (FAILED(hr)) {
     discard_host_caches_after_run();
     return hr;
   }
   Wrapper* wrapper = wrap(state, info, vtable);
-  if (translated) wrapper->flags = kTranslatedPipeline;
+  if (recipe->translated) wrapper->flags = kTranslatedPipeline;
+  {
+    std::lock_guard<std::mutex> guard(g_recipe_lock);
+    recipes()[wrapper] = std::move(recipe);
+  }
   *pipeline = wrapper;
   return S_OK;
+}
+
+}  // namespace
+
+void stream_append(std::vector<uint8_t>* stream, uint32_t type, const void* data, size_t size) {
+  SubobjectLayout layout{size, 4};
+  layout_of(type, &layout);
+  stream->resize(align_up(stream->size(), sizeof(void*)), 0);
+  const size_t at = stream->size();
+  const size_t inner = align_up(at + 4, layout.align);
+  stream->resize(align_up(inner + layout.size, sizeof(void*)), 0);
+  std::memcpy(stream->data() + at, &type, 4);
+  std::memcpy(stream->data() + inner, data, size < layout.size ? size : layout.size);
+}
+
+HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream,
+                                 std::vector<std::vector<uint8_t>> blobs, bool translated,
+                                 const lib::VtableInfo* info, void* const* vtable, void** pipeline) {
+  auto recipe = std::make_shared<Recipe>();
+  recipe->stream = std::move(stream);
+  recipe->blobs = std::make_shared<std::vector<std::vector<uint8_t>>>(std::move(blobs));
+  recipe->translated = translated;
+  if (!own_pointers(recipe.get())) {
+    // Not derivable; created all the same.
+    ID3D12Device2* device2 = nullptr;
+    if (FAILED(device->host->QueryInterface(IID_PPV_ARGS(&device2)))) return E_NOINTERFACE;
+    const D3D12_PIPELINE_STATE_STREAM_DESC host_desc{recipe->stream.size(), recipe->stream.data()};
+    ID3D12PipelineState* state = nullptr;
+    const HRESULT hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
+    device2->Release();
+    if (FAILED(hr)) return hr;
+    Wrapper* wrapper = wrap(state, info, vtable);
+    if (translated) wrapper->flags = kTranslatedPipeline;
+    *pipeline = wrapper;
+    return S_OK;
+  }
+  return create_from_recipe(device, std::move(recipe), info, vtable, pipeline);
+}
+
+// Observed: device slot 55 takes (base pipeline, count, entries, interface
+// id, out) and returns an HRESULT. Entries are 0x14C bytes: a type dword and
+// a desktop description: 0 D3D12_DEPTH_STENCIL_DESC, 1 D3D12_RASTERIZER_DESC,
+// 2 D3D12_BLEND_DESC (field for field from how titles fill them). Type 5 is
+// written next to a depth-stencil entry with zero depth fields and the same
+// stencil masks; its meaning is not established and it is not applied.
+// The result is the base pipeline with those parts replaced.
+HRESULT create_derived_pipeline(Device* device, const void* base, uint32_t count, const uint8_t* entries,
+                                const lib::VtableInfo* info, void* const* vtable, void** pipeline,
+                                const void* caller) {
+  if (!pipeline) return E_POINTER;
+  *pipeline = nullptr;
+  std::shared_ptr<Recipe> from;
+  {
+    std::lock_guard<std::mutex> guard(g_recipe_lock);
+    auto found = recipes().find(base);
+    if (found != recipes().end()) from = found->second;
+  }
+  if (!from) {
+    LIB_LOG(lib::kError, "d3d12", "derived pipeline from %p, whose making was not recorded", base);
+    HolyUnimplementedFrom(kLibrary, "pipeline derived from an unrecorded pipeline", caller);
+    return E_NOTIMPL;
+  }
+  auto recipe = std::make_shared<Recipe>(*from);
+  constexpr size_t kEntryBytes = 0x14C;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint8_t* entry = entries + i * kEntryBytes;
+    uint32_t kind;
+    std::memcpy(&kind, entry, 4);
+    uint32_t types[2] = {0, 0};
+    size_t size = 0;
+    switch (kind) {
+      case 0:
+        types[0] = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
+        types[1] = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;
+        size = sizeof(D3D12_DEPTH_STENCIL_DESC);
+        break;
+      case 1:
+        types[0] = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+        size = sizeof(D3D12_RASTERIZER_DESC);
+        break;
+      case 2:
+        types[0] = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND;
+        size = sizeof(D3D12_BLEND_DESC);
+        break;
+      default:
+        LIB_LOG(lib::kDebug, "d3d12", "derived pipeline entry of type %u not applied", kind);
+        continue;
+    }
+    bool replaced = false;
+    walk(recipe->stream, [&](uint32_t type, size_t inner, size_t) {
+      if (type == types[0] || (types[1] && type == types[1])) {
+        std::memcpy(recipe->stream.data() + inner, entry + 4, size);
+        replaced = true;
+      }
+    });
+    if (!replaced) stream_append(&recipe->stream, types[0], entry + 4, size);
+  }
+  const HRESULT hr = create_from_recipe(device, recipe, info, vtable, pipeline);
+  LIB_LOG(FAILED(hr) ? lib::kError : lib::kDebug, "d3d12", "derived pipeline from %p with %u entries -> 0x%08lX",
+          base, count, static_cast<unsigned long>(hr));
+  return hr;
 }
 
 }  // namespace holy::d3d12

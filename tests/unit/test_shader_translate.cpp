@@ -217,12 +217,85 @@ TEST(translated_graphics_stages_link) {
 }
 
 TEST(untranslatable_code_is_reported) {
-  // v_mov_b32 with a DPP16 operand (needs other lanes), then s_endpgm.
-  const std::vector<uint8_t> code = words({0x7E0202FAu, 0x000000E4u, 0xBF810000u});
+  // v_mov_b32 with a DPP16 operand (needs other lanes), then s_endpgm: a
+  // pixel shader has no group shared memory to exchange through.
+  const std::vector<uint8_t> code = words({0x7E0202FAu, 0xFF001B00u, 0xBF810000u});
+  std::vector<uint8_t> bytecode;
+  ShaderInterface link;
+  std::string error;
+  EXPECT(!translate_graphics(code.data(), code.size(), GraphicsStage::Pixel, &bytecode, &link, &error));
+  EXPECT(error.find("cross-lane") != std::string::npos);
+  EXPECT(error.find("0x0") != std::string::npos);
+  // A DPP control the hardware generation lacks (row_bcast:15) is reported.
+  const std::vector<uint8_t> broadcast = words({0x7E0202FAu, 0xFF014200u, 0xBF810000u});
+  EXPECT(!translate_compute(broadcast.data(), broadcast.size(), ComputeShaderInfo{}, &bytecode, &error));
+  EXPECT(error.find("DPP control 0x142") != std::string::npos);
+}
+
+TEST(cross_lane_operations_exchange_through_group_memory) {
+  // v_mov_b32 v1, v0 quad_perm:[3,2,1,0]; v_readlane_b32 s0, v1, 5;
+  // v_permlanex16_b32 v2, v1, s0, s0; s_endpgm.
+  const std::vector<uint8_t> code = words({0x7E0202FAu, 0xFF001B00u, 0xD7600000u, 0x00010B01u, 0xD7780002u,
+                                           0x00000101u, 0xBF810000u});
   ComputeShaderInfo info;
+  info.threads[0] = 32;
   std::vector<uint8_t> bytecode;
   std::string error;
-  EXPECT(!translate_compute(code.data(), code.size(), info, &bytecode, &error));
-  EXPECT(error.find("DPP") != std::string::npos);
-  EXPECT(error.find("0x0") != std::string::npos);
+  EXPECT(translate_compute(code.data(), code.size(), info, &bytecode, &error));
+  const std::string text = disassemble(bytecode);
+  // Two buffers of 8 bytes for each of the 32 threads.
+  EXPECT(text.find("dcl_tgsm_raw g1, 512") != std::string::npos);
+  EXPECT(text.find("store_raw g1") != std::string::npos);
+  EXPECT(text.find("ld_raw") != std::string::npos);
+  EXPECT(text.find("sync_uglobal_g_t") != std::string::npos);
+}
+
+TEST(native_compute_registers_are_read) {
+  // Observed register block: 8 x 8 threads; RSRC2 0xB8A: 5 user SGPRs,
+  // group ids x, y and z, thread ids x and y, no LDS.
+  uint32_t registers[7] = {0, 0, 0, 8u | (8u << 16), 1, 0, 0xB8Au};
+  ComputeShaderInfo info;
+  std::string error;
+  EXPECT(native_compute_registers(registers, sizeof(registers), &info, &error));
+  EXPECT(info.threads[0] == 8 && info.threads[1] == 8 && info.threads[2] == 1);
+  EXPECT(info.user_sgprs == 5);
+  EXPECT(info.tgid_enabled[0] && info.tgid_enabled[1] && info.tgid_enabled[2]);
+  EXPECT(info.lds_bytes == 32768);
+  registers[6] = 0xB8Au | (4u << 15);  // 4 x 128 dwords of LDS
+  EXPECT(native_compute_registers(registers, sizeof(registers), &info, &error) && info.lds_bytes == 2048);
+  registers[6] = 0xB8Bu;  // scratch
+  EXPECT(!native_compute_registers(registers, sizeof(registers), &info, &error));
+  EXPECT(!native_compute_registers(registers, 20, &info, &error));
+}
+
+TEST(graphics_stage_is_told_by_the_code) {
+  // exp pos0 v0..v3 done: vertex; v_interp_mov_f32 then exp mrt0: pixel.
+  const std::vector<uint8_t> vs_code = words({0xF80008CFu, 0x03020100u, 0xBF810000u});
+  const std::vector<uint8_t> ps_code = words({0xC80A0002u, 0xF8000801u, 0x00000002u, 0xBF810000u});
+  const std::vector<uint8_t> neither = words({0xBF810000u});
+  GraphicsStage stage = GraphicsStage::Pixel;
+  EXPECT(native_graphics_stage(vs_code.data(), vs_code.size(), &stage) && stage == GraphicsStage::Vertex);
+  EXPECT(native_graphics_stage(ps_code.data(), ps_code.size(), &stage) && stage == GraphicsStage::Pixel);
+  EXPECT(!native_graphics_stage(neither.data(), neither.size(), &stage));
+}
+
+TEST(typed_loads_gathers_and_half_class_tests_translate) {
+  // tbuffer_load_format_xyzw v[0:3], v4, s[0:3] format:56 (8_8_8_8_UNORM) idxen;
+  // image_gather4_lz v[0:3], v[4:5], s[8:15], s[16:19] dmask:0x1 dim:2D;
+  // v_cmp_class_f16 vcc, v0, v1; s_endpgm.
+  const std::vector<uint8_t> code = words({0xE9C32000u, 0x80000004u, 0xF11C0108u, 0x00820004u, 0x7D1E0300u,
+                                           0xBF810000u});
+  ComputeShaderInfo info;
+  info.threads[0] = 64;
+  std::vector<uint8_t> bytecode;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &bytecode, &error));
+  EXPECT(error.empty());
+  const std::string text = disassemble(bytecode);
+  EXPECT(text.find("gather4") != std::string::npos);
+  EXPECT(text.find("ubfe") != std::string::npos);  // 8-bit components unpacked
+  // A format number past the RDNA 2 table is reported.
+  const std::vector<uint8_t> bad = words({0xEBC32000u, 0x80000004u, 0xBF810000u});
+  EXPECT(!translate_compute(bad.data(), bad.size(), info, &bytecode, &error));
+  EXPECT(error.find("typed buffer format 120") != std::string::npos);
 }

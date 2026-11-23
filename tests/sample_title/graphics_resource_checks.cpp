@@ -131,7 +131,8 @@ void test_resources(void* device) {
     check(back.Width == desc.Width && back.Flags == desc.Flags, "a resource reports its description");
   }
 
-  // A committed texture like the display buffers titles create.
+  // A committed texture like the display buffers titles create: render target
+  // and unordered access, created in the unordered-access layout (3).
   D3D12_RESOURCE_DESC texture{};
   texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   texture.Width = 256;
@@ -140,7 +141,7 @@ void test_resources(void* device) {
   texture.MipLevels = 1;
   texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
   texture.SampleDesc.Count = 1;
-  texture.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x300001);
+  texture.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x300005);
   const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                    D3D12_MEMORY_POOL_UNKNOWN, 0, 1};
   void* committed = nullptr;

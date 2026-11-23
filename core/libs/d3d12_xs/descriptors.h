@@ -5,6 +5,9 @@
 
 namespace holy::d3d12 {
 
+// Bytes per descriptor in title memory (and the increment titles are told).
+inline constexpr UINT kTitleDescriptorBytes = 32;
+
 struct DescriptorHeap {
   void* const* vtable;
   const lib::VtableInfo* info;
@@ -21,8 +24,18 @@ struct DescriptorHeap {
 
 HRESULT create_descriptor_heap(Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, void** out);
 
+struct DescriptorLocation {
+  DescriptorHeap* heap = nullptr;
+  uint32_t index = 0;   // in the heap
+  uint64_t title = 0;   // the descriptor's address in title memory
+};
+bool find_descriptor(uint64_t title_handle, DescriptorLocation* out);
+
 // The host CPU handle for a title CPU handle; zero if it is in no heap.
 D3D12_CPU_DESCRIPTOR_HANDLE host_cpu_handle(uint64_t title_handle);
+// The host GPU handle for a title GPU handle (an address in a shader-visible
+// heap's memory); zero if it is in none.
+D3D12_GPU_DESCRIPTOR_HANDLE host_gpu_handle(uint64_t title_handle);
 
 ID3D12DescriptorHeap* host_heap(const void* heap);
 

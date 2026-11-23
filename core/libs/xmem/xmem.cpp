@@ -25,6 +25,10 @@
 
 #include "core/libs/support.h"
 
+// physical.cpp
+void* reserve_placeholder(void* address, SIZE_T size);
+void* replace_placeholder(void* address, SIZE_T size, DWORD type, DWORD protect);
+
 namespace {
 
 constexpr char kLibrary[] = "xmem.dll";
@@ -150,10 +154,44 @@ void release(void* address) {
 
 }  // namespace
 
+// Allocation hooks (observed): a title may export __XMemAllocationHooks__, a
+// table whose first two entries are an allocation function with XMemAlloc's
+// signature and a release function with XMemFree's. When it does, every
+// XMemAlloc and XMemFree goes to those hooks, which chain to
+// XMemAllocDefault and XMemFreeDefault for what they do not handle
+// themselves. Titles use them to place system allocations (descriptor heap
+// memory, object type 4) at addresses of their choosing.
+namespace {
+
+struct AllocationHooks {
+  void* (*alloc)(SIZE_T, uint64_t);
+  void (*free)(void*, uint64_t);
+};
+
+const AllocationHooks* title_hooks() {
+  static const AllocationHooks* hooks = [] {
+    const auto* table = reinterpret_cast<const AllocationHooks*>(
+        GetProcAddress(GetModuleHandleW(nullptr), "__XMemAllocationHooks__"));
+    if (table && table->alloc && table->free) {
+      LIB_LOG(holy::lib::kInfo, "xmem", "the title's allocation hooks are in use");
+      return table;
+    }
+    return static_cast<const AllocationHooks*>(nullptr);
+  }();
+  return hooks;
+}
+
+}  // namespace
+
 HOLY_EXPORT void* XMemAlloc(SIZE_T size, uint64_t attributes) {
+  if (const AllocationHooks* hooks = title_hooks()) return hooks->alloc(size, attributes);
   return allocate(size, attributes);
 }
-HOLY_EXPORT void XMemFree(void* address, uint64_t) {
+HOLY_EXPORT void XMemFree(void* address, uint64_t attributes) {
+  if (const AllocationHooks* hooks = title_hooks()) {
+    hooks->free(address, attributes);
+    return;
+  }
   release(address);
 }
 
@@ -197,6 +235,27 @@ HOLY_EXPORT void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_
   const DWORD host_type = allocation_type & ~kConsolePageFlags;
   DWORD host_protect = protect & ~kGraphicsProtectMask;
   if ((host_protect & 0xFF) == 0) host_protect |= PAGE_NOACCESS;
+
+  // Placeholder reservations (documented MEM_RESERVE_PLACEHOLDER) need the
+  // host's VirtualAlloc2; the physical-page mapper takes them over.
+  constexpr DWORD kMemReservePlaceholder = 0x00040000;
+  if (allocation_type & kMemReservePlaceholder) {
+    void* placeholder = reserve_placeholder(address, size);
+    LIB_LOG(placeholder ? holy::lib::kDebug : holy::lib::kError, "xmem",
+            "placeholder reservation size=0x%llx allocator=0x%llx -> %p", static_cast<unsigned long long>(size),
+            static_cast<unsigned long long>(allocator_id), placeholder);
+    return placeholder;
+  }
+
+  constexpr DWORD kMemReplacePlaceholder = 0x00004000;
+  if (allocation_type & kMemReplacePlaceholder) {
+    void* replaced = replace_placeholder(address, size, host_type, host_protect);
+    if (!replaced) {
+      LIB_LOG(holy::lib::kError, "xmem", "placeholder replacement at %p size=0x%llx failed (error %lu)", address,
+              static_cast<unsigned long long>(size), GetLastError());
+    }
+    return replaced;
+  }
 
   void* result = nullptr;
   const bool aligned_reservation = !address && (allocation_type & MEM_RESERVE) && (allocation_type & kMem4MbPages);

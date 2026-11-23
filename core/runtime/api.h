@@ -45,6 +45,12 @@ HOLYRT_API void HolyCommitOnDemand(void* base, size_t size, uint32_t protect);
 // Returns non-zero on success.
 HOLYRT_API int HolyEnsureCommitted(const void* address, size_t size);
 
+// Lets a library that backs title memory lazily (physical pages) back a
+// buffer before it is handed to the kernel; called by HolyEnsureCommitted.
+// The hook returns non-zero on success.
+typedef int (*HolyBackingHook)(const void* address, size_t size);
+HOLYRT_API void HolySetBackingHook(HolyBackingHook hook);
+
 // Translates a path as the title sees it (mounted drives, package-relative
 // paths) into a host path. Returns the length written, or 0 if `count` is too
 // small.

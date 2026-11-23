@@ -23,4 +23,8 @@ void register_commit_on_demand(void* base, size_t size, DWORD protect);
 // yet committed. Returns false if the host refused to commit them.
 bool ensure_committed(const void* address, size_t size);
 
+// A library's hook that backs lazily mapped memory (see HolySetBackingHook);
+// ensure_committed calls it first.
+void set_backing_hook(int (*hook)(const void* address, size_t size));
+
 }  // namespace holy::rt

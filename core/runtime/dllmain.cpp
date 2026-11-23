@@ -161,6 +161,10 @@ void HolyCommitOnDemand(void* base, size_t size, uint32_t protect) {
   holy::rt::register_commit_on_demand(base, size, protect);
 }
 
+void HolySetBackingHook(HolyBackingHook hook) {
+  holy::rt::set_backing_hook(hook);
+}
+
 int HolyEnsureCommitted(const void* address, size_t size) {
   return holy::rt::ensure_committed(address, size) ? 1 : 0;
 }

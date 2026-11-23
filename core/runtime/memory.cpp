@@ -104,8 +104,19 @@ void register_commit_on_demand(void* base, size_t size, DWORD protect) {
   LOG_DEBUG(kComponent, "commit on demand for %p + 0x%llx", base, static_cast<unsigned long long>(size));
 }
 
+namespace {
+std::atomic<int (*)(const void*, size_t)> g_backing_hook{nullptr};
+}  // namespace
+
+void set_backing_hook(int (*hook)(const void* address, size_t size)) {
+  g_backing_hook.store(hook);
+}
+
 bool ensure_committed(const void* address, size_t size) {
   if (!address || size == 0) return true;
+  if (const auto hook = g_backing_hook.load()) {
+    if (!hook(address, size)) return false;
+  }
   const auto begin = reinterpret_cast<uintptr_t>(address);
   const uintptr_t end = begin + size;
   Range range;

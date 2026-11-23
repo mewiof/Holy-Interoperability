@@ -294,6 +294,26 @@ void test_physical_pages() {
   check(XMemMapPhysicalPages(first, 2, nullptr) == first, "physical pages can be unmapped");
   XMemMapPhysicalPages(second + 0x10000, 2, nullptr);
   check(XMemFreePhysicalPages(2, pages) != FALSE, "physical pages can be freed");
+
+  // Fresh pages read as zero, and the kernel can write into pages nobody has
+  // touched yet (file reads straight into mapped physical memory).
+  ULONG_PTR fresh[2] = {};
+  count = 2;
+  auto* third = static_cast<unsigned char*>(XMemVirtualAlloc(nullptr, 0x20000, 0x20402000, 0x23, PAGE_READWRITE));
+  if (!third || !XMemAllocatePhysicalPages(0x280, &count, fresh) || XMemMapPhysicalPages(third, 2, fresh) != third) {
+    check(false, "fresh physical pages map");
+    return;
+  }
+  check(third[0x10000 + 0x123] == 0, "fresh physical pages read as zero");
+  const HANDLE file = CreateFileW(L"G:\\data\\hello.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+  DWORD got = 0;
+  const BOOL read = file != INVALID_HANDLE_VALUE && ReadFile(file, third, 5, &got, nullptr);
+  if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+  check(read && got == 5 && std::memcmp(third, "hello", 5) == 0,
+        "files read straight into untouched physical pages");
+  XMemMapPhysicalPages(third, 2, nullptr);
+  XMemFreePhysicalPages(2, fresh);
 }
 
 // Fast storage: files open through the title's paths.

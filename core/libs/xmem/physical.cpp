@@ -27,12 +27,22 @@
 // open one GPU heap over them (HolyXMemQueryPhysical). Mapping replaces a
 // 64 KiB placeholder with a view of the page's slice, so a page mapped at
 // several addresses is the same memory, as titles' CPU and GPU views expect.
-// Sections are committed; when the host is short of commit charge they are
-// reserved and pages are committed when mapped or first touched.
+// Sections are committed (the host opens GPU heaps only over committed
+// sections); when the host is short of commit charge they are reserved and
+// pages are committed when mapped or first touched.
+//
+// Storage is created lazily: mapping a page that has none yet only records
+// the mapping. The page gets its storage, and the granule its view, on first
+// CPU access (a vectored exception handler), when a buffer in it is handed to
+// the kernel (HolySetBackingHook), or when the graphics library asks for the
+// memory behind it (HolyXMemQueryPhysical). Fresh storage reads as zero
+// either way. Titles map large pools up front (several GiB of texture pool)
+// and use them gradually; commit charge follows use instead of the mapping.
 #include <windows.h>
 
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "core/libs/support.h"
@@ -76,6 +86,11 @@ std::unordered_map<uintptr_t, ULONG_PTR>& mapped() {  // granule address -> page
 }
 std::vector<Region>& regions() {
   static auto* storage = new std::vector<Region>();
+  return *storage;
+}
+// Granules whose mapping is recorded but not yet backed by a view.
+std::unordered_set<uintptr_t>& pending() {
+  static auto* storage = new std::unordered_set<uintptr_t>();
   return *storage;
 }
 
@@ -222,17 +237,24 @@ void restore_placeholder(uintptr_t granule) {
   }
 }
 
-// Makes [granule, granule + 64 KiB) a placeholder of its own.
+// Makes [granule, granule + 64 KiB) a placeholder of its own. (The region
+// size a query reports counts from the queried address, so a granule at the
+// end of a larger placeholder is recognised by the allocation base.)
 void split_placeholder(uintptr_t granule) {
   MEMORY_BASIC_INFORMATION info;
   if (!VirtualQuery(reinterpret_cast<void*>(granule), &info, sizeof(info))) return;
-  if (info.State != MEM_RESERVE || info.RegionSize <= kPage) return;
+  if (info.State != MEM_RESERVE) return;
+  if (reinterpret_cast<uintptr_t>(info.AllocationBase) == granule && info.RegionSize <= kPage) return;
   VirtualFree(reinterpret_cast<void*>(granule), kPage, MEM_RELEASE | kMemPreservePlaceholder);
 }
 
 void unmap_granule(uintptr_t granule) {
   auto found = mapped().find(granule);
   if (found == mapped().end()) return;
+  if (pending().erase(granule)) {
+    mapped().erase(found);
+    return;
+  }
   const auto unmap = kernelbase<UnmapViewOfFile2Fn>("UnmapViewOfFile2");
   if (unmap) unmap(GetCurrentProcess(), reinterpret_cast<void*>(granule), kMemPreservePlaceholder);
   mapped().erase(found);
@@ -245,10 +267,25 @@ void* map_view(const Page& page, uintptr_t granule) {
              static_cast<ULONG64>(page.index) * kPage, kPage, kMemReplacePlaceholder, PAGE_READWRITE, nullptr, 0);
 }
 
+bool back_granule(uintptr_t granule, ULONG_PTR id);
+
 bool map_granule(uintptr_t granule, ULONG_PTR id) {
   unmap_granule(granule);
   if (id == 0) return true;
   if (id > pages().size() || !pages()[id - 1].live) return false;
+  if (pages()[id - 1].section < 0) {
+    // No storage yet: backed on first use.
+    mapped()[granule] = id;
+    pending().insert(granule);
+    return true;
+  }
+  return back_granule(granule, id);
+}
+
+// Gives a mapped granule its page's storage and a view of it. Called with
+// g_lock held.
+bool back_granule(uintptr_t granule, ULONG_PTR id) {
+  pending().erase(granule);
   if (!materialize(id, granule)) return false;
   Page& page = pages()[id - 1];
   split_placeholder(granule);
@@ -281,6 +318,48 @@ bool map_granule(uintptr_t granule, ULONG_PTR id) {
   }
   mapped()[granule] = id;
   return true;
+}
+
+// Backs every pending granule in [begin, end). Called with g_lock held.
+bool back_range(uintptr_t begin, uintptr_t end) {
+  if (pending().empty()) return true;
+  bool ok = true;
+  for (uintptr_t granule = begin & ~(kPage - 1); granule < end; granule += kPage) {
+    if (!pending().count(granule)) continue;
+    if (!back_granule(granule, mapped()[granule])) ok = false;
+  }
+  return ok;
+}
+
+LONG CALLBACK back_on_fault(EXCEPTION_POINTERS* info) {
+  const EXCEPTION_RECORD* record = info->ExceptionRecord;
+  if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  const uintptr_t granule = static_cast<uintptr_t>(record->ExceptionInformation[1]) & ~(kPage - 1);
+  AcquireSRWLockExclusive(&g_lock);
+  const auto found = pending().count(granule) ? mapped().find(granule) : mapped().end();
+  const bool backed = found != mapped().end() && back_granule(granule, found->second);
+  ReleaseSRWLockExclusive(&g_lock);
+  return backed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+int back_buffer(const void* address, size_t size) {
+  if (!address || size == 0) return 1;
+  const auto begin = reinterpret_cast<uintptr_t>(address);
+  AcquireSRWLockExclusive(&g_lock);
+  const bool ok = back_range(begin, begin + size);
+  ReleaseSRWLockExclusive(&g_lock);
+  return ok ? 1 : 0;
+}
+
+void install_lazy_backing() {
+  static const bool installed = [] {
+    AddVectoredExceptionHandler(1, &back_on_fault);
+    HolySetBackingHook(&back_buffer);
+    return true;
+  }();
+  (void)installed;
 }
 
 }  // namespace
@@ -342,7 +421,11 @@ HOLY_EXPORT BOOL HolyXMemQueryPhysical(const void* address, HANDLE* section, uin
                                        uint64_t* contiguous) {
   const auto at = reinterpret_cast<uintptr_t>(address);
   const uintptr_t granule = at & ~(kPage - 1);
-  AcquireSRWLockShared(&g_lock);
+  AcquireSRWLockExclusive(&g_lock);
+  // Back the granule and every pending one mapped contiguously after it.
+  uintptr_t last = granule;
+  while (mapped().count(last + kPage)) last += kPage;
+  back_range(granule, last + kPage);
   BOOL found = FALSE;
   auto it = mapped().find(granule);
   if (it != mapped().end()) {
@@ -361,7 +444,7 @@ HOLY_EXPORT BOOL HolyXMemQueryPhysical(const void* address, HANDLE* section, uin
     *contiguous = run;
     found = storage.committed ? TRUE : FALSE;
   }
-  ReleaseSRWLockShared(&g_lock);
+  ReleaseSRWLockExclusive(&g_lock);
   return found;
 }
 
@@ -383,6 +466,7 @@ HOLY_EXPORT BOOL XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* page_array) {
 
 HOLY_EXPORT void* XMemMapPhysicalPages(void* address, ULONG_PTR count, ULONG_PTR* page_array) {
   if (!address || count == 0 || (reinterpret_cast<uintptr_t>(address) & (kPage - 1))) return nullptr;
+  install_lazy_backing();
   const auto base = reinterpret_cast<uintptr_t>(address);
   bool ok = true;
   AcquireSRWLockExclusive(&g_lock);
@@ -397,6 +481,7 @@ HOLY_EXPORT void* XMemMapPhysicalPages(void* address, ULONG_PTR count, ULONG_PTR
 
 HOLY_EXPORT BOOL XMemMapPhysicalPagesScatter(void** addresses, ULONG_PTR count, ULONG_PTR* page_array) {
   if (!addresses) return FALSE;
+  install_lazy_backing();
   bool ok = true;
   AcquireSRWLockExclusive(&g_lock);
   for (ULONG_PTR i = 0; i < count && ok; ++i) {

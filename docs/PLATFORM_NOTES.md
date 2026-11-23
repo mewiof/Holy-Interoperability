@@ -86,7 +86,30 @@ Notes describe the platform, never a title.
   reservation.
 - *assumed*: `D3D12SerializeVersionedRootSignature` and `D3D12CreateRootSignatureDeserializer` have the
   desktop signatures (same names, same role); they are forwarded to the host.
-- Open: `D3D12XboxCreateDevice` and everything behind it.
+- *observed*: `HRESULT D3D12XboxCreateDevice(adapter, const parameters*, REFIID, void** device)` is called once,
+  after the title has created its window, with a null adapter, a 0x40-byte parameter block starting with the
+  version `0x20004`, and the device interface id `5405c344-d457-444e-b4dd-2366e45aee39`.
+- *observed*: methods that return a structure are called C-style: the result pointer is the first argument and
+  the object the second (device slot 26, called with node mask 1 and heap types 1-3, is the desktop
+  `GetCustomHeapProperties`). All other methods take the object first.
+- *observed*: the device's vtable follows the desktop `ID3D12Device` order only in places: slot 8
+  `CreateCommandQueue` (desktop `D3D12_COMMAND_QUEUE_DESC`, desktop `ID3D12CommandQueue` id), 9
+  `CreateCommandAllocator`, 26 `GetCustomHeapProperties`, 36 `CreateFence` (desktop `ID3D12Fence` id). Slot 48
+  also creates command queues (used for compute queues, with a flags value that has no desktop meaning), and slot
+  73 creates command lists from a 16-byte descriptor (first dword the list type), an allocator, an initial
+  state and the console command-list id `c3827890-4024-474c-98cf-645b51dc4874`.
+- *observed*: fences and allocators keep the desktop method order for the slots titles call (fence 7
+  `GetDevice`, 8 `GetCompletedValue`, 10 `Signal`; allocator 8 `Reset`).
+- *observed*: the console command list has well over 130 slots; slot 9 is `Close`. Right after creating a
+  list, titles call slot 132 with `(0x700000, 0, 0, 0xffffffffff00)` and slot 131 with
+  `(0xc3c0, 0x80020000, 0, 0xffffffffff00)`, without checking a result. The values look like hardware register
+  offsets, values and masks; what the calls do cannot be established from call sites or desktop documentation.
+- *observed*: titles query the device for `IDXGIDevice` and walk adapter and output through it; the console
+  output's display-mode query is at slot 21 and fills 32-byte entries, which is not the desktop
+  `IDXGIOutput` order.
+- Implementation: device creation on the host's Direct3D 12, the device slots above, queues, fences and
+  allocators (fences and allocators forward to host objects), and command-list creation and `Close`. Every
+  other slot, and any interface query other than the device's own, reports itself.
 
 ## Game runtime (`xgameruntime.dll`)
 

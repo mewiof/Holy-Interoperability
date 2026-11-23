@@ -10,6 +10,7 @@
 
 #include <cstring>
 
+#include "core/libs/d3d12_xs/device.h"
 #include "core/libs/support.h"
 
 namespace {
@@ -33,6 +34,17 @@ HOLY_EXPORT HRESULT WINAPI D3D12ConfigureVirtualMemoryX(const void* configuratio
   LIB_LOG(holy::lib::kInfo, "d3d12", "virtual memory configuration: %08x %08x %08x %08x %08x %08x %08x %08x",
           words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
   return S_OK;
+}
+
+// Observed: D3D12XboxCreateDevice(adapter, parameters, REFIID, void** device),
+// called once with a null adapter after D3D12ConfigureVirtualMemoryX.
+HOLY_EXPORT HRESULT WINAPI D3D12XboxCreateDevice(void* adapter, const void* parameters, REFIID riid,
+                                                 void** device) {
+  (void)adapter;
+  (void)riid;
+  if (!device) return E_POINTER;
+  *device = holy::d3d12::create_device(parameters);
+  return *device ? S_OK : static_cast<HRESULT>(0x887A0004);  // DXGI_ERROR_UNSUPPORTED
 }
 
 HOLY_EXPORT HRESULT WINAPI D3D12SerializeVersionedRootSignature(const void* root_signature, void** blob,

@@ -173,7 +173,7 @@ constexpr DWORD kMemLargePages = 0x20000000;  // MEM_LARGE_PAGES
 constexpr DWORD kMemPhysical = 0x00400000;    // MEM_PHYSICAL
 constexpr DWORD kMem4MbPages = 0x80000000;    // MEM_4MB_PAGES
 constexpr DWORD kConsolePageFlags = kMemLargePages | kMemPhysical | kMem4MbPages;
-constexpr DWORD kGraphicsProtectMask = 0x0003F800;  // PAGE_GRAPHICS_NOACCESS .. PAGE_GRAPHICS_COHERENT
+constexpr DWORD kGraphicsProtectMask = 0x0007F800;  // PAGE_GRAPHICS_NOACCESS .. PAGE_GRAPHICS_NOCACHE
 constexpr SIZE_T k4Mb = 4 * 1024 * 1024;
 
 std::atomic<int> g_virtual_log_budget{64};

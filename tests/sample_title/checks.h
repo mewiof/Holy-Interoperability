@@ -7,3 +7,4 @@ void check(bool ok, const char* what);
 extern bool g_expect_online;
 
 void test_game_runtime();
+void test_graphics();

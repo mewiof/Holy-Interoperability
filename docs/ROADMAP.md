@@ -53,12 +53,17 @@ provider interfaces obtained from `QueryApiImpl`.
 - Policy for services with no local equivalent: the runtime does not sign users in to anything, does not
   emulate online services, and never reports ownership of add-on content.
 
-## 4. Graphics (`d3d12_xs`, `xg_xs`) — open
+## 4. Graphics (`d3d12_xs`, `xg_xs`) — partial (blocked)
 
 The largest piece.
 
 - done: `D3D12ConfigureVirtualMemoryX` (accepted and recorded), root-signature helpers (forwarded).
-- open: `D3D12XboxCreateDevice` and the object model behind it, translated onto the host's Direct3D 12.
+- partial: `D3D12XboxCreateDevice` on the host's Direct3D 12; command queues, fences, allocators, command-list
+  creation and `Close`.
+- blocked: the next calls titles make are console command-list methods that take hardware-register-style
+  values (see [PLATFORM_NOTES.md](PLATFORM_NOTES.md)); their contracts cannot be established from call sites
+  and desktop documentation alone.
+- open: console DXGI objects (device, adapter, output with the console's display-mode query).
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.
 - open: shader translation. Titles ship only native console GPU machine code (see

@@ -374,6 +374,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR command_line, int) {
   test_input();
   test_physical_pages();
   test_fast_storage();
+  test_graphics();
   if (!(command_line && std::strstr(command_line, "--expect-online"))) test_offline();
   if (command_line && std::strstr(command_line, "--expect-sandbox")) test_sandbox_is_enforced_by_the_os();
 

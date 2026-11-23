@@ -38,7 +38,7 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Runtime: import binder, reporting thunks, call tracing, crash reports | Working, tested end to end |
 | Title environment: package mount, read-only package, scratch storage, console identity, lifecycle registration | Working, tested end to end |
 | `xmem` (title memory) | Heap, virtual and physical-page allocation and mapping; commit on demand |
-| `d3d12_xs` (graphics) | Entry points only; no device, no rendering |
+| `d3d12_xs` (graphics) | Device on the host's Direct3D 12, queues, fences, allocators, command-list creation; no rendering |
 | `xgameruntime` (game runtime) | Entry points, task queues and async calls, networking (offline), users (nobody signed in), system identity, package state, persistent local storage, display mode; other services missing |
 | `xcrdapi` (fast storage) | Factory and file opening; queues and requests missing |
 | `gameinput` (input) | Interface present; no input devices surfaced yet |
@@ -47,7 +47,9 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 What this means in practice: a retail title image loads, runs its static initialisation, initialises the
 game runtime, creates its task queues, queries networking, user and system services and the input API, and
-reaches graphics device creation, where it stops. Nothing is rendered yet and no title is playable.
+creates its window and its graphics device, queues and first command list, and stops at the first
+console-specific command-list method. Nothing is rendered yet and no title is playable: titles ship their
+shaders only as the console GPU's native machine code (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 
 Progress is measured as *console library coverage*: of the console-only symbols a title imports, how many
 have a real implementation. `holy inspect` prints it for any package. Placeholder exports never count.

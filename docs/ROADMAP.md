@@ -71,12 +71,15 @@ The largest piece.
   against known results once draws and dispatches run.
 - done: query heaps, command signatures, desktop-order committed resources, console samplers (field meaning
   partly assumed), heaps over title memory, pipeline state streams (desktop or translated programs).
-- next: `xg_xs` texture layout (the title asks for swizzle modes next), then command recording (for translated
-  pipelines: root data in user SGPRs, root tables and the region table) and presentation.
-- open: textures placed in title memory (console layouts via `xg_xs`), presentation.
+- partial: `xg_xs` texture layout: swizzle mode suggestion and the texture computer's copy into the layout it
+  reports (desktop copyable footprints); texture views at title addresses through host copies.
+- next: compute pipelines from native code given directly (device slot 67), which need image instructions and
+  cross-lane operations in the translation (DXBC has no wave operations; to be emulated through group shared
+  memory); then command recording (for translated pipelines: root data in user SGPRs, root tables, the region
+  table and console-format descriptors in title memory) and presentation.
+- open: textures the GPU writes in title memory, presentation.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.
-- open: `xg_xs` texture layout computation.
 - open: interaction with graphics helper DLLs that packages ship and that call into the device.
 
 ## 5. Audio (`acphal`, `xapu`, `chad`) — open
@@ -97,8 +100,8 @@ name.
 
 The console's fast-storage factory. Plan: implement on host file I/O first, the host's equivalent API later.
 
-- done: factory, `OpenFile`, staging size.
-- open: queues, requests (including the console's decompression formats), status arrays.
+- done: factory, `OpenFile`, staging size, status arrays, queues, file and memory requests, zlib requests.
+- open: asynchronous processing (requests are carried out one at a time when enqueued), other request kinds.
 
 ## Cross-cutting
 

@@ -40,17 +40,20 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `xmem` (title memory) | Heap, virtual and physical-page allocation and mapping; commit on demand; lazily backed physical pages |
 | `d3d12_xs` (graphics) | Device on the host's Direct3D 12, queues, fences, descriptor heaps, views, samplers, query heaps, command signatures, resources and heaps in title memory, compute and graphics pipelines from DXIL or from native GPU code translated to host bytecode (not yet run); no command recording or rendering yet |
 | `xgameruntime` (game runtime) | Entry points, task queues and async calls, networking (offline), users (nobody signed in), system identity, package state, persistent local storage, display mode; other services missing |
-| `xcrdapi` (fast storage) | Factory and file opening; queues and requests missing |
+| `xcrdapi` (fast storage) | Factory, file opening, status arrays, queues, file and memory requests including zlib (processed synchronously) |
 | `gameinput` (input) | Interface present; no input devices surfaced yet |
 | Offline switch, interposers for DLLs the package ships | Working, tested end to end |
-| Audio and texture-layout console libraries | Not started |
+| `xg_xs` (texture layout) | Swizzle mode suggestion, texture copies into a desktop-compatible layout |
+| Audio console libraries | Not started |
 
 What this means in practice: a retail title image loads, runs its static initialisation, initialises the
 game runtime, creates its task queues, queries networking, user and system services and the input API, and
 creates its window, its graphics device, queues, descriptor heaps, display buffers, the compute pipelines of
 a packaged library (one of them translated from native GPU code because the host refuses its DXIL), query
-heaps, command signatures, its texture pool and its first graphics pipelines (shaders translated from native
-GPU code), and stops in the texture layout library, which is not started. Nothing is rendered yet and no title is playable: command
+heaps, command signatures, its texture pool, its first graphics pipelines (shaders translated from native
+GPU code) and textures, streams its start-up data through fast storage for about half a minute, and stops at a
+compute pipeline given as raw native code that uses image and cross-lane instructions the translation does not
+support yet. Nothing is rendered yet and no title is playable: command
 recording, graphics shader translation and presentation are open (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 
 Progress is measured as *console library coverage*: of the console-only symbols a title imports, how many

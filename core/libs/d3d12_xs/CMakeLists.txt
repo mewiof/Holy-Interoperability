@@ -19,8 +19,8 @@ holy_add_system_library(holy_lib_d3d12_xs
     resource.cpp
     shader/dxbc.cpp
     shader/dxbc.h
-    shader/inflate.cpp
-    shader/inflate.h
+    ../inflate.cpp
+    ../inflate.h
     shader/rdna.cpp
     shader/rdna.h
     shader/translate.cpp
@@ -29,7 +29,9 @@ holy_add_system_library(holy_lib_d3d12_xs
     shader_container.h
     shader_dump.cpp
     shader_dump.h
+    texture_upload.cpp
+    texture_upload.h
     views.cpp
     views.h
     queue.cpp
-  LIBS d3d12 dxgi holy_lib_xmem)
+  LIBS d3d12 dxgi psapi holy_lib_xmem)

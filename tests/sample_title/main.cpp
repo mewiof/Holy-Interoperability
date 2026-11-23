@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 #include <stdexcept>
 #include <string>
 
@@ -274,6 +275,72 @@ void test_lifecycle() {
 }
 
 // Physical pages: the same page mapped at two addresses is one piece of memory.
+// Large commits are taken on first touch: they read as zero and accept
+// writes, and title arrays in such memory can be passed to the physical
+// page functions.
+void test_deferred_commit() {
+  auto* pool = static_cast<unsigned char*>(XMemVirtualAlloc(nullptr, 256ull << 20, MEM_RESERVE | MEM_COMMIT, 0x21,
+                                                            PAGE_READWRITE));
+  check(pool != nullptr, "a 256 MiB commit succeeds");
+  if (!pool) return;
+  const bool zero = pool[0] == 0 && pool[(256ull << 20) - 1] == 0;
+  pool[(128ull << 20) + 7] = 0x42;
+  check(zero && pool[(128ull << 20) + 7] == 0x42, "large commits read as zero and accept writes");
+  // A page array in untouched memory of the pool.
+  auto* ids = reinterpret_cast<ULONG_PTR*>(pool + (200ull << 20));
+  ULONG_PTR count = 1;
+  ULONG_PTR page = 0;
+  auto* region = static_cast<unsigned char*>(XMemVirtualAlloc(nullptr, 0x10000, 0x20402000, 0x23, PAGE_READWRITE));
+  const bool allocated = XMemAllocatePhysicalPages(0x280, &count, &page) && region;
+  if (allocated) ids[0] = page;
+  check(allocated && XMemMapPhysicalPages(region, 1, ids) == region && region[5] == 0,
+        "page arrays in memory committed on first touch map pages");
+  if (allocated) {
+    XMemMapPhysicalPages(region, 1, nullptr);
+    XMemFreePhysicalPages(1, &page);
+  }
+}
+
+// The texture layout library: swizzle mode suggestion, and copies into the
+// layout it reports (desktop copyable footprints: rows 256 bytes apart).
+void test_texture_layout() {
+  HMODULE xg = LoadLibraryW(L"xg_xs.dll");
+  using SuggestFn = HRESULT(WINAPI*)(const void*, uint32_t, uint32_t*);
+  using CreateFn = HRESULT(WINAPI*)(const void*, void**);
+  const auto suggest = xg ? reinterpret_cast<SuggestFn>(GetProcAddress(xg, "XGSuggestSwizzleMode")) : nullptr;
+  const auto create = xg ? reinterpret_cast<CreateFn>(GetProcAddress(xg, "XGCreateTextureComputer")) : nullptr;
+  if (!suggest || !create) {
+    check(false, "the texture layout library is available");
+    return;
+  }
+  // D3D12_RESOURCE_DESC layout: a 4x2 R8_UNORM 2D texture.
+  uint8_t desc[56] = {};
+  const uint32_t dimension = 3, height = 2, format = 61, samples = 1;
+  const uint64_t width = 4;
+  const uint16_t one = 1;
+  std::memcpy(desc + 0, &dimension, 4);
+  std::memcpy(desc + 16, &width, 8);
+  std::memcpy(desc + 24, &height, 4);
+  std::memcpy(desc + 28, &one, 2);
+  std::memcpy(desc + 30, &one, 2);
+  std::memcpy(desc + 32, &format, 4);
+  std::memcpy(desc + 36, &samples, 4);
+  uint32_t mode = 0xFFFFFFFF;
+  check(suggest(desc, 0, &mode) == S_OK && mode == 0, "the layout library suggests a swizzle mode");
+  void* computer = nullptr;
+  check(create(desc, &computer) == S_OK && computer, "the layout library creates texture computers");
+  if (!computer) return;
+  using CopyFn = HRESULT(STDMETHODCALLTYPE*)(void*, void*, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
+  const uint8_t texels[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  std::vector<uint8_t> memory(512, 0xEE);
+  const HRESULT copied =
+      reinterpret_cast<CopyFn>((*static_cast<void***>(computer))[8])(computer, memory.data(), 0, 0, texels, 4, 8);
+  check(copied == S_OK && memory[0] == 1 && memory[3] == 4 && memory[4] == 0xEE && memory[256] == 5 &&
+            memory[259] == 8,
+        "texture computers copy texels into rows 256 bytes apart");
+  reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(computer))[2])(computer);
+}
+
 void test_physical_pages() {
   ULONG_PTR pages[2] = {};
   ULONG_PTR count = 2;
@@ -326,10 +393,57 @@ void test_fast_storage() {
   const auto open = reinterpret_cast<OpenFileFn>((*static_cast<void***>(factory))[4]);
   void* file = nullptr;
   check(open(factory, L"G:\\data\\hello.txt", kFactory, &file) == S_OK && file, "fast storage opens package files");
-  if (file) reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(file))[2])(file);
   void* missing = nullptr;
   check(open(factory, L"G:\\data\\missing.bin", kFactory, &missing) == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND),
         "fast storage reports missing files");
+
+  // Status array (slot 5) and queue (slot 10); requests (queue slot 3) read a
+  // file range, or inflate a zlib stream from memory, into the destination;
+  // a status entry (queue slot 4) completes with the requests' result.
+  using CreateStatusFn = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, const char*, REFIID, void**);
+  using CreateQueueFn = HRESULT(STDMETHODCALLTYPE*)(void*, const void*, REFIID, void**);
+  void** table = *static_cast<void***>(factory);
+  void* status = nullptr;
+  void* queue = nullptr;
+  uint32_t queue_desc[10] = {};
+  reinterpret_cast<CreateStatusFn>(table[5])(factory, 2, "sample", kFactory, &status);
+  reinterpret_cast<CreateQueueFn>(table[10])(factory, queue_desc, kFactory, &queue);
+  check(status && queue, "fast storage creates status arrays and queues");
+  if (!status || !queue || !file) return;
+  void** q = *static_cast<void***>(queue);
+  void** st = *static_cast<void***>(status);
+  using EnqueueFn = HRESULT(STDMETHODCALLTYPE*)(void*, const uint8_t*);
+  using StatusFn = void(STDMETHODCALLTYPE*)(void*, void*, uint32_t);
+  using CompleteFn = bool(STDMETHODCALLTYPE*)(void*, uint32_t);
+  using ResultFn = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t);
+  auto request = [](uint64_t options, void* destination, uint32_t destination_size, const void* source,
+                    uint64_t offset, uint32_t source_size) {
+    std::vector<uint8_t> r(0x40, 0);
+    std::memcpy(r.data(), &options, 8);
+    std::memcpy(r.data() + 8, &destination, 8);
+    std::memcpy(r.data() + 0x18, &destination_size, 4);
+    std::memcpy(r.data() + 0x20, &source, 8);
+    std::memcpy(r.data() + 0x28, &offset, 8);
+    std::memcpy(r.data() + 0x30, &source_size, 4);
+    return r;
+  };
+  char text[5] = {};
+  const std::vector<uint8_t> from_file = request(0, text, 4, file, 6, 4);  // "from"
+  reinterpret_cast<EnqueueFn>(q[3])(queue, from_file.data());
+  reinterpret_cast<StatusFn>(q[4])(queue, status, 0);
+  check(reinterpret_cast<CompleteFn>(st[3])(status, 0) && reinterpret_cast<ResultFn>(st[4])(status, 0) == S_OK &&
+            std::memcmp(text, "from", 4) == 0,
+        "fast storage reads file ranges and completes status entries");
+  // zlib stream (one stored block) holding "packed".
+  const uint8_t packed[] = {0x78, 0x01, 0x01, 0x06, 0x00, 0xF9, 0xFF, 'p', 'a', 'c', 'k', 'e', 'd',
+                            0x08, 0x86, 0x02, 0x69};
+  char unpacked[7] = {};
+  const std::vector<uint8_t> from_memory = request((1ull << 22) | 1, unpacked, 6, packed, 0, sizeof(packed));
+  reinterpret_cast<EnqueueFn>(q[3])(queue, from_memory.data());
+  reinterpret_cast<StatusFn>(q[4])(queue, status, 1);
+  check(reinterpret_cast<ResultFn>(st[4])(status, 1) == S_OK && std::memcmp(unpacked, "packed", 6) == 0,
+        "fast storage inflates zlib requests");
+  reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(file))[2])(file);
 }
 
 // The console input library, with no input device attached.
@@ -401,7 +515,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR command_line, int) {
   test_game_runtime();
   test_input();
   test_physical_pages();
+  test_deferred_commit();
   test_fast_storage();
+  test_texture_layout();
   test_graphics();
   if (!(command_line && std::strstr(command_line, "--expect-online"))) test_offline();
   if (command_line && std::strstr(command_line, "--expect-sandbox")) test_sandbox_is_enforced_by_the_os();

@@ -1,9 +1,9 @@
 // DEFLATE decoder following RFC 1951: stored, fixed-Huffman and
 // dynamic-Huffman blocks, canonical Huffman codes decoded one bit at a time
 // from per-length code counts.
-#include "core/libs/d3d12_xs/shader/inflate.h"
+#include "core/libs/inflate.h"
 
-namespace holy::d3d12 {
+namespace holy::lib {
 namespace {
 
 constexpr int kMaxBits = 15;
@@ -234,4 +234,4 @@ bool zlib_inflate(const uint8_t* data, size_t size, std::vector<uint8_t>* out, s
   return ((b << 16) | a) == expected;
 }
 
-}  // namespace holy::d3d12
+}  // namespace holy::lib

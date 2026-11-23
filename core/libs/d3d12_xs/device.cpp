@@ -17,6 +17,7 @@
 #include <d3d12.h>
 
 #include <intrin.h>
+#include <psapi.h>
 
 #include <cstdio>
 #include <cstring>
@@ -528,9 +529,13 @@ HRESULT create_translated_compute_pipeline(Device* self, const D3D12_COMPUTE_PIP
   host.CS = {bytecode.data(), bytecode.size()};
   ID3D12PipelineState* state = nullptr;
   const HRESULT hr = self->host->CreateComputePipelineState(&host, IID_PPV_ARGS(&state));
-  LIB_LOG(lib::kInfo, "d3d12", "translated compute shader (%u threads, %zu bytes of host bytecode) in %llu ms: 0x%08lX",
+  PROCESS_MEMORY_COUNTERS_EX memory{};
+  GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory));
+  LIB_LOG(lib::kInfo, "d3d12",
+          "translated compute shader (%u threads, %zu bytes of host bytecode) in %llu ms: 0x%08lX (process commit %llu MiB)",
           info.threads[0] * info.threads[1] * info.threads[2], bytecode.size(),
-          static_cast<unsigned long long>(GetTickCount64() - start), static_cast<unsigned long>(hr));
+          static_cast<unsigned long long>(GetTickCount64() - start), static_cast<unsigned long>(hr),
+          static_cast<unsigned long long>(memory.PrivateUsage >> 20));
   if (FAILED(hr)) {
     dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
     return hr;
@@ -596,6 +601,22 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(Device* self, const D3D12_PIPELI
   return create_pipeline_from_stream(self, desc, &kPipelineInfo, kPipelineVtable.data(), pipeline, _ReturnAddress());
 }
 
+// Observed: device slot 67 takes (description, pipeline interface id, out)
+// and returns an HRESULT. The description starts with the root signature,
+// followed by (pointer, size) pairs: 28 bytes of what look like register
+// settings (an 8x8 thread group among them), 20 bytes not understood, and
+// native GPU code behind a short header. It creates compute pipelines from
+// native code given directly; not supported yet (the code seen uses image
+// and cross-lane instructions, which the translation lacks).
+HRESULT STDMETHODCALLTYPE create_native_pipeline(Device*, const uint64_t* desc, REFIID, void** out) {
+  if (out) *out = nullptr;
+  if (desc && desc[5] && desc[6] && desc[6] < 0x100000) {
+    dump_shader(reinterpret_cast<const void*>(desc[5]), desc[6], "native compute");
+  }
+  HolyUnimplementedFrom(kLibrary, "compute pipeline from native code (device slot 67)", _ReturnAddress());
+  return E_NOTIMPL;
+}
+
 const auto kDeviceVtable = [] {
   auto table = lib::make_reporting_vtable<kDeviceSlots>();
   table[0] = reinterpret_cast<void*>(&device_query_interface);
@@ -623,6 +644,7 @@ const auto kDeviceVtable = [] {
   table[48] = reinterpret_cast<void*>(&create_queue_x);
   table[61] = reinterpret_cast<void*>(&create_sampler_x);
   table[62] = reinterpret_cast<void*>(&create_compute_pipeline_state_x);
+  table[67] = reinterpret_cast<void*>(&create_native_pipeline);
   table[70] = reinterpret_cast<void*>(&create_shader_resource_view_at);
   table[73] = reinterpret_cast<void*>(&create_command_list_x);
   table[74] = reinterpret_cast<void*>(&create_heap_over_memory);

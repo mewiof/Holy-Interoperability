@@ -94,6 +94,11 @@ Notes describe the platform, never a title.
   library), when a buffer in it is handed to the kernel (the runtime's commit-before-I/O path calls the memory
   library first), or when the graphics library asks for the memory behind an address. Fresh storage reads as
   zero. Commit charge is taken per section (up to 1 GiB) when its first page is used, not at mapping time.
+  Code holding the page-table lock never touches title memory (title arrays are copied in and out around
+  it), since a fault there would re-enter the backing handler.
+- Implementation: commits of 64 MiB or more are always reserved and committed on first touch, not only when
+  the host refuses them: titles commit pools of several GiB up front and otherwise take the host's spare
+  commit charge before anything else can.
 - Open: `XMemVirtualQuery`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable` signatures.
 
 ## Graphics (`d3d12_xs.dll`)
@@ -137,6 +142,16 @@ Notes describe the platform, never a title.
   `GetResourceAllocationInfo` keep the desktop meanings. A descriptor heap's CPU memory comes from `XMemAlloc`
   with object type 4 and allocator id 0x80: titles place it with an allocation hook and require the heap's CPU
   start to be their address. Titles ask for shader-visible heaps of 1,245,184 descriptors.
+- *observed*: slot 70 is also called for textures (a texture description, a view description and the texture's
+  address in title memory, laid out as the texture layout library reported). Implementation: a host texture of
+  the same shape is created and filled from that memory with buffer-to-texture copies, once per address and
+  shape. Partial: memory written after that is not copied again; textures the GPU writes are not supported.
+- *observed*: device slot 67 takes (description, pipeline interface id, out) and returns an `HRESULT`. The
+  description holds the root signature and (pointer, size) pairs: 28 bytes of what look like register settings
+  (an 8x8 thread group among them), 20 bytes not understood, and native GPU code behind a short header. It
+  creates compute pipelines from native code given directly. Not supported yet: the code seen samples and
+  stores images and reduces values across lanes (DPP, `v_readlane`), which the translation lacks; such calls
+  report themselves.
 - *observed*: titles create constant buffer views of 128 bytes; the desktop requires multiples of 256 and removes
   the device otherwise. Views are widened to the next multiple of 256.
 - *observed*: titles ask for the descriptor increment of heap type 4, which the desktop does not have; what the
@@ -308,8 +323,19 @@ Notes describe the platform, never a title.
   void**)`, 8 takes a 32 MiB size before any queue exists (staging buffer size), 10 `CreateQueue(desc,
   REFIID, void**)` with a descriptor laid out like the public `DSTORAGE_QUEUE_DESC` (source type, capacity,
   priority, name) followed by a field titles set to 1.
-- Implementation, partial: the factory, `OpenFile` (read-only, through the title's path translation) and the
-  staging size. Queues, requests and status arrays are open.
+- *observed*: the queue descriptor is not the desktop layout past the source type: the name pointer is at offset
+  16 and the field titles set to 1 at offset 24.
+- *observed* queue slots: 3 `EnqueueRequest(const Request*)`, 4 `EnqueueStatus(status array, index)`. Request
+  layout (from how titles fill it): options at 0 (bit 22: the source is memory; bit 0: set for the titles'
+  format 3), destination address at 8, destination size at 0x18, source (file object or memory address) at
+  0x20, file offset at 0x28, source size at 0x30. Requests with bit 0 carry zlib streams (RFC 1950 headers
+  seen), whose inflated size is the destination size.
+- *assumed*: queue slots 5 `EnqueueSignal(fence, value)` and 6 `Submit()`, status array slots 3
+  `IsComplete(index)` and 4 `GetHResult(index)`, in the desktop order (not yet called by titles).
+- Implementation: requests are carried out when enqueued (reads through the title's path translation, zlib
+  inflated by the project's decoder), so they complete earlier than on the console; a status entry gets the
+  first failure since the previous one. Partial: requests are processed one at a time on the calling thread
+  (slow: titles stream thousands at start-up); other request kinds and queue slots report themselves.
 
 ## Graphics shaders
 
@@ -377,7 +403,20 @@ Notes describe the platform, never a title.
 - *observed*: titles do not write GPU command packets themselves; draws and dispatches go through the
   console D3D12 interfaces.
 
+## Texture layout (`xg_xs.dll`)
+
+- *observed*: titles import `XGSuggestSwizzleMode(const desc*, uint32_t, uint32_t* mode)` and
+  `XGCreateTextureComputer(const desc*, computer**)`, both checked as `HRESULT`s. The 56-byte description has the
+  desktop `D3D12_RESOURCE_DESC` layout (dimension, alignment, width, height, depth or array size, mip levels,
+  format, sample description, layout, flags) with the console's flag bits.
+- *observed*: titles fill textures through the computer: slot 8 `CopyIntoSubresource(destination base, plane,
+  subresource, source, source row pitch, source slice pitch)`, called per subresource; the result is not
+  checked.
+- Implementation: the layout a title follows is the one this library reports, so it is chosen to be the
+  desktop's copyable footprint layout (subresources in order, each at a multiple of 512 bytes, rows 256 bytes
+  apart; core/libs/texture_layout.h); the swizzle mode reported is 0 (*assumed* linear). Other computer slots
+  report themselves.
+
 ## Libraries not started
 
-Import names seen, contracts open: the audio hardware interfaces (`AcpHal.dll`, `xapu.dll`, `chad.dll`) and
-texture layout (`xg_xs.dll`).
+Import names seen, contracts open: the audio hardware interfaces (`AcpHal.dll`, `xapu.dll`, `chad.dll`).

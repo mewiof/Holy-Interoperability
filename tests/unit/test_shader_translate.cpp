@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "core/libs/d3d12_xs/shader/inflate.h"
+#include "core/libs/inflate.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/d3d12_xs/shader_container.h"
 #include "tests/unit/test.h"
@@ -72,7 +72,7 @@ std::vector<uint8_t> words(std::initializer_list<uint32_t> list) {
 TEST(inflate_fixed_huffman) {
   const uint8_t stream[] = {0x78, 0xda, 0x4b, 0x4c, 0x4a, 0x4e, 0x44, 0x45, 0x00, 0x41, 0x7c, 0x06, 0xe5};
   std::vector<uint8_t> out;
-  EXPECT(zlib_inflate(stream, sizeof(stream), &out));
+  EXPECT(holy::lib::zlib_inflate(stream, sizeof(stream), &out));
   EXPECT(std::string(out.begin(), out.end()) == "abcabcabcabcabcabc");
 }
 
@@ -96,7 +96,7 @@ TEST(inflate_dynamic_huffman) {
     expected += line;
   }
   std::vector<uint8_t> out;
-  EXPECT(zlib_inflate(stream, sizeof(stream), &out));
+  EXPECT(holy::lib::zlib_inflate(stream, sizeof(stream), &out));
   EXPECT(std::string(out.begin(), out.end()) == expected);
 }
 
@@ -104,13 +104,13 @@ TEST(inflate_rejects_bad_input) {
   std::vector<uint8_t> data = {1, 2, 3, 4, 5};
   std::vector<uint8_t> stream = zlib_stored(data);
   std::vector<uint8_t> out;
-  EXPECT(zlib_inflate(stream.data(), stream.size(), &out));
+  EXPECT(holy::lib::zlib_inflate(stream.data(), stream.size(), &out));
   EXPECT(out == data);
   stream.back() ^= 1;  // checksum mismatch
-  EXPECT(!zlib_inflate(stream.data(), stream.size(), &out));
+  EXPECT(!holy::lib::zlib_inflate(stream.data(), stream.size(), &out));
   const uint8_t not_zlib[] = {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc};
-  EXPECT(!zlib_inflate(not_zlib, sizeof(not_zlib), &out));
-  EXPECT(!zlib_inflate(stream.data(), 3, &out));
+  EXPECT(!holy::lib::zlib_inflate(not_zlib, sizeof(not_zlib), &out));
+  EXPECT(!holy::lib::zlib_inflate(stream.data(), 3, &out));
 }
 
 TEST(native_compute_program_is_found) {

@@ -19,7 +19,7 @@
 #include <algorithm>
 #include <cstring>
 
-#include "core/libs/d3d12_xs/shader/inflate.h"
+#include "core/libs/inflate.h"
 
 namespace holy::d3d12 {
 namespace {
@@ -287,7 +287,7 @@ bool native_program(const void* blob, size_t size, NativeProgram* out) {
     const uint32_t offset = read32(xdat + entry), length = read32(xdat + entry + 4);
     if (offset >= available || xdat[offset] != 0x78) continue;  // not a zlib stream
     const size_t stream = std::min<size_t>(length, available - offset);
-    if (!zlib_inflate(xdat + offset, stream, &out->block)) continue;
+    if (!lib::zlib_inflate(xdat + offset, stream, &out->block)) continue;
     if (out->block.size() < 0x100 || std::memcmp(out->block.data(), "FSSM", 4) != 0) continue;
     const uint32_t record = read32(out->block.data() + 0xC0);
     if (record + 0x28ull >= out->block.size()) return false;

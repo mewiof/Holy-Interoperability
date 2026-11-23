@@ -14,6 +14,7 @@
 
 #include "core/libs/d3d12_xs/descriptors.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
+#include "core/libs/d3d12_xs/texture_upload.h"
 #include "core/libs/support.h"
 
 #include <intrin.h>
@@ -86,8 +87,14 @@ static_assert(offsetof(ViewAtAddress, address) == 40);
 void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_RESOURCE_DESC* resource,
                                                       const ViewAtAddress* view, SIZE_T dest) {
   if (!resource || !view) return;
-  if (resource->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || view->srv.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
-    HolyUnimplementedFrom(kLibrary, "ID3D12DeviceX#70(texture view)", _ReturnAddress());
+  if (resource->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+    // A texture in title memory: viewed through a host copy (texture_upload.h).
+    ID3D12Resource* texture = texture_at(self, *resource, view->address);
+    if (texture) self->host->CreateShaderResourceView(texture, &view->srv, host_cpu_handle(dest));
+    return;
+  }
+  if (view->srv.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
+    HolyUnimplementedFrom(kLibrary, "ID3D12DeviceX#70(texture view of a buffer)", _ReturnAddress());
     return;
   }
   Backing backing;

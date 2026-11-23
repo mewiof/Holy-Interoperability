@@ -9,6 +9,7 @@
 #include "core/common/strings.h"
 #include "core/runtime/api.h"
 #include "core/runtime/binder.h"
+#include "core/runtime/cpu_compat.h"
 #include "core/runtime/crash.h"
 #include "core/runtime/hooks.h"
 #include "core/runtime/memory.h"
@@ -98,6 +99,7 @@ void boot() {
 
   install_crash_handlers();
   install_commit_on_demand();
+  install_cpu_compatibility();
   bind_title_imports(image_base, s.title_size, {g_boot.original_import_rva, g_boot.original_import_size});
   restore_directories(image_base, g_boot);
   LOG_INFO(kComponent, "imports bound; handing control to the title");

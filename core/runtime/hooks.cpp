@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -387,6 +388,31 @@ LPTOP_LEVEL_EXCEPTION_FILTER WINAPI hook_SetUnhandledExceptionFilter(LPTOP_LEVEL
   return exchange_title_filter(filter);
 }
 
+// --- process exit: logged with the calling stack, then carried out ----------
+
+void __cdecl hook_exit(int code) {
+  log_title_exit("exit", static_cast<unsigned>(code));
+  exit(code);
+}
+void __cdecl hook__exit(int code) {
+  log_title_exit("_exit", static_cast<unsigned>(code));
+  _exit(code);
+}
+void __cdecl hook_abort() {
+  log_title_exit("abort", 3);
+  abort();
+}
+void WINAPI hook_ExitProcess(UINT code) {
+  log_title_exit("ExitProcess", code);
+  ExitProcess(code);
+}
+BOOL WINAPI hook_TerminateProcess(HANDLE process, UINT code) {
+  if (process == GetCurrentProcess() || GetProcessId(process) == GetCurrentProcessId()) {
+    log_title_exit("TerminateProcess", code);
+  }
+  return TerminateProcess(process, code);
+}
+
 #define HOLY_OVERRIDE(name)                      \
   Override {                                     \
     #name, reinterpret_cast<void*>(&hook_##name) \
@@ -427,6 +453,11 @@ const Override kOverrides[] = {
     HOLY_OVERRIDE(RegQueryValueExW),
     HOLY_OVERRIDE(RegCloseKey),
     HOLY_OVERRIDE(SetUnhandledExceptionFilter),
+    HOLY_OVERRIDE(exit),
+    HOLY_OVERRIDE(_exit),
+    HOLY_OVERRIDE(abort),
+    HOLY_OVERRIDE(ExitProcess),
+    HOLY_OVERRIDE(TerminateProcess),
 };
 
 #undef HOLY_OVERRIDE

@@ -3,6 +3,8 @@ add_library(holyrt SHARED
   api.h
   binder.cpp
   binder.h
+  cpu_compat.cpp
+  cpu_compat.h
   crash.cpp
   crash.h
   dllmain.cpp

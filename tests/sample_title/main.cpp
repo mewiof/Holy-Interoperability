@@ -86,6 +86,28 @@ void test_exceptions() {
   check(caught, "C++ exceptions unwind through the title image");
 }
 
+// Console-CPU instructions the host may lack (core/runtime/cpu_compat.h):
+// CLZERO zeroes the aligned 64-byte line around the address in rAX, both on
+// hosts that have it and through the runtime on hosts that do not.
+void test_cpu_compatibility() {
+  // mov rax, rcx; clzero; ret
+  static const unsigned char kCode[] = {0x48, 0x89, 0xC8, 0x0F, 0x01, 0xFC, 0xC3};
+  void* page = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+  check(page != nullptr, "executable page for the CPU checks");
+  if (!page) return;
+  std::memcpy(page, kCode, sizeof(kCode));
+  FlushInstructionCache(GetCurrentProcess(), page, sizeof(kCode));
+  alignas(64) static unsigned char line[192];
+  std::memset(line, 0xAB, sizeof(line));
+  reinterpret_cast<void (*)(void*)>(page)(line + 64 + 17);  // inside the second line
+  bool zeroed = true, kept = true;
+  for (int i = 0; i < 64; ++i) zeroed = zeroed && line[64 + i] == 0;
+  for (int i = 0; i < 64; ++i) kept = kept && line[i] == 0xAB && line[128 + i] == 0xAB;
+  check(zeroed, "CLZERO zeroes the cache line around its address");
+  check(kept, "CLZERO leaves the neighbouring lines alone");
+  VirtualFree(page, 0, MEM_RELEASE);
+}
+
 void test_memory() {
   auto* small = static_cast<unsigned char*>(XMemAlloc(100, 0));
   check(small != nullptr && small[0] == 0 && small[99] == 0, "XMemAlloc returns zeroed heap memory");
@@ -504,6 +526,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR command_line, int) {
   test_thread_local_storage();
   test_exceptions();
   test_memory();
+  test_cpu_compatibility();
   test_package_files();
   test_package_is_read_only();
   test_scratch_storage();

@@ -95,4 +95,13 @@ LPTOP_LEVEL_EXCEPTION_FILTER exchange_title_filter(LPTOP_LEVEL_EXCEPTION_FILTER 
   return g_title_filter.exchange(filter);
 }
 
+void log_title_exit(const char* how, unsigned code) {
+  const DWORD saved_error = GetLastError();
+  LOG_ERROR(kComponent, "the title ends the process (%s, code %u)", how, code);
+  CONTEXT context{};
+  RtlCaptureContext(&context);
+  walk_stack(&context);
+  SetLastError(saved_error);
+}
+
 }  // namespace holy::rt

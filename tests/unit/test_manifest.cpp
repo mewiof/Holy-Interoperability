@@ -11,6 +11,7 @@ constexpr char kManifest[] = R"(<?xml version="1.0" encoding="utf-8"?>
 <Game configVersion="1">
   <TitleId>0A0B0C0D</TitleId>
   <StoreId>9ZZZZZZZZZZZ</StoreId>
+  <PersistentLocalStorage><SizeMB>512</SizeMB></PersistentLocalStorage>
   <Identity Name="Example.Sample" Publisher="CN=Example" Version="1.2.3.4" />
   <ExecutableList>
     <Executable Name="tools.exe" Id="Tools" TargetDeviceFamily="Scarlett" IsDevOnly="true" />
@@ -30,6 +31,7 @@ TEST(manifest_extracts_identity_and_executables) {
   EXPECT(manifest->title_id == "0A0B0C0D");
   EXPECT(manifest->executables.size() == 3);
   EXPECT(manifest->executables[0].dev_only);
+  EXPECT(manifest->persistent_local_storage_mb == 512);
 }
 
 TEST(manifest_prefers_the_retail_console_executable) {

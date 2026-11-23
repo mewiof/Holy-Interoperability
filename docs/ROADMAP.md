@@ -31,10 +31,9 @@ Legend: **done** — implemented and tested; **partial** — some of it works; *
 - done: `XMemAlloc` / `XMemFree` and the default-allocator pair.
 - done: `XMemVirtualAlloc` with console page-size and graphics-protection flags.
 - done: commit on demand when the host's commit charge cannot cover a title's up-front pools.
-- open: physical page allocation and mapping (`XMemAllocatePhysicalPages`, `XMemMapPhysicalPages`,
-  `XMemMapPhysicalPagesScatter`, `XMemFreePhysicalPages`, `XMemTransferMemory`). Intended design: a
-  section-backed pool of "physical" pages mapped into placeholder reservations, which also gives the aliased
-  CPU and GPU views titles build.
+- done: physical page allocation and mapping (`XMemAllocatePhysicalPages`, `XMemMapPhysicalPages`,
+  `XMemMapPhysicalPagesScatter`, `XMemFreePhysicalPages`, `XMemTransferMemory`): section-backed pages mapped
+  into placeholder reservations, giving the aliased CPU and GPU views titles build.
 - open: `XMemVirtualQuery`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`.
 - open: honouring a title's exported allocation hooks.
 
@@ -48,9 +47,9 @@ provider interfaces obtained from `QueryApiImpl`.
   themselves by interface id and slot.
 - done: task queues, async blocks, the time-sensitive thread assertion.
 - done (the functions titles have been seen to call): connectivity hint, user add (nobody signed in) and
-  change events, system analytics info and device identity, title id.
-- open: the rest of the user service, package and installation queries, persistent local storage, game
-  saves, store queries.
+  change events, system analytics info and device identity, title id, package identity and installation
+  state, persistent local storage, HDR mode.
+- open: the rest of the user service, game saves, store queries.
 - Policy for services with no local equivalent: the runtime does not sign users in to anything, does not
   emulate online services, and never reports ownership of add-on content.
 
@@ -62,7 +61,9 @@ The largest piece.
 - open: `D3D12XboxCreateDevice` and the object model behind it, translated onto the host's Direct3D 12.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.
-- open: shader formats: determine what titles ship and translate where the host cannot consume it directly.
+- open: shader translation. Titles ship only native console GPU machine code (see
+  [PLATFORM_NOTES.md](PLATFORM_NOTES.md)); nothing portable is included, so every shader must be translated
+  from that machine code to a host shader format.
 - open: `xg_xs` texture layout computation.
 - open: interaction with graphics helper DLLs that packages ship and that call into the device.
 
@@ -80,9 +81,12 @@ name.
   input device attached.
 - open: surfacing host controllers (and keyboard and mouse) as devices and readings.
 
-## 7. Storage (`xcrdapi`) — open
+## 7. Storage (`xcrdapi`) — partial
 
 The console's fast-storage factory. Plan: implement on host file I/O first, the host's equivalent API later.
+
+- done: factory, `OpenFile`, staging size.
+- open: queues, requests (including the console's decompression formats), status arrays.
 
 ## Cross-cutting
 

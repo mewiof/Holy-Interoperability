@@ -4,7 +4,10 @@
 namespace holy::xgr {
 
 void register_core_interface();
+void register_display();
+void register_local_storage();
 void register_networking();
+void register_package();
 void register_system();
 void register_user();
 

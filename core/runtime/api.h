@@ -45,6 +45,11 @@ HOLYRT_API void HolyCommitOnDemand(void* base, size_t size, uint32_t protect);
 // Returns non-zero on success.
 HOLYRT_API int HolyEnsureCommitted(const void* address, size_t size);
 
+// Translates a path as the title sees it (mounted drives, package-relative
+// paths) into a host path. Returns the length written, or 0 if `count` is too
+// small.
+HOLYRT_API size_t HolyTranslatePath(const wchar_t* title_path, wchar_t* out, size_t count);
+
 // Absolute host paths of the running title's package and data directories.
 // Empty strings when the runtime was not booted by the launcher.
 HOLYRT_API const wchar_t* HolyPackageDir(void);

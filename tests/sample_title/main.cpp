@@ -24,6 +24,11 @@ __declspec(dllimport) ULONG NTAPI RegisterAppStateChangeNotification(void (*rout
 __declspec(dllimport) void NTAPI UnregisterAppStateChangeNotification(void* registration);
 __declspec(dllimport) int HolySampleMissingFunction(int value);
 __declspec(dllimport) HRESULT WINAPI GameInputCreate(void** game_input);
+__declspec(dllimport) BOOL XMemAllocatePhysicalPages(unsigned long long attributes, ULONG_PTR* count,
+                                                     ULONG_PTR* pages);
+__declspec(dllimport) BOOL XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* pages);
+__declspec(dllimport) void* XMemMapPhysicalPages(void* address, ULONG_PTR count, ULONG_PTR* pages);
+__declspec(dllimport) HRESULT WINAPI DStorageGetFactory(REFIID riid, void** factory);
 __declspec(dllimport) int SamplePackageResolve(const char* host);
 __declspec(dllimport) int SamplePackageLoadsConsoleRuntime();
 }
@@ -260,6 +265,45 @@ void test_lifecycle() {
   if (registration) UnregisterAppStateChangeNotification(registration);
 }
 
+// Physical pages: the same page mapped at two addresses is one piece of memory.
+void test_physical_pages() {
+  ULONG_PTR pages[2] = {};
+  ULONG_PTR count = 2;
+  check(XMemAllocatePhysicalPages(0x280, &count, pages) && count == 2 && pages[0] && pages[1],
+        "XMemAllocatePhysicalPages allocates 64 KiB pages");
+  auto* first = static_cast<unsigned char*>(XMemVirtualAlloc(nullptr, 0x40000, 0x20402000, 0x23, PAGE_READWRITE));
+  auto* second = static_cast<unsigned char*>(XMemVirtualAlloc(nullptr, 0x40000, 0x20402000, 0x23, PAGE_READWRITE));
+  check(first && second, "reservations for physical mappings can be made");
+  if (!first || !second) return;
+  check(XMemMapPhysicalPages(first, 2, pages) == first, "physical pages map into a reservation");
+  ULONG_PTR swapped[2] = {pages[1], pages[0]};
+  check(XMemMapPhysicalPages(second + 0x10000, 2, swapped) == second + 0x10000,
+        "the same pages map at a second address");
+  first[0x10] = 0x5A;
+  first[0x10000 + 0x10] = 0xA5;
+  check(second[0x20000 + 0x10] == 0x5A && second[0x10000 + 0x10] == 0xA5,
+        "writes through one mapping are visible through the other");
+  check(XMemMapPhysicalPages(first, 2, nullptr) == first, "physical pages can be unmapped");
+  XMemMapPhysicalPages(second + 0x10000, 2, nullptr);
+  check(XMemFreePhysicalPages(2, pages) != FALSE, "physical pages can be freed");
+}
+
+// Fast storage: files open through the title's paths.
+void test_fast_storage() {
+  constexpr GUID kFactory = {0x62959d11, 0xd45f, 0x4884, {0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae}};
+  void* factory = nullptr;
+  check(DStorageGetFactory(kFactory, &factory) == S_OK && factory, "the fast-storage factory is available");
+  if (!factory) return;
+  using OpenFileFn = HRESULT(STDMETHODCALLTYPE*)(void*, const wchar_t*, REFIID, void**);
+  const auto open = reinterpret_cast<OpenFileFn>((*static_cast<void***>(factory))[4]);
+  void* file = nullptr;
+  check(open(factory, L"G:\\data\\hello.txt", kFactory, &file) == S_OK && file, "fast storage opens package files");
+  if (file) reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(file))[2])(file);
+  void* missing = nullptr;
+  check(open(factory, L"G:\\data\\missing.bin", kFactory, &missing) == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND),
+        "fast storage reports missing files");
+}
+
 // The console input library, with no input device attached.
 void test_input() {
   void* input = nullptr;
@@ -328,6 +372,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR command_line, int) {
   g_expect_online = command_line && std::strstr(command_line, "--expect-online");
   test_game_runtime();
   test_input();
+  test_physical_pages();
+  test_fast_storage();
   if (!(command_line && std::strstr(command_line, "--expect-online"))) test_offline();
   if (command_line && std::strstr(command_line, "--expect-sandbox")) test_sandbox_is_enforced_by_the_os();
 

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 #include "tests/sample_title/checks.h"
 
@@ -45,6 +46,12 @@ constexpr GUID kIdentityProvider = {0xe349bd1a, 0xfc20, 0x4e40, {0xb9, 0x9c, 0x4
 constexpr GUID kIdentity = {0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}};
 constexpr GUID kGameProvider = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
 constexpr GUID kGame = {0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34}};
+constexpr GUID kPackageProvider = {0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};
+constexpr GUID kPackage = {0x0b9d556e, 0xab70, 0x43f4, {0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40}};
+constexpr GUID kStorageProvider = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3e, 0x84, 0x3e}};
+constexpr GUID kStorage = {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
+constexpr GUID kDisplayProvider = {0x03f0fe74, 0xfdd9, 0x4e5c, {0xb6, 0x30, 0xf9, 0x33, 0x9c, 0x47, 0xac, 0xc5}};
+constexpr GUID kDisplay = {0x35f07670, 0x706e, 0x4bfb, {0x94, 0x76, 0x09, 0x07, 0x98, 0xc5, 0xeb, 0xf3}};
 
 // Core interface slots.
 enum CoreSlot {
@@ -258,6 +265,62 @@ void test_system() {
   release(identity);
 }
 
+void CALLBACK package_found(void*, const void*) {}
+
+void test_package() {
+  void* package = query(kPackageProvider, kPackage);
+  check(package && call<bool>(package, 4), "the title runs as a packaged process");
+  if (!package) return;
+  char id[33] = {};
+  check(call<HRESULT>(package, 3, sizeof(id), id) == S_OK && id[0] != 0, "the package has an identifier");
+  void* monitor = nullptr;
+  HRESULT hr = call<HRESULT>(package, 5, static_cast<const char*>(id), 0u, nullptr, 1000u, nullptr, &monitor);
+  struct {
+    uint64_t total, installed, launch;
+    bool launchable, completed;
+  } progress{};
+  if (SUCCEEDED(hr)) call<void>(package, 7, monitor, &progress);
+  check(SUCCEEDED(hr) && progress.completed && progress.launchable && progress.total > 0 &&
+            progress.installed == progress.total,
+        "the installation monitor reports a complete installation");
+  if (monitor) call<void>(package, 6, monitor);
+  check(call<HRESULT>(package, 39, 1u, 0u, nullptr, reinterpret_cast<void*>(&package_found)) == S_OK,
+        "enumerating content packages finds none and succeeds");
+  release(package);
+}
+
+void test_local_storage() {
+  void* storage = query(kStorageProvider, kStorage);
+  check(storage != nullptr, "persistent local storage is available");
+  if (!storage) return;
+  char path[512] = {};
+  size_t used = 0;
+  const HRESULT hr = call<HRESULT>(storage, 4, sizeof(path), path, &used);
+  check(hr == S_OK && used == std::strlen(path) + 1, "persistent local storage has a path");
+  std::string file = std::string(path) + "\\sample.bin";
+  HANDLE handle = CreateFileA(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  DWORD written = 0;
+  const bool wrote = handle != INVALID_HANDLE_VALUE && WriteFile(handle, "1234", 4, &written, nullptr);
+  if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+  check(wrote, "persistent local storage is writable");
+  struct {
+    uint64_t available, total_free, used, total;
+  } info{};
+  check(call<HRESULT>(storage, 5, &info) == S_OK && info.total == 64ull << 20 && info.used >= 4 &&
+            info.available <= info.total - info.used,
+        "space info reports the manifest's quota and the bytes in use");
+  DeleteFileA(file.c_str());
+  release(storage);
+}
+
+void test_display() {
+  void* display = query(kDisplayProvider, kDisplay);
+  float info[3] = {1, 1, 1};
+  check(display && call<uint32_t>(display, 4, 0u, info) == 2 && info[1] == 0.0f,
+        "HDR output is reported disabled");
+  release(display);
+}
+
 }  // namespace
 
 void test_game_runtime() {
@@ -282,4 +345,7 @@ void test_game_runtime() {
   test_networking();
   test_user();
   test_system();
+  test_package();
+  test_local_storage();
+  test_display();
 }

@@ -100,6 +100,18 @@ std::optional<Manifest> parse(std::string_view xml_text, std::string* error) {
   Manifest manifest;
   manifest.title_id = child_text(*root, "TitleId");
   manifest.store_id = child_text(*root, "StoreId");
+  if (const xml::Node* storage = root->child("PersistentLocalStorage")) {
+    const std::string size = child_text(*storage, "SizeMB");
+    unsigned long value = 0;
+    for (const char c : size) {
+      if (c < '0' || c > '9' || value > 0x10000000) {
+        value = 0;
+        break;
+      }
+      value = value * 10 + static_cast<unsigned long>(c - '0');
+    }
+    manifest.persistent_local_storage_mb = static_cast<uint32_t>(value);
+  }
   if (const xml::Node* identity = root->child("Identity")) {
     manifest.identity_name = identity->attribute_or("Name");
     manifest.identity_publisher = identity->attribute_or("Publisher");

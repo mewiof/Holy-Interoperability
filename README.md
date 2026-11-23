@@ -37,16 +37,17 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Loader: in-memory import takeover, sandbox, job control, timeouts | Working, tested end to end |
 | Runtime: import binder, reporting thunks, call tracing, crash reports | Working, tested end to end |
 | Title environment: package mount, read-only package, scratch storage, console identity, lifecycle registration | Working, tested end to end |
-| `xmem` (title memory) | Heap and virtual allocation implemented; physical-page APIs missing |
+| `xmem` (title memory) | Heap, virtual and physical-page allocation and mapping; commit on demand |
 | `d3d12_xs` (graphics) | Entry points only; no device, no rendering |
-| `xgameruntime` (game runtime) | Entry points, task queues and async calls, networking (offline), users (nobody signed in), system identity; other services missing |
+| `xgameruntime` (game runtime) | Entry points, task queues and async calls, networking (offline), users (nobody signed in), system identity, package state, persistent local storage, display mode; other services missing |
+| `xcrdapi` (fast storage) | Factory and file opening; queues and requests missing |
 | `gameinput` (input) | Interface present; no input devices surfaced yet |
 | Offline switch, interposers for DLLs the package ships | Working, tested end to end |
-| Audio, storage and texture-layout console libraries | Not started |
+| Audio and texture-layout console libraries | Not started |
 
 What this means in practice: a retail title image loads, runs its static initialisation, initialises the
 game runtime, creates its task queues, queries networking, user and system services and the input API, and
-stops where it opens the console's fast-storage API. Nothing is rendered yet and no title is playable.
+reaches graphics device creation, where it stops. Nothing is rendered yet and no title is playable.
 
 Progress is measured as *console library coverage*: of the console-only symbols a title imports, how many
 have a real implementation. `holy inspect` prints it for any package. Placeholder exports never count.

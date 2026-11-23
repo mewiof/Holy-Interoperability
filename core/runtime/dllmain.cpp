@@ -165,6 +165,14 @@ int HolyEnsureCommitted(const void* address, size_t size) {
   return holy::rt::ensure_committed(address, size) ? 1 : 0;
 }
 
+size_t HolyTranslatePath(const wchar_t* title_path, wchar_t* out, size_t count) {
+  if (!title_path || !out || count == 0) return 0;
+  const std::wstring host = holy::vfs::translate(holy::rt::state().vfs, title_path);
+  if (host.size() + 1 > count) return 0;
+  std::memcpy(out, host.c_str(), (host.size() + 1) * sizeof(wchar_t));
+  return host.size();
+}
+
 const wchar_t* HolyPackageDir(void) {
   return holy::rt::g_boot.package_dir;
 }

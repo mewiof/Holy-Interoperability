@@ -61,7 +61,21 @@ Notes describe the platform, never a title.
   errors) the range is reserved instead and committed in 64 KiB chunks on first touch, from a vectored
   exception handler in the runtime. `ReadFile` into such memory commits the buffer first, because the kernel
   reports an access to uncommitted memory as an error instead of faulting it in. A warning is logged once.
-- *assumed*: the physical-page functions follow the shape of the desktop's user-physical-pages API.
+- *observed*: the physical-page functions have the shape of the desktop's user-physical-pages functions with
+  64 KiB pages: `BOOL XMemAllocatePhysicalPages(uint64_t attributes, ULONG_PTR* count, ULONG_PTR* pages)`
+  (count in and out; titles round byte sizes up with `>> 16` and check for `TRUE` and the full count),
+  `BOOL XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* pages)`,
+  `void* XMemMapPhysicalPages(void* address, ULONG_PTR count, ULONG_PTR* pages)` (the result is tested as a
+  pointer; a null array unmaps) and `BOOL XMemMapPhysicalPagesScatter(void** addresses, ULONG_PTR count,
+  ULONG_PTR* pages)`. Pages are mapped into reservations made with `XMemVirtualAlloc` and the 64 KiB-page
+  flags.
+- *observed*: `XMemTransferMemory(uint32_t, size_t bytes)` is called with sizes rounded to 2 MiB and capped at
+  16 MiB; the result is not acted on (*assumed* `HRESULT`).
+- Implementation: each physical allocation is a pagefile-backed section reserved without commit; page ids
+  are opaque. Mapping turns the target reservation into a placeholder reservation (once, while it has no
+  committed memory) and maps 64 KiB views of the section into it, so a page mapped at two addresses is the
+  same memory. Pages are committed when first mapped, or on first touch when the host is short of commit.
+  `XMemTransferMemory` has nothing to move between partitions on a host and succeeds.
 - Open: `XMemVirtualQuery`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable` signatures.
 
 ## Graphics (`d3d12_xs.dll`)
@@ -117,6 +131,9 @@ Notes describe the platform, never a title.
 | `b884675d-b738-4a9c-815d-9a9a1e0c6c9b` | 3 `XSystemGetAnalyticsInfo` (result through a hidden pointer, 0x90 bytes) |
 | `1861cf2e-e18b-4834-a9f5-b4a4e6efb4cf` (`e349bd1a-fc20-4e40-b99c-4178cc6b409f`) | 3 `XSystemGetConsoleId` (39-byte buffer), 4 `XSystemGetXboxLiveSandboxId` (16), 5 `XSystemGetAppSpecificDeviceId` (45) |
 | `2549f142-6419-4a06-97b5-931aab7c2f34` (`973a344e-24bf-4d0f-8457-56c534892b29`) | 3 `XGameGetXboxTitleId`; 4 is a three-argument void function, assumed `XLaunchNewGame` (not bound) |
+| `0b9d556e-ab70-43f4-baa0-9999ac4cb040` (`af406016-e850-4aa8-a88d-2f3dcb9dac7e`) package | 3 `XPackageGetCurrentProcessPackageIdentifier` (33-byte buffer), 4 `XPackageIsPackagedProcess`, 5 `XPackageCreateInstallationMonitor`, 6 `XPackageCloseInstallationMonitorHandle`, 7 `XPackageGetInstallationProgress`, 9 `XPackageRegisterInstallationProgressChanged`, 39 `XPackageEnumeratePackages` |
+| `41a4e10c-5a7e-41d9-8c37-37bde62a07d6` (`f4faf4d4-2d04-4fce-b3e0-474a713a3e84`) persistent local storage | 4 `XPersistentLocalStorageGetPath`, 5 `XPersistentLocalStorageGetSpaceInfo` |
+| `35f07670-706e-4bfb-9476-090798c5ebf3` (`03f0fe74-fdd9-4e5c-b630-f9339c47acc5`) display | 4 `XDisplayTryEnableHdrMode` |
 
 ### Behaviour
 
@@ -137,6 +154,17 @@ Notes describe the platform, never a title.
   The title id is the manifest's `TitleId`. The sandbox is `RETAIL`. Device ids are stable per host and
   title (a hash of the host machine id and the title id); the console id is formatted as a braced GUID
   (*assumed*; it fits the documented size).
+
+- Packages: the process is packaged; installation monitors report a finished installation of the package's
+  size on disk (*documented* `XPackageInstallationProgress` layout); progress callbacks never fire.
+  Enumerating content packages finds none (the runtime never reports add-on content); enumerating game
+  packages is not implemented and reports itself. The package identifier is an opaque name derived from
+  manifest ids.
+- Persistent local storage: a directory in the title's data directory; the quota is the manifest's
+  `<PersistentLocalStorage><SizeMB>`; space info follows the *documented* struct (available, free on disk,
+  used, total).
+- Display: *documented* `XDisplayHdrModeResult` values (1 enabled, 2 disabled; *observed*: titles compare
+  with 1). HDR is reported disabled because presentation is standard dynamic range.
 
 ## Network
 
@@ -165,7 +193,29 @@ Notes describe the platform, never a title.
 - Implementation, partial: no input device is surfaced yet. Enumeration finds no device, reading queries
   return `0x838A0003`, callback registrations succeed and never fire. Slots 3-6, 8, 9, 12 and 13 are bound.
 
+## Fast storage (`XCRDAPI.dll`)
+
+- *observed*: `DStorageGetFactory(REFIID, void**)`, the public desktop signature; the console factory has its
+  own interface id `62959d11-d45f-4884-a0a3-f7862ea243ae`.
+- *observed* factory slots: 4 `OpenFile(const wchar_t* path, REFIID, void**)` (wide path; titles check it
+  with `GetFileAttributesW` first), 5 `CreateStatusArray(uint32_t capacity, const char* name, REFIID,
+  void**)`, 8 takes a 32 MiB size before any queue exists (staging buffer size), 10 `CreateQueue(desc,
+  REFIID, void**)` with a descriptor laid out like the public `DSTORAGE_QUEUE_DESC` (source type, capacity,
+  priority, name) followed by a field titles set to 1.
+- Implementation, partial: the factory, `OpenFile` (read-only, through the title's path translation) and the
+  staging size. Queues, requests and status arrays are open.
+
+## Graphics shaders
+
+- *observed*: shader containers in titles are DXBC-style containers whose `DXIL` part carries no LLVM bitcode
+  (a `NOBC` marker) but a console block (`XDAT`, with a zlib-compressed `FSSM` payload). The payload holds the
+  console GPU's native machine code (RDNA-family instruction encodings: `s_waitcnt`, exports, `s_endpgm`,
+  `s_code_end` padding) plus metadata. Titles therefore ship no portable shader code; running their shaders on
+  a host GPU requires translating that machine code.
+- *observed*: titles do not write GPU command packets themselves; draws and dispatches go through the
+  console D3D12 interfaces.
+
 ## Libraries not started
 
-Import names seen, contracts open: the audio hardware interfaces (`AcpHal.dll`, `xapu.dll`, `chad.dll`), the fast-storage factory (`XCRDAPI.dll`,
-`DStorageGetFactory`), and texture layout (`xg_xs.dll`).
+Import names seen, contracts open: the audio hardware interfaces (`AcpHal.dll`, `xapu.dll`, `chad.dll`) and
+texture layout (`xg_xs.dll`).

@@ -4,7 +4,10 @@ holy_add_system_library(holy_lib_xgameruntime
   OUTPUT_NAME holy_xgameruntime
   SOURCES
     core_interface.cpp
+    display.cpp
+    local_storage.cpp
     networking.cpp
+    package.cpp
     provider.cpp
     provider.h
     services.h

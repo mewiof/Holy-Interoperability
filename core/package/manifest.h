@@ -2,6 +2,7 @@
 // package. Only the fields the launcher needs are extracted.
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -25,6 +26,7 @@ struct Manifest {
   std::string identity_version;
   std::string title_id;
   std::string store_id;
+  uint32_t persistent_local_storage_mb = 0;  // <PersistentLocalStorage><SizeMB>, 0 if absent
   std::vector<Executable> executables;
 
   // The executable a retail launch would start: the first non-dev console

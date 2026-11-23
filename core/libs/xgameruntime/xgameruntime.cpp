@@ -112,7 +112,10 @@ namespace holy::xgr {
 
 void register_services() {
   register_core_interface();
+  register_display();
+  register_local_storage();
   register_networking();
+  register_package();
   register_system();
   register_user();
 }

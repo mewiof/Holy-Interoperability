@@ -41,6 +41,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -71,7 +72,22 @@ struct Region {
   std::vector<int32_t> chunks;  // section per chunk, -1 if not created yet
 };
 
+// The lock guarding the page tables. Code holding it never touches title
+// memory (title arrays are copied in and out around it): a fault on title
+// memory would enter the backing handler, which takes the lock too. The
+// owner is recorded so the handler can step aside for faults raised by the
+// lock's own holder.
 SRWLOCK g_lock = SRWLOCK_INIT;
+std::atomic<DWORD> g_lock_owner{0};
+
+void lock() {
+  AcquireSRWLockExclusive(&g_lock);
+  g_lock_owner.store(GetCurrentThreadId());
+}
+void unlock() {
+  g_lock_owner.store(0);
+  ReleaseSRWLockExclusive(&g_lock);
+}
 std::vector<Section>& sections() {
   static auto* storage = new std::vector<Section>();
   return *storage;
@@ -337,19 +353,20 @@ LONG CALLBACK back_on_fault(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;
   }
   const uintptr_t granule = static_cast<uintptr_t>(record->ExceptionInformation[1]) & ~(kPage - 1);
-  AcquireSRWLockExclusive(&g_lock);
+  if (g_lock_owner.load() == GetCurrentThreadId()) return EXCEPTION_CONTINUE_SEARCH;
+  lock();
   const auto found = pending().count(granule) ? mapped().find(granule) : mapped().end();
   const bool backed = found != mapped().end() && back_granule(granule, found->second);
-  ReleaseSRWLockExclusive(&g_lock);
+  unlock();
   return backed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
 int back_buffer(const void* address, size_t size) {
   if (!address || size == 0) return 1;
   const auto begin = reinterpret_cast<uintptr_t>(address);
-  AcquireSRWLockExclusive(&g_lock);
+  lock();
   const bool ok = back_range(begin, begin + size);
-  ReleaseSRWLockExclusive(&g_lock);
+  unlock();
   return ok ? 1 : 0;
 }
 
@@ -370,9 +387,9 @@ void* reserve_placeholder(void* address, SIZE_T size) {
   void* base = virtual_alloc2(GetCurrentProcess(), address, size, MEM_RESERVE | kMemReservePlaceholder,
                               PAGE_NOACCESS, nullptr, 0);
   if (!base) return nullptr;
-  AcquireSRWLockExclusive(&g_lock);
+  lock();
   add_region(reinterpret_cast<uintptr_t>(base), reinterpret_cast<uintptr_t>(base) + size);
-  ReleaseSRWLockExclusive(&g_lock);
+  unlock();
   return base;
 }
 
@@ -402,12 +419,11 @@ HOLY_EXPORT BOOL XMemAllocatePhysicalPages(uint64_t attributes, ULONG_PTR* count
     return FALSE;
   }
   const ULONG_PTR requested = *count;
-  AcquireSRWLockExclusive(&g_lock);
-  for (ULONG_PTR i = 0; i < requested; ++i) {
-    pages().push_back(Page{-1, 0, true, false});
-    page_array[i] = pages().size();  // ids start at 1
-  }
-  ReleaseSRWLockExclusive(&g_lock);
+  lock();
+  const ULONG_PTR first = pages().size() + 1;  // ids start at 1
+  pages().resize(pages().size() + requested, Page{-1, 0, true, false});
+  unlock();
+  for (ULONG_PTR i = 0; i < requested; ++i) page_array[i] = first + i;
   LIB_LOG(holy::lib::kDebug, "xmem", "allocated %llu physical pages (attributes 0x%llx)",
           static_cast<unsigned long long>(requested), static_cast<unsigned long long>(attributes));
   return TRUE;
@@ -421,7 +437,7 @@ HOLY_EXPORT BOOL HolyXMemQueryPhysical(const void* address, HANDLE* section, uin
                                        uint64_t* contiguous) {
   const auto at = reinterpret_cast<uintptr_t>(address);
   const uintptr_t granule = at & ~(kPage - 1);
-  AcquireSRWLockExclusive(&g_lock);
+  lock();
   // Back the granule and every pending one mapped contiguously after it.
   uintptr_t last = granule;
   while (mapped().count(last + kPage)) last += kPage;
@@ -444,15 +460,16 @@ HOLY_EXPORT BOOL HolyXMemQueryPhysical(const void* address, HANDLE* section, uin
     *contiguous = run;
     found = storage.committed ? TRUE : FALSE;
   }
-  ReleaseSRWLockExclusive(&g_lock);
+  unlock();
   return found;
 }
 
 HOLY_EXPORT BOOL XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* page_array) {
   if (!page_array) return FALSE;
-  AcquireSRWLockExclusive(&g_lock);
+  const std::vector<ULONG_PTR> ids(page_array, page_array + count);
+  lock();
   for (ULONG_PTR i = 0; i < count; ++i) {
-    const ULONG_PTR id = page_array[i];
+    const ULONG_PTR id = ids[i];
     if (id == 0 || id > pages().size() || !pages()[id - 1].live) continue;
     Page& page = pages()[id - 1];
     page.live = false;
@@ -460,7 +477,7 @@ HOLY_EXPORT BOOL XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* page_array) {
     // memory until they are unmapped.
     if (page.section >= 0) sections()[page.section].owner[page.index] = 0;
   }
-  ReleaseSRWLockExclusive(&g_lock);
+  unlock();
   return TRUE;
 }
 
@@ -468,31 +485,36 @@ HOLY_EXPORT void* XMemMapPhysicalPages(void* address, ULONG_PTR count, ULONG_PTR
   if (!address || count == 0 || (reinterpret_cast<uintptr_t>(address) & (kPage - 1))) return nullptr;
   install_lazy_backing();
   const auto base = reinterpret_cast<uintptr_t>(address);
+  const std::vector<ULONG_PTR> ids = page_array ? std::vector<ULONG_PTR>(page_array, page_array + count)
+                                                : std::vector<ULONG_PTR>(count, 0);
   bool ok = true;
-  AcquireSRWLockExclusive(&g_lock);
+  lock();
   if (!make_placeholder_region(base)) {
     ok = false;
   } else {
-    for (ULONG_PTR i = 0; i < count && ok; ++i) ok = map_granule(base + i * kPage, page_array ? page_array[i] : 0);
+    for (ULONG_PTR i = 0; i < count && ok; ++i) ok = map_granule(base + i * kPage, ids[i]);
   }
-  ReleaseSRWLockExclusive(&g_lock);
+  unlock();
   return ok ? address : nullptr;
 }
 
 HOLY_EXPORT BOOL XMemMapPhysicalPagesScatter(void** addresses, ULONG_PTR count, ULONG_PTR* page_array) {
   if (!addresses) return FALSE;
   install_lazy_backing();
+  const std::vector<void*> places(addresses, addresses + count);
+  const std::vector<ULONG_PTR> ids = page_array ? std::vector<ULONG_PTR>(page_array, page_array + count)
+                                                : std::vector<ULONG_PTR>(count, 0);
   bool ok = true;
-  AcquireSRWLockExclusive(&g_lock);
+  lock();
   for (ULONG_PTR i = 0; i < count && ok; ++i) {
-    const auto granule = reinterpret_cast<uintptr_t>(addresses[i]);
+    const auto granule = reinterpret_cast<uintptr_t>(places[i]);
     if (!granule || (granule & (kPage - 1)) || !make_placeholder_region(granule)) {
       ok = false;
       break;
     }
-    ok = map_granule(granule, page_array ? page_array[i] : 0);
+    ok = map_granule(granule, ids[i]);
   }
-  ReleaseSRWLockExclusive(&g_lock);
+  unlock();
   return ok ? TRUE : FALSE;
 }
 

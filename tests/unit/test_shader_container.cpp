@@ -129,3 +129,49 @@ TEST(malformed_containers_are_rejected) {
   const uint8_t junk[8] = {1, 2, 3};
   EXPECT(rebuild_desktop_container(junk, sizeof(junk), out) == ShaderFormat::Unknown);
 }
+
+namespace {
+
+// A container whose DXIL part starts with a desktop program header and keeps
+// the console block between the header and the program, as console graphics
+// shaders do; the program is either bitcode or the "NOBC" marker.
+std::vector<uint8_t> header_first_container(bool with_bitcode) {
+  const std::vector<uint8_t> program = with_bitcode ? std::vector<uint8_t>{'B', 'C', 0xC0, 0xDE, 1, 2, 3, 4}
+                                                    : std::vector<uint8_t>{'N', 'O', 'B', 'C'};
+  std::vector<uint8_t> dxil;
+  put32(dxil, 0x10066);  // vertex 6.6
+  put32(dxil, 0);        // size in dwords, patched below
+  dxil.insert(dxil.end(), {'D', 'X', 'I', 'L'});
+  put32(dxil, 0x106);
+  put32(dxil, 16 + 16);  // program offset from the "DXIL" tag: past a 16-byte console block
+  put32(dxil, static_cast<uint32_t>(program.size()));
+  dxil.insert(dxil.end(), {'X', 'D', 'A', 'T'});
+  put32(dxil, 3);
+  put32(dxil, 0);
+  put32(dxil, 0);
+  dxil.insert(dxil.end(), program.begin(), program.end());
+  const auto dwords = static_cast<uint32_t>(dxil.size() / 4);
+  std::memcpy(dxil.data() + 4, &dwords, 4);
+  std::vector<uint8_t> out = {'D', 'X', 'B', 'C'};
+  out.resize(20, 0);
+  out.insert(out.end(), {1, 0, 0, 0});
+  put32(out, 0);
+  put32(out, 1);
+  put32(out, 36);
+  out.insert(out.end(), {'D', 'X', 'I', 'L'});
+  put32(out, static_cast<uint32_t>(dxil.size()));
+  out.insert(out.end(), dxil.begin(), dxil.end());
+  const auto total = static_cast<uint32_t>(out.size());
+  std::memcpy(out.data() + 24, &total, 4);
+  return out;
+}
+
+}  // namespace
+
+TEST(header_first_console_containers) {
+  std::vector<uint8_t> out;
+  const std::vector<uint8_t> native = header_first_container(false);
+  EXPECT(rebuild_desktop_container(native.data(), native.size(), out) == ShaderFormat::NativeOnly);
+  const std::vector<uint8_t> desktop = header_first_container(true);
+  EXPECT(rebuild_desktop_container(desktop.data(), desktop.size(), out) == ShaderFormat::Desktop);
+}

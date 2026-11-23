@@ -263,6 +263,140 @@ void test_native_pipeline(void* device) {
   if (pipeline) call<ULONG>(pipeline, 2);
 }
 
+// Device objects created through slots that keep (or nearly keep) the
+// desktop arguments.
+void test_device_objects(void* device) {
+  D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 16, 1};
+  void* query_heap = nullptr;
+  check(call<HRESULT>(device, 39, &query_desc, __uuidof(ID3D12QueryHeap), &query_heap) == S_OK && query_heap,
+        "the device creates query heaps");
+  if (query_heap) call<ULONG>(query_heap, 2);
+
+  D3D12_HEAP_PROPERTIES readback{};
+  readback.Type = D3D12_HEAP_TYPE_READBACK;
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 16 * 8;
+  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  void* resource = nullptr;
+  check(call<HRESULT>(device, 27, &readback, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                      static_cast<const D3D12_CLEAR_VALUE*>(nullptr), __uuidof(ID3D12Resource), &resource) == S_OK &&
+            resource,
+        "the device creates committed resources with the desktop arguments");
+  if (resource) call<ULONG>(resource, 2);
+
+  D3D12_INDIRECT_ARGUMENT_DESC arguments[2]{};
+  arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+  D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DRAW_ARGUMENTS), 1, arguments, 0};
+  void* signature = nullptr;
+  check(call<HRESULT>(device, 41, &signature_desc, static_cast<void*>(nullptr), __uuidof(ID3D12CommandSignature),
+                      &signature) == S_OK &&
+            signature,
+        "the device creates command signatures");
+  if (signature) call<ULONG>(signature, 2);
+  arguments[1].Type = static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(105);  // console type, 12-byte arguments
+  D3D12_COMMAND_SIGNATURE_DESC console_desc{12, 1, &arguments[1], 0};
+  void* console_signature = nullptr;
+  check(call<HRESULT>(device, 41, &console_desc, static_cast<void*>(nullptr), __uuidof(ID3D12CommandSignature),
+                      &console_signature) == S_OK &&
+            console_signature,
+        "command signatures accept the console's 12-byte argument type");
+  if (console_signature) call<ULONG>(console_signature, 2);
+
+  // Console sampler description into a sampler heap.
+  D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 1};
+  void* sampler_heap = nullptr;
+  call<HRESULT>(device, 14, &sampler_heap_desc, __uuidof(ID3D12DescriptorHeap), &sampler_heap);
+  if (sampler_heap) {
+    const uint64_t start = call<uint64_t>(sampler_heap, 9);
+    uint32_t sampler[21] = {0, 2, 2, 2, 0, 0, 3, 3, 3, 0, 0x41400000u, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0};
+    call<void>(device, 61, sampler, start);
+    check(true, "console sampler descriptions create samplers");
+    call<ULONG>(sampler_heap, 2);
+  }
+
+  // A heap over a reservation with physical pages mapped.
+  ULONG_PTR pages[4] = {};
+  ULONG_PTR count = 4;
+  void* pool = XMemVirtualAlloc(nullptr, 0x40000, 0x20402000, 0x23, PAGE_READWRITE);
+  if (pool && XMemAllocatePhysicalPages(0x380, &count, pages) && XMemMapPhysicalPages(pool, 4, pages) == pool) {
+    void* heap = nullptr;
+    check(call<HRESULT>(device, 74, pool, 4u, &heap) == S_OK && heap, "the device makes heaps over title memory");
+    if (heap) {
+      // GetDesc: a 48-byte result, result pointer first and the object second.
+      using GetDescFn = D3D12_HEAP_DESC*(STDMETHODCALLTYPE*)(D3D12_HEAP_DESC*, void*);
+      D3D12_HEAP_DESC desc{};
+      reinterpret_cast<GetDescFn>((*static_cast<void***>(heap))[8])(&desc, heap);
+      check(desc.SizeInBytes == 0x40000, "a heap over title memory reports its size");
+      call<ULONG>(heap, 2);
+    }
+  } else {
+    check(false, "physical pages for a heap over title memory map");
+  }
+}
+
+// A graphics pipeline from a pipeline state stream of desktop shaders.
+void test_pipeline_stream(void* device) {
+  HMODULE compiler = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  using CompileFn = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*,
+                                     UINT, UINT, void**, void**);
+  const auto compile = compiler ? reinterpret_cast<CompileFn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+  const char vs_source[] = "float4 main(uint id : SV_VertexID) : SV_Position { return float4(id, 0, 0, 1); }";
+  const char ps_source[] = "float4 main() : SV_Target { return float4(1, 0, 0, 1); }";
+  void* vs = nullptr;
+  void* ps = nullptr;
+  if (compile) {
+    compile(vs_source, sizeof(vs_source) - 1, nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vs, nullptr);
+    compile(ps_source, sizeof(ps_source) - 1, nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &ps, nullptr);
+  }
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+  root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  ID3DBlob* serialized = nullptr;
+  D3D12SerializeVersionedRootSignature(&root_desc, &serialized, nullptr);
+  void* root = nullptr;
+  if (serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &root);
+  }
+  if (!vs || !ps || !root) {
+    check(false, "pipeline stream ingredients are available");
+    return;
+  }
+  struct alignas(void*) RootSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+    void* value;
+  };
+  struct alignas(void*) ShaderSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+    D3D12_SHADER_BYTECODE value;
+  };
+  struct alignas(void*) TopologySubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY;
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  };
+  struct alignas(void*) FormatsSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+    D3D12_RT_FORMAT_ARRAY value{{DXGI_FORMAT_R8G8B8A8_UNORM}, 1};
+  };
+  struct Stream {
+    RootSubobject root;
+    ShaderSubobject vs;
+    ShaderSubobject ps;
+    TopologySubobject topology;
+    FormatsSubobject formats;
+  } stream{};
+  stream.root.value = root;
+  stream.vs = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {blob_pointer(vs), blob_size(vs)}};
+  stream.ps = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {blob_pointer(ps), blob_size(ps)}};
+  D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+  void* pipeline = nullptr;
+  check(call<HRESULT>(device, 86, &desc, __uuidof(ID3D12PipelineState), &pipeline) == S_OK && pipeline,
+        "the device creates graphics pipelines from pipeline state streams");
+  if (pipeline) call<ULONG>(pipeline, 2);
+}
+
 void test_display_and_pacing(void* device) {
   constexpr GUID kDxgiDevice = {0x54ec77fa, 0x1377, 0x44e6, {0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c}};
   void* dxgi = nullptr;
@@ -292,5 +426,7 @@ void test_graphics_resources(void* device) {
   test_resources(device);
   test_root_signature_and_pipeline(device);
   test_native_pipeline(device);
+  test_device_objects(device);
+  test_pipeline_stream(device);
   test_display_and_pacing(device);
 }

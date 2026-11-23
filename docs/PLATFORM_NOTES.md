@@ -85,6 +85,15 @@ Notes describe the platform, never a title.
   a placeholder become placeholders again when pages are mapped into them. Without enough commit charge,
   sections are reserved and pages committed when mapped or touched.
   `XMemTransferMemory` has nothing to move between partitions on a host and succeeds.
+- *observed*: titles allocate and map several GiB of physical pages for a texture pool during start-up and
+  treat a failed mapping as fatal.
+- *documented* host behaviour: the host opens GPU heaps only over committed sections (`SEC_COMMIT`); a
+  `SEC_RESERVE` section is refused even when all of it is committed through a view.
+- Implementation: storage is created lazily. Mapping a page that has none only records the mapping; the page
+  gets its slice, and the granule its view, on first CPU access (a vectored exception handler in the memory
+  library), when a buffer in it is handed to the kernel (the runtime's commit-before-I/O path calls the memory
+  library first), or when the graphics library asks for the memory behind an address. Fresh storage reads as
+  zero. Commit charge is taken per section (up to 1 GiB) when its first page is used, not at mapping time.
 - Open: `XMemVirtualQuery`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable` signatures.
 
 ## Graphics (`d3d12_xs.dll`)
@@ -143,6 +152,28 @@ Notes describe the platform, never a title.
   the interface id and the out pointer.
 - *assumed*: command-list slots 131 and 132 program GPU state by register offset, value and mask; they are
   recorded and not applied, since the host driver owns its GPU's state.
+- *observed*: device slots that keep the desktop arguments: 27 `CreateCommittedResource`, 39
+  `CreateQueryHeap` (titles create occlusion query heaps and readback buffers of 8 bytes per query), 41
+  `CreateCommandSignature` (titles pass a null root signature).
+- *observed*: command signatures use the desktop argument types and also type 105 with a 12-byte stride, seen
+  next to a desktop dispatch (type 2) and mesh dispatch (type 10) signature of the same stride. What type 105
+  does is not established; such signatures are created (with a desktop stand-in of the same stride) and
+  executing one will have to report itself.
+- *observed*: device slot 61 takes an 84-byte console sampler description and a destination descriptor
+  address (titles build the description from their own packed sampler state). *assumed* fields: dwords 1-3
+  min, mag and mip filter (1 point, 2 linear), 6-8 address modes U/V/W in desktop values, 9-10 min and max
+  LOD, 12 LOD bias, 13 comparison function (desktop values, 0 none), 16 maximum anisotropy, 17-20 border
+  colour. Dwords 0, 4, 5, 11, 14 and 15 are not understood and ignored.
+- *observed*: device slot 74 takes the address of a reservation with physical pages mapped, the page count
+  (64 KiB pages) and the out pointer, and returns an `HRESULT`; titles call it for their texture pool. The
+  object behaves as a heap (interface slots 0-2, 7 `GetDevice`, 8 `GetDesc` with a result pointer). Host
+  heaps over that memory are opened per piece of storage only when something is placed or mapped there.
+- *observed*: device slot 86 takes a `D3D12_PIPELINE_STATE_STREAM_DESC` (size, stream), the interface id and
+  the out pointer, as the desktop `CreatePipelineState`. Streams use the desktop subobject layout; the first
+  ones titles create carry root signature, vertex, pixel and empty hull/domain/geometry shaders, blend, sample
+  mask, rasterizer, depth-stencil (type 21), sample description, input layout, topology and target formats.
+  Their shaders carry only native code; graphics shaders are not translated yet, so such pipelines report
+  themselves.
 - Implementation:
   - GPU addresses are title addresses, as on the console. Each piece of title memory resources are placed in
     gets a host heap opened over the same memory (from the physical-page section, or from the committed
@@ -285,6 +316,10 @@ Notes describe the platform, never a title.
   libraries) or by a 4-byte `NOBC` marker (titles' own shaders).
 - *documented*: the container digest is the DXBC checksum (MD5 with a modified final block); the
   implementation reproduces console containers' digests byte for byte and the host compiler's.
+- *observed*: in graphics shaders (and some compute shaders) the `DXIL` part starts with a desktop program
+  header whose bitcode offset skips the console block; the "program" it points at may be just the `NOBC`
+  marker. Such containers carry only native code even though the part looks like a desktop one. Graphics
+  shaders seen so far have console block version 3 (compute: 5) and an extra 12-byte `PRIV` part.
 - *observed*: the console block starts with `XDAT` and a version; from byte 16 follow (offset, size, kind)
   entries, offsets relative to `XDAT`, up to the first entry's data. Kind 10 is the DXIL bitcode, kind 16 the
   zlib stream of the native program block (`FSSM`). Its recorded size has been seen to run a few bytes past the

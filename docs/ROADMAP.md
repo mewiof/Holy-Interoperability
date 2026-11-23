@@ -36,6 +36,8 @@ Legend: **done** — implemented and tested; **partial** — some of it works; *
   into placeholder reservations, giving the aliased CPU and GPU views titles build.
 - open: `XMemVirtualQuery`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`.
 - done: honouring a title's exported allocation hooks.
+- done: lazy storage for mapped physical pages (commit follows use; texture pools of several GiB map on hosts
+  with less spare commit).
 
 ## 3. Game runtime (`xgameruntime`) — partial
 
@@ -67,7 +69,11 @@ The largest piece.
   vector ALU, scalar, buffer, global and group-shared memory and atomics. Open: image instructions,
   cross-lane operations, graphics stages (exports, interpolation), and checking translated code against
   known results once dispatches run.
-- next: query heaps, then command recording (for translated pipelines: root tables and the region table).
+- done: query heaps, command signatures, desktop-order committed resources, console samplers (field meaning
+  partly assumed), heaps over title memory, pipeline state streams with desktop programs.
+- next: graphics shader translation (vertex and pixel shaders: exports, interpolation, images), which the
+  title's first graphics pipelines need; then command recording (for translated pipelines: root tables and
+  the region table).
 - open: textures placed in title memory (console layouts via `xg_xs`), presentation.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.

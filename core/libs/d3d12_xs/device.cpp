@@ -27,6 +27,7 @@
 #include "core/libs/d3d12_xs/descriptors.h"
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/frame_pacing.h"
+#include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/d3d12_xs/shader_container.h"
 #include "core/libs/d3d12_xs/shader_dump.h"
@@ -201,6 +202,16 @@ HRESULT STDMETHODCALLTYPE create_committed_resource_x(Device* self, const D3D12_
   return create_committed_resource(self, properties, flags, desc, state, clear, resource);
 }
 
+// Observed: device slot 27 takes the desktop CreateCommittedResource
+// arguments (heap properties, heap flags, resource description, initial
+// state, optimised clear value, interface id, out pointer).
+HRESULT STDMETHODCALLTYPE create_committed_resource_desktop(Device* self, const D3D12_HEAP_PROPERTIES* properties,
+                                                            D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC* desc,
+                                                            UINT state, const D3D12_CLEAR_VALUE* clear, REFIID,
+                                                            void** resource) {
+  return create_committed_resource(self, properties, flags, desc, state, clear, resource);
+}
+
 // --- root signatures -----------------------------------------------------------------
 //
 // Observed: device slot 16 is CreateRootSignature(node mask, blob, size, riid,
@@ -229,6 +240,152 @@ HRESULT STDMETHODCALLTYPE create_root_signature(Device* self, UINT, const void* 
 }
 
 // --- pipeline states ------------------------------------------------------------------
+// A heap over title memory. Observed: device slot 74 takes the address of a
+// title reservation with physical pages mapped, the page count (64 KiB pages)
+// and the out pointer, and returns an HRESULT; titles create it for their
+// texture pools. Host heaps over that memory are opened per piece of storage
+// when something is placed or mapped there (gpu_memory.h), not here: pools
+// are large and mostly untouched.
+struct TitleHeap {
+  void* const* vtable;
+  const lib::VtableInfo* info;
+  std::atomic<long> refs{1};
+  Device* device = nullptr;
+  uint64_t address = 0;
+  uint64_t size = 0;
+};
+
+const lib::VtableInfo kTitleHeapInfo{kLibrary, "ID3D12HeapX"};
+
+HRESULT STDMETHODCALLTYPE title_heap_query_interface(TitleHeap* self, REFIID iid, void** out) {
+  if (!out) return E_POINTER;
+  *out = nullptr;
+  if (!IsEqualGUID(iid, __uuidof(ID3D12Heap)) && !IsEqualGUID(iid, __uuidof(IUnknown))) return E_NOINTERFACE;
+  self->refs.fetch_add(1);
+  *out = self;
+  return S_OK;
+}
+ULONG STDMETHODCALLTYPE title_heap_add_ref(TitleHeap* self) {
+  return static_cast<ULONG>(self->refs.fetch_add(1) + 1);
+}
+ULONG STDMETHODCALLTYPE title_heap_release(TitleHeap* self) {
+  const long left = self->refs.fetch_sub(1) - 1;
+  if (left == 0) delete self;
+  return static_cast<ULONG>(left);
+}
+HRESULT STDMETHODCALLTYPE title_heap_get_device(TitleHeap* self, REFIID, void** device) {
+  if (!device) return E_POINTER;
+  self->device->refs.fetch_add(1);
+  *device = self->device;
+  return S_OK;
+}
+// GetDesc: a 48-byte structure, result pointer first.
+D3D12_HEAP_DESC* STDMETHODCALLTYPE title_heap_get_desc(D3D12_HEAP_DESC* result, TitleHeap* self) {
+  *result = {};
+  result->SizeInBytes = self->size;
+  result->Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  result->Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  return result;
+}
+
+const auto kTitleHeapVtable = [] {
+  auto table = lib::make_reporting_vtable<16>();
+  table[0] = reinterpret_cast<void*>(&title_heap_query_interface);
+  table[1] = reinterpret_cast<void*>(&title_heap_add_ref);
+  table[2] = reinterpret_cast<void*>(&title_heap_release);
+  table[7] = reinterpret_cast<void*>(&title_heap_get_device);
+  table[8] = reinterpret_cast<void*>(&title_heap_get_desc);
+  return table;
+}();
+
+HRESULT STDMETHODCALLTYPE create_heap_over_memory(Device* self, void* address, uint32_t pages, void** heap) {
+  if (!heap) return E_POINTER;
+  *heap = nullptr;
+  if (!address || pages == 0) return E_INVALIDARG;
+  auto* object = new TitleHeap();
+  object->vtable = kTitleHeapVtable.data();
+  object->info = &kTitleHeapInfo;
+  object->device = self;
+  object->address = reinterpret_cast<uint64_t>(address);
+  object->size = static_cast<uint64_t>(pages) << 16;
+  LIB_LOG(lib::kDebug, "d3d12", "heap over title memory %p + 0x%llx", address,
+          static_cast<unsigned long long>(object->size));
+  *heap = object;
+  return S_OK;
+}
+
+const lib::VtableInfo kQueryHeapInfo{kLibrary, "ID3D12QueryHeapX"};
+
+const auto kQueryHeapVtable = [] {
+  auto table = make_forwarding_vtable(8);
+  table[7] = reinterpret_cast<void*>(&get_device_of_child);
+  return table;
+}();
+
+// Observed: device slot 39 takes a D3D12_QUERY_HEAP_DESC (type, count, node
+// mask), the interface id and the out pointer, as the desktop's
+// CreateQueryHeap at the same slot.
+HRESULT STDMETHODCALLTYPE create_query_heap(Device* self, const D3D12_QUERY_HEAP_DESC* desc, REFIID, void** heap) {
+  if (!heap || !desc) return E_POINTER;
+  *heap = nullptr;
+  D3D12_QUERY_HEAP_DESC host_desc = *desc;
+  host_desc.NodeMask = 0;
+  ID3D12QueryHeap* host = nullptr;
+  const HRESULT hr = self->host->CreateQueryHeap(&host_desc, IID_PPV_ARGS(&host));
+  LIB_LOG(lib::kDebug, "d3d12", "query heap type %u count %u node mask 0x%x -> 0x%08lX",
+          static_cast<unsigned>(desc->Type), desc->Count, desc->NodeMask, static_cast<unsigned long>(hr));
+  if (FAILED(hr)) return hr;
+  *heap = wrap(host, &kQueryHeapInfo, kQueryHeapVtable.data());
+  return S_OK;
+}
+
+const lib::VtableInfo kCommandSignatureInfo{kLibrary, "ID3D12CommandSignatureX"};
+
+const auto kCommandSignatureVtable = [] {
+  auto table = make_forwarding_vtable(8);
+  table[7] = reinterpret_cast<void*>(&get_device_of_child);
+  return table;
+}();
+
+// Observed: device slot 41 takes a D3D12_COMMAND_SIGNATURE_DESC, a root
+// signature (null when no argument touches root state), the interface id
+// and the out pointer, as the desktop's CreateCommandSignature. Argument
+// types are passed on when the desktop knows them. Assumed: console type
+// 105, seen alone with a 12-byte stride, is a dispatch.
+constexpr uint32_t kConsoleDispatchArgument = 105;
+
+HRESULT STDMETHODCALLTYPE create_command_signature(Device* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                                   const void* root_signature, REFIID, void** signature) {
+  if (!signature || !desc) return E_POINTER;
+  *signature = nullptr;
+  std::vector<D3D12_INDIRECT_ARGUMENT_DESC> arguments(desc->pArgumentDescs,
+                                                      desc->pArgumentDescs + desc->NumArgumentDescs);
+  for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
+    const auto* raw = reinterpret_cast<const uint32_t*>(&desc->pArgumentDescs[i]);
+    LIB_LOG(lib::kDebug, "d3d12", "command signature stride %u argument %u: %08x %08x %08x %08x", desc->ByteStride, i,
+            raw[0], raw[1], raw[2], raw[3]);
+    if (raw[0] == kConsoleDispatchArgument) {
+      arguments[i] = {};
+      arguments[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    } else if (desc->pArgumentDescs[i].Type > D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH) {
+      HolyUnimplementedFrom(kLibrary, "command signature with a console argument type", _ReturnAddress());
+      return E_NOTIMPL;
+    }
+  }
+  D3D12_COMMAND_SIGNATURE_DESC host_desc = *desc;
+  host_desc.pArgumentDescs = arguments.data();
+  host_desc.NodeMask = 0;
+  ID3D12CommandSignature* host = nullptr;
+  const HRESULT hr = self->host->CreateCommandSignature(
+      &host_desc, root_signature ? host_of<ID3D12RootSignature>(root_signature) : nullptr, IID_PPV_ARGS(&host));
+  if (FAILED(hr)) {
+    LIB_LOG(lib::kError, "d3d12", "command signature refused by the host (0x%08lX)", static_cast<unsigned long>(hr));
+    return hr;
+  }
+  *signature = wrap(host, &kCommandSignatureInfo, kCommandSignatureVtable.data());
+  return S_OK;
+}
+
 const lib::VtableInfo kPipelineInfo{kLibrary, "ID3D12PipelineStateX"};
 
 const auto kPipelineVtable = [] {
@@ -361,6 +518,11 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline_state_x(Device* self, const D3
   return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE create_pipeline_state(Device* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID,
+                                                void** pipeline) {
+  return create_pipeline_from_stream(self, desc, &kPipelineInfo, kPipelineVtable.data(), pipeline, _ReturnAddress());
+}
+
 const auto kDeviceVtable = [] {
   auto table = lib::make_reporting_vtable<kDeviceSlots>();
   table[0] = reinterpret_cast<void*>(&device_query_interface);
@@ -381,11 +543,17 @@ const auto kDeviceVtable = [] {
   table[24] = reinterpret_cast<void*>(&copy_descriptors_simple);
   table[25] = reinterpret_cast<void*>(&get_resource_allocation_info);
   table[26] = reinterpret_cast<void*>(&get_custom_heap_properties);
+  table[27] = reinterpret_cast<void*>(&create_committed_resource_desktop);
   table[36] = reinterpret_cast<void*>(&create_fence);
+  table[39] = reinterpret_cast<void*>(&create_query_heap);
+  table[41] = reinterpret_cast<void*>(&create_command_signature);
   table[48] = reinterpret_cast<void*>(&create_queue_x);
+  table[61] = reinterpret_cast<void*>(&create_sampler_x);
   table[62] = reinterpret_cast<void*>(&create_compute_pipeline_state_x);
   table[70] = reinterpret_cast<void*>(&create_shader_resource_view_at);
   table[73] = reinterpret_cast<void*>(&create_command_list_x);
+  table[74] = reinterpret_cast<void*>(&create_heap_over_memory);
+  table[86] = reinterpret_cast<void*>(&create_pipeline_state);
   table[78] = reinterpret_cast<void*>(&set_frame_interval_x);
   table[79] = reinterpret_cast<void*>(&schedule_frame_event_x);
   table[127] = reinterpret_cast<void*>(&create_committed_resource_x);

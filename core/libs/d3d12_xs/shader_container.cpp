@@ -154,7 +154,15 @@ ShaderFormat rebuild_desktop_container(const void* blob, size_t size, std::vecto
   }
   if (!dxil || dxil_size < 24) return ShaderFormat::Unknown;
   if (std::memcmp(dxil, "XDAT", 4) != 0) {
-    // Already a desktop program.
+    // A desktop program header. Console containers keep their block between
+    // the header and the program, which the header's bitcode offset skips;
+    // the program can also be just the "NOBC" marker.
+    if (std::memcmp(dxil + 8, "DXIL", 4) == 0) {
+      const uint64_t at = 8ull + read32(dxil + 16), length = read32(dxil + 20);
+      if (at + length > dxil_size || length < 4 || std::memcmp(dxil + at, "BC\xC0\xDE", 4) != 0) {
+        return ShaderFormat::NativeOnly;
+      }
+    }
     out.assign(bytes, bytes + size);
     return ShaderFormat::Desktop;
   }

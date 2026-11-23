@@ -21,6 +21,7 @@ struct ViewAtAddress;
 void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_RESOURCE_DESC* resource,
                                                       const ViewAtAddress* view, SIZE_T dest);
 void STDMETHODCALLTYPE create_sampler(Device* self, const D3D12_SAMPLER_DESC* desc, SIZE_T dest);
+void STDMETHODCALLTYPE create_sampler_x(Device* self, const uint32_t* desc, SIZE_T dest);
 void STDMETHODCALLTYPE copy_descriptors(Device* self, UINT dest_ranges, const SIZE_T* dest_starts,
                                         const UINT* dest_sizes, UINT source_ranges, const SIZE_T* source_starts,
                                         const UINT* source_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type);

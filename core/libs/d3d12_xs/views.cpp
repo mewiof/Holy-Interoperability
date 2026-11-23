@@ -19,6 +19,7 @@
 #include <intrin.h>
 
 #include <cstddef>
+#include <cstring>
 
 namespace holy::d3d12 {
 namespace {
@@ -161,6 +162,50 @@ void STDMETHODCALLTYPE create_depth_stencil_view(Device* self, void* resource,
 
 void STDMETHODCALLTYPE create_sampler(Device* self, const D3D12_SAMPLER_DESC* desc, SIZE_T dest) {
   self->host->CreateSampler(desc, host_cpu_handle(dest));
+}
+
+// Observed: device slot 61 takes an 84-byte console sampler description and
+// the destination descriptor address. Field meanings (assumed, from how
+// titles fill it and the values seen): dwords 1-3 min, mag and mip filter
+// (1 point, 2 linear), 6-8 address modes U/V/W (desktop values), 9-10 min and
+// max LOD, 12 LOD bias, 13 comparison function (desktop values, 0 none), 16
+// maximum anisotropy, 17-20 border colour. Dwords 0, 4, 5, 11, 14 and 15 are
+// not understood and ignored.
+void STDMETHODCALLTYPE create_sampler_x(Device* self, const uint32_t* desc, SIZE_T dest) {
+  auto as_float = [&](int index) {
+    float value;
+    std::memcpy(&value, desc + index, 4);
+    return value;
+  };
+  LIB_LOG(lib::kDebug, "d3d12",
+          "sampler x: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", desc[0],
+          desc[1], desc[2], desc[3], desc[4], desc[5], desc[6], desc[7], desc[8], desc[9], desc[10], desc[11], desc[12],
+          desc[13], desc[14], desc[15], desc[16]);
+  D3D12_SAMPLER_DESC host{};
+  const bool min_linear = desc[1] == 2, mag_linear = desc[2] == 2, mip_linear = desc[3] == 2;
+  const bool compare = desc[13] >= D3D12_COMPARISON_FUNC_NEVER && desc[13] <= D3D12_COMPARISON_FUNC_ALWAYS;
+  const UINT anisotropy = desc[16] < 1 ? 1 : desc[16] > 16 ? 16 : desc[16];
+  if (anisotropy > 1) {
+    host.Filter = compare ? D3D12_FILTER_COMPARISON_ANISOTROPIC : D3D12_FILTER_ANISOTROPIC;
+  } else {
+    const int filter = (min_linear ? 0x10 : 0) | (mag_linear ? 0x4 : 0) | (mip_linear ? 0x1 : 0);
+    host.Filter = static_cast<D3D12_FILTER>(filter | (compare ? 0x80 : 0));
+  }
+  auto address = [](uint32_t mode) {
+    return mode >= D3D12_TEXTURE_ADDRESS_MODE_WRAP && mode <= D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE
+               ? static_cast<D3D12_TEXTURE_ADDRESS_MODE>(mode)
+               : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+  };
+  host.AddressU = address(desc[6]);
+  host.AddressV = address(desc[7]);
+  host.AddressW = address(desc[8]);
+  host.MinLOD = as_float(9);
+  host.MaxLOD = as_float(10);
+  host.MipLODBias = as_float(12);
+  host.ComparisonFunc = compare ? static_cast<D3D12_COMPARISON_FUNC>(desc[13]) : D3D12_COMPARISON_FUNC_NEVER;
+  host.MaxAnisotropy = anisotropy;
+  for (int i = 0; i < 4; ++i) host.BorderColor[i] = as_float(17 + i);
+  self->host->CreateSampler(&host, host_cpu_handle(dest));
 }
 
 void STDMETHODCALLTYPE copy_descriptors(Device* self, UINT dest_ranges, const SIZE_T* dest_starts,

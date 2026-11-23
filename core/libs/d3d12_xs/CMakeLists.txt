@@ -14,6 +14,8 @@ holy_add_system_library(holy_lib_d3d12_xs
     frame_pacing.h
     gpu_memory.cpp
     gpu_memory.h
+    pipeline_stream.cpp
+    pipeline_stream.h
     resource.cpp
     shader/dxbc.cpp
     shader/dxbc.h

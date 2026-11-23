@@ -22,6 +22,7 @@ struct Device {
   const lib::VtableInfo* info;
   std::atomic<long> refs{1};
   ID3D12Device* host = nullptr;
+  ID3D12RootSignature* translated_root = nullptr;  // shared by translated pipelines
 };
 
 struct CommandQueue {

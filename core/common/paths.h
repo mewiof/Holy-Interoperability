@@ -22,4 +22,12 @@ bool create_directories(const std::wstring& path);
 // Location of the runtime's log file inside a per-title data directory.
 std::wstring runtime_log_path(const std::wstring& data_dir);
 
+// Host caches of the title process (the graphics driver's and the graphics
+// runtime's shader caches, which are located from the user profile path)
+// live in this subdirectory of the data directory. A file named
+// kHostCacheDiscard inside it asks the launcher to discard them before the
+// next run.
+inline constexpr wchar_t kHostCacheDir[] = L"host";
+inline constexpr wchar_t kHostCacheDiscard[] = L"discard";
+
 }  // namespace holy

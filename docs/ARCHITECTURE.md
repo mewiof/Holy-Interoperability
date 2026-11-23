@@ -104,7 +104,11 @@ resolve against the package root, as on the console.
 
 **Data directory.** Per title, under the user's low-integrity application data folder so sandboxed titles can
 write to it. The directory name is derived from ids in the manifest, not from the title's name. It holds
-`logs/`, `temp/` and `scratch/`.
+`logs/`, `temp/`, `scratch/`, `shaders/` (shader containers kept for study when a pipeline cannot be created
+as shipped), `refused-pipelines.txt` (shaders whose desktop program the host refused, translated directly in
+later runs) and `host/`, the title process's profile path, where the graphics driver and runtime keep their
+shader caches. `host/` is discarded before a run when the previous run left a `discard` marker in it (written
+when the host refuses a pipeline; see [PLATFORM_NOTES.md](PLATFORM_NOTES.md), Graphics shaders).
 
 **Console identity.** Platform code linked into titles asks the registry which console model it runs on; the
 runtime answers that single query (see [PLATFORM_NOTES.md](PLATFORM_NOTES.md)).

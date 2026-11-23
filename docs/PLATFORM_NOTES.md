@@ -154,7 +154,9 @@ Notes describe the platform, never a title.
   - Committed resources are host committed resources; the matching `XMemAlloc` is made so titles' accounting
     holds.
   - Root signature flag bits above the desktop's are dropped. Compute pipelines whose shaders keep their DXIL
-    run from a rebuilt desktop container; shaders with only native GPU code report themselves.
+    run from that program; shaders with only native GPU code, and shaders whose DXIL the host refuses, run
+    translated from their native code (see Graphics shaders). Recording and executing commands for
+    translated pipelines is not implemented yet.
   - Every other slot, and any interface query other than the device's own and `IDXGIDevice`, reports itself.
 
 ## Game runtime (`xgameruntime.dll`)
@@ -283,9 +285,40 @@ Notes describe the platform, never a title.
   libraries) or by a 4-byte `NOBC` marker (titles' own shaders).
 - *documented*: the container digest is the DXBC checksum (MD5 with a modified final block); the
   implementation reproduces console containers' digests byte for byte and the host compiler's.
-- Implementation: containers with bitcode are rebuilt as desktop containers (plain DXIL program, desktop parts
-  kept, `RTS0` flags masked, digest recomputed) and run on the host; one such packaged compute shader is
-  refused by the host driver. Shaders with only native code need translation, which is not implemented yet.
+- *observed*: the console block starts with `XDAT` and a version; from byte 16 follow (offset, size, kind)
+  entries, offsets relative to `XDAT`, up to the first entry's data. Kind 10 is the DXIL bitcode, kind 16 the
+  zlib stream of the native program block (`FSSM`). Its recorded size has been seen to run a few bytes past the
+  part; the stream itself ends inside it. The DXIL program header in front of the console block is a valid
+  desktop program header (its bitcode offset skips the block), so such containers also pass as desktop ones.
+- *observed*: in the `FSSM` block, the dword at 0xC0 is the offset of the code record, whose machine code starts
+  0x28 bytes in; the dword at 0xF8 matches the number of user SGPRs the code reads (root table pointer and
+  arguments: 3 and 4 in the two programs studied, each consistent with its use of `s[0:1]` and the following
+  registers). The thread group size is in `PSV0` as on the desktop (runtime information bytes 40-51).
+- *assumed*: the workgroup id SGPRs (x, y, z) follow the user SGPRs, lane registers `v0`-`v2` hold the thread id
+  in the group, and a program is wave64 when it writes `EXEC` with 64-bit scalar operations (wave32 otherwise).
+  Not yet confirmed by running translated code against known results.
+- *documented*: the native code is RDNA 2 (public AMD instruction set reference); decoding follows it.
+- *documented*: host bytecode (DXBC, shader model 5.1) follows the desktop runtime's tokenized program format;
+  a container needs input and output signature parts besides `SHEX`, and the DXBC checksum.
+- Implementation, desktop programs: containers with bitcode are rebuilt as desktop containers (plain DXIL
+  program, desktop parts kept, `RTS0` flags masked, digest recomputed) and run on the host.
+- Implementation, native programs (compute only): the native code is translated straight into DXBC, without a
+  shader compiler. One host thread runs one lane; scalar registers are recomputed per lane; lane masks keep the
+  lane's own bit; control flow becomes a loop around a switch over block addresses; workgroup barriers leave
+  the loop and synchronise at the top level. Memory is reached through a region table: title GPU addresses
+  (which equal CPU addresses) are looked up in a constant buffer of (base, size, view) entries and accessed
+  through raw views (u0-u63, space 8). Scalar and vector ALU, scalar loads, buffer loads and stores
+  (untyped, and typed for the 8/16/32-bit integer, normalised and float formats seen), global and flat
+  memory, atomics and group shared memory (32 KiB, the host's limit) are translated. Not translated, and
+  reported as such: cross-lane operations (DPP, lane reads with a lane mask), image instructions, exports
+  (graphics shaders), and anything else not listed.
+- *observed*: on the host GPU used for development, one packaged compute program is refused
+  (`E_OUTOFMEMORY`), and a sandboxed (low-integrity) process that has seen this refusal leaves the driver's
+  shader cache in a state that makes every later process using it fail fast inside the driver. Mitigations:
+  the title process's profile path points at a private host cache directory in its data directory (the
+  driver and the graphics runtime locate their shader caches from it); a refusal marks that cache for
+  discarding before the next run, and the refused shader's hash is remembered there so later runs translate
+  it without asking the host again.
 - *observed*: titles do not write GPU command packets themselves; draws and dispatches go through the
   console D3D12 interfaces.
 

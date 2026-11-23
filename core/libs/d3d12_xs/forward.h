@@ -26,7 +26,12 @@ struct Wrapper {
   const lib::VtableInfo* info;
   IUnknown* host;
   std::atomic<long> refs{1};
+  uint32_t flags = 0;  // kind-specific (see kTranslatedPipeline)
 };
+
+// Wrapper flag: a pipeline running translated native code with the
+// translation's own root signature.
+inline constexpr uint32_t kTranslatedPipeline = 1;
 static_assert(offsetof(Wrapper, host) == 0x10);
 
 inline constexpr int kWrapperSlots = 96;

@@ -35,7 +35,7 @@ Legend: **done** — implemented and tested; **partial** — some of it works; *
   `XMemMapPhysicalPagesScatter`, `XMemFreePhysicalPages`, `XMemTransferMemory`): section-backed pages mapped
   into placeholder reservations, giving the aliased CPU and GPU views titles build.
 - open: `XMemVirtualQuery`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`.
-- open: honouring a title's exported allocation hooks.
+- done: honouring a title's exported allocation hooks.
 
 ## 3. Game runtime (`xgameruntime`) — partial
 
@@ -53,7 +53,7 @@ provider interfaces obtained from `QueryApiImpl`.
 - Policy for services with no local equivalent: the runtime does not sign users in to anything, does not
   emulate online services, and never reports ownership of add-on content.
 
-## 4. Graphics (`d3d12_xs`, `xg_xs`) — partial (blocked)
+## 4. Graphics (`d3d12_xs`, `xg_xs`) — partial
 
 The largest piece.
 
@@ -61,15 +61,16 @@ The largest piece.
 - partial: `D3D12XboxCreateDevice` on the host's Direct3D 12; command queues, fences, allocators, command-list
   creation and `Close`; console DXGI display modes; frame interval and frame events; descriptor heaps placed by
   the title; views; root signatures; committed and placed resources (buffers placed in title memory through
-  host heaps over that memory); compute pipelines from shaders that keep their DXIL.
-- next: shader translation from native GPU code (titles' own shaders carry nothing else), and a packaged
-  compute shader whose DXIL the host driver refuses.
-- open: textures placed in title memory (console layouts via `xg_xs`), command recording, presentation.
+  host heaps over that memory); compute pipelines from shaders that keep their DXIL, and from native code.
+- partial: shader translation from native GPU code (titles' own shaders carry nothing else): compute
+  programs are translated straight into host bytecode (DXBC) without a shader compiler, covering scalar and
+  vector ALU, scalar, buffer, global and group-shared memory and atomics. Open: image instructions,
+  cross-lane operations, graphics stages (exports, interpolation), and checking translated code against
+  known results once dispatches run.
+- next: query heaps, then command recording (for translated pipelines: root tables and the region table).
+- open: textures placed in title memory (console layouts via `xg_xs`), presentation.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.
-- open: shader translation. Titles ship only native console GPU machine code (see
-  [PLATFORM_NOTES.md](PLATFORM_NOTES.md)); nothing portable is included, so every shader must be translated
-  from that machine code to a host shader format.
 - open: `xg_xs` texture layout computation.
 - open: interaction with graphics helper DLLs that packages ship and that call into the device.
 
@@ -98,5 +99,7 @@ The console's fast-storage factory. Plan: implement on host file I/O first, the 
 
 - A way to run more than the default executable of a package, and to pass a launch context.
 - Symbol-free minidumps next to the runtime log.
+- done: host caches (graphics driver and runtime shader caches) of the title process live in its data
+  directory and are discarded after a run in which the host refused a pipeline.
 - CI: build and test on every push (workflow present, not yet exercised on the hosting service).
 - Other host operating systems, by way of a Windows API layer beneath the project.

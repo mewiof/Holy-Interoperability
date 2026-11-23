@@ -38,7 +38,7 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Runtime: import binder, reporting thunks, call tracing, crash reports | Working, tested end to end |
 | Title environment: package mount, read-only package, scratch storage, console identity, lifecycle registration | Working, tested end to end |
 | `xmem` (title memory) | Heap, virtual and physical-page allocation and mapping; commit on demand |
-| `d3d12_xs` (graphics) | Device on the host's Direct3D 12, queues, fences, descriptor heaps, views, resources in title memory, DXIL compute pipelines; no command recording or rendering yet |
+| `d3d12_xs` (graphics) | Device on the host's Direct3D 12, queues, fences, descriptor heaps, views, resources in title memory, compute pipelines from DXIL or from native GPU code translated to host bytecode (compute only, not yet run); no command recording or rendering yet |
 | `xgameruntime` (game runtime) | Entry points, task queues and async calls, networking (offline), users (nobody signed in), system identity, package state, persistent local storage, display mode; other services missing |
 | `xcrdapi` (fast storage) | Factory and file opening; queues and requests missing |
 | `gameinput` (input) | Interface present; no input devices surfaced yet |
@@ -47,10 +47,10 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 What this means in practice: a retail title image loads, runs its static initialisation, initialises the
 game runtime, creates its task queues, queries networking, user and system services and the input API, and
-creates its window, its graphics device, queues, descriptor heaps, display buffers and the first pipelines of a
-packaged library, and stops where a pipeline needs a shader the host cannot run as shipped. Nothing is rendered
-yet and no title is playable: titles ship their own shaders only as the console GPU's native machine code (see
-[docs/ROADMAP.md](docs/ROADMAP.md)).
+creates its window, its graphics device, queues, descriptor heaps, display buffers and the compute pipelines
+of a packaged library (one of them translated from native GPU code because the host refuses its DXIL), and
+stops at the next graphics call not implemented yet. Nothing is rendered yet and no title is playable: command
+recording, graphics shader translation and presentation are open (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 
 Progress is measured as *console library coverage*: of the console-only symbols a title imports, how many
 have a real implementation. `holy inspect` prints it for any package. Placeholder exports never count.

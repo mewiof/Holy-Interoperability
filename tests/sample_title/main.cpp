@@ -157,6 +157,14 @@ void test_scratch_storage() {
   check(read_all(file) == "scratch", "temporary storage reads back what was written");
   CloseHandle(file);
   check(DeleteFileW(L"T:\\sample_scratch.bin") != 0, "temporary files can be deleted");
+
+  // Host caches (graphics driver and runtime) live in the title's data
+  // directory: the process's profile path points there.
+  wchar_t profile[MAX_PATH] = {};
+  const DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+  const bool private_profile = length > 5 && length < MAX_PATH && wcscmp(profile + length - 5, L"\\host") == 0 &&
+                               (GetFileAttributesW(profile) & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  check(private_profile, "the host cache directory is the process's profile path");
 }
 
 void test_library_loading() {

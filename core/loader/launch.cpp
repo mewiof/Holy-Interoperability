@@ -6,6 +6,7 @@
 #include <shlobj.h>
 
 #include <cstring>
+#include <filesystem>
 #include <map>
 
 #include "core/common/boot_block.h"
@@ -402,7 +403,21 @@ LaunchResult launch(const LaunchOptions& options) {
   }
 
   const std::wstring temp_dir = join_path(data_dir, L"temp");
-  std::vector<wchar_t> environment = build_environment({{L"TEMP", temp_dir}, {L"TMP", temp_dir}});
+  // The title process's user profile path points at its host cache
+  // directory, so the graphics driver and runtime keep their shader caches
+  // there instead of in the user's shared ones. A run in which the host
+  // refused a pipeline leaves a marker; such caches are discarded, because
+  // the host driver has been seen to fail on its own cache entries for a
+  // refused pipeline in every later process.
+  const std::wstring host_dir = join_path(data_dir, kHostCacheDir);
+  if (file_exists(join_path(host_dir, kHostCacheDiscard))) {
+    std::error_code ignored;
+    std::filesystem::remove_all(std::filesystem::path(host_dir), ignored);
+    LOG_INFO(kComponent, "host caches discarded after a refused pipeline");
+  }
+  if (!create_directories(host_dir)) return fail("cannot create the host cache directory");
+  std::vector<wchar_t> environment =
+      build_environment({{L"TEMP", temp_dir}, {L"TMP", temp_dir}, {L"USERPROFILE", host_dir}});
 
   std::vector<HANDLE> inherited;
   STARTUPINFOW startup{};

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "tests/sample_title/checks.h"
 
@@ -190,6 +191,78 @@ void test_root_signature_and_pipeline(void* device) {
         "the device creates compute pipelines from desktop shader containers");
 }
 
+void put32(std::vector<uint8_t>& out, uint32_t value) {
+  for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(value >> (8 * i)));
+}
+
+// A console compute shader container that carries only native code (layout
+// in docs/PLATFORM_NOTES.md): PSV0 with the thread group size, and a DXIL
+// part whose console block holds a zlib stream (one stored block) with the
+// native program block. The program: s_mov_b32 s5, 7; v_mov_b32 v1, s5;
+// s_endpgm.
+std::vector<uint8_t> native_only_container() {
+  std::vector<uint8_t> block(0x134, 0);
+  std::memcpy(block.data(), "FSSM", 4);
+  const uint32_t record = 0x100, user_sgprs = 2;
+  const uint32_t code[3] = {0xBE850387u, 0x7E020205u, 0xBF810000u};
+  std::memcpy(block.data() + 0xC0, &record, 4);
+  std::memcpy(block.data() + 0xF8, &user_sgprs, 4);
+  std::memcpy(block.data() + 0x128, code, sizeof(code));
+  uint32_t a = 1, b = 0;
+  for (uint8_t byte : block) {
+    a = (a + byte) % 65521;
+    b = (b + a) % 65521;
+  }
+  std::vector<uint8_t> stream = {0x78, 0x01, 0x01};
+  const auto length = static_cast<uint16_t>(block.size());
+  stream.insert(stream.end(), {static_cast<uint8_t>(length), static_cast<uint8_t>(length >> 8),
+                               static_cast<uint8_t>(~length), static_cast<uint8_t>(~length >> 8)});
+  stream.insert(stream.end(), block.begin(), block.end());
+  const uint32_t adler = (b << 16) | a;
+  stream.insert(stream.end(), {static_cast<uint8_t>(adler >> 24), static_cast<uint8_t>(adler >> 16),
+                               static_cast<uint8_t>(adler >> 8), static_cast<uint8_t>(adler)});
+
+  std::vector<uint8_t> dxil = {'X', 'D', 'A', 'T'};
+  for (uint32_t v : {5u, 0u, 1u, 32u, static_cast<uint32_t>(stream.size()), 16u, 0u}) put32(dxil, v);
+  dxil.insert(dxil.end(), stream.begin(), stream.end());
+  while (dxil.size() % 4) dxil.push_back(0);
+  std::vector<uint8_t> psv(56, 0);
+  const uint32_t info_size = 52, threads = 64, one = 1;
+  std::memcpy(psv.data(), &info_size, 4);
+  std::memcpy(psv.data() + 40, &threads, 4);
+  std::memcpy(psv.data() + 44, &one, 4);
+  std::memcpy(psv.data() + 48, &one, 4);
+
+  std::vector<uint8_t> out = {'D', 'X', 'B', 'C'};
+  out.resize(20, 0);
+  put32(out, 1);
+  put32(out, 0);
+  put32(out, 2);
+  put32(out, 40);
+  put32(out, static_cast<uint32_t>(40 + 8 + psv.size()));
+  out.insert(out.end(), {'P', 'S', 'V', '0'});
+  put32(out, static_cast<uint32_t>(psv.size()));
+  out.insert(out.end(), psv.begin(), psv.end());
+  out.insert(out.end(), {'D', 'X', 'I', 'L'});
+  put32(out, static_cast<uint32_t>(dxil.size()));
+  out.insert(out.end(), dxil.begin(), dxil.end());
+  const auto total = static_cast<uint32_t>(out.size());
+  std::memcpy(out.data() + 24, &total, 4);
+  return out;
+}
+
+void test_native_pipeline(void* device) {
+  const std::vector<uint8_t> container = native_only_container();
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+  pso.CS = {container.data(), container.size()};
+  void* pipeline = nullptr;
+  check(call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
+                      __uuidof(ID3D12PipelineState), &pipeline) == S_OK &&
+            pipeline,
+        "the device creates compute pipelines from shaders that carry only native code");
+  if (pipeline) call<ULONG>(pipeline, 2);
+}
+
 void test_display_and_pacing(void* device) {
   constexpr GUID kDxgiDevice = {0x54ec77fa, 0x1377, 0x44e6, {0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c}};
   void* dxgi = nullptr;
@@ -218,5 +291,6 @@ void test_graphics_resources(void* device) {
   test_descriptor_heap(device);
   test_resources(device);
   test_root_signature_and_pipeline(device);
+  test_native_pipeline(device);
   test_display_and_pacing(device);
 }

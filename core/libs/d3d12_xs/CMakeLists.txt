@@ -15,6 +15,14 @@ holy_add_system_library(holy_lib_d3d12_xs
     gpu_memory.cpp
     gpu_memory.h
     resource.cpp
+    shader/dxbc.cpp
+    shader/dxbc.h
+    shader/inflate.cpp
+    shader/inflate.h
+    shader/rdna.cpp
+    shader/rdna.h
+    shader/translate.cpp
+    shader/translate.h
     shader_container.cpp
     shader_container.h
     shader_dump.cpp

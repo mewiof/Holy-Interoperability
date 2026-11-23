@@ -6,8 +6,11 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <mutex>
+#include <set>
 #include <string>
 
+#include "core/common/paths.h"
 #include "core/libs/support.h"
 
 namespace holy::d3d12 {
@@ -17,6 +20,56 @@ uint64_t shader_hash(const void* bytes, size_t size) {
   const auto* data = static_cast<const uint8_t*>(bytes);
   for (size_t i = 0; i < size; ++i) hash = (hash ^ data[i]) * 0x100000001b3ull;
   return hash;
+}
+
+void discard_host_caches_after_run() {
+  const wchar_t* data_dir = HolyDataDir();
+  if (!data_dir || !*data_dir) return;
+  const std::wstring path = std::wstring(data_dir) + L"\\" + kHostCacheDir + L"\\" + kHostCacheDiscard;
+  const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+}
+
+namespace {
+
+std::mutex g_refused_lock;
+
+std::wstring refused_list_path() {
+  const wchar_t* data_dir = HolyDataDir();
+  if (!data_dir || !*data_dir) return {};
+  return std::wstring(data_dir) + L"\\refused-pipelines.txt";
+}
+
+std::set<uint64_t>& refused() {
+  static std::set<uint64_t>* set = [] {
+    auto* loaded = new std::set<uint64_t>();
+    const std::wstring path = refused_list_path();
+    FILE* file = path.empty() ? nullptr : _wfopen(path.c_str(), L"r");
+    if (file) {
+      unsigned long long hash = 0;
+      while (std::fscanf(file, "%llx", &hash) == 1) loaded->insert(hash);
+      std::fclose(file);
+    }
+    return loaded;
+  }();
+  return *set;
+}
+
+}  // namespace
+
+bool host_refused_before(uint64_t hash) {
+  std::lock_guard<std::mutex> guard(g_refused_lock);
+  return refused().count(hash) != 0;
+}
+
+void remember_host_refusal(uint64_t hash) {
+  std::lock_guard<std::mutex> guard(g_refused_lock);
+  if (!refused().insert(hash).second) return;
+  const std::wstring path = refused_list_path();
+  FILE* file = path.empty() ? nullptr : _wfopen(path.c_str(), L"a");
+  if (!file) return;
+  std::fprintf(file, "%016llx\n", static_cast<unsigned long long>(hash));
+  std::fclose(file);
 }
 
 void dump_shader(const void* bytes, size_t size, const char* stage) {

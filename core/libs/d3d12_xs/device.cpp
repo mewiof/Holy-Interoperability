@@ -20,11 +20,14 @@
 
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "core/libs/d3d12_xs/descriptors.h"
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/frame_pacing.h"
+#include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/d3d12_xs/shader_container.h"
 #include "core/libs/d3d12_xs/shader_dump.h"
 #include "core/libs/d3d12_xs/views.h"
@@ -234,20 +237,104 @@ const auto kPipelineVtable = [] {
   return table;
 }();
 
+// The root signature of translated pipelines: the region views (u0-u63,
+// space 8) as a descriptor table, the system constants (b0, space 8) as a
+// root constant buffer view.
+ID3D12RootSignature* translated_root_signature(Device* device) {
+  static std::mutex lock;
+  std::lock_guard<std::mutex> guard(lock);
+  if (device->translated_root) return device->translated_root;
+  D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, kRegionTableSize, 0, kTranslatedSpace, 0};
+  D3D12_ROOT_PARAMETER parameters[2]{};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable = {1, &range};
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  parameters[1].Descriptor = {0, kTranslatedSpace};
+  const D3D12_ROOT_SIGNATURE_DESC desc{2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  ID3DBlob* blob = nullptr;
+  ID3DBlob* errors = nullptr;
+  HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
+  if (SUCCEEDED(hr)) {
+    hr = device->host->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                           IID_PPV_ARGS(&device->translated_root));
+  }
+  if (FAILED(hr)) {
+    LIB_LOG(lib::kError, "d3d12", "root signature for translated pipelines: 0x%08lX", static_cast<unsigned long>(hr));
+  }
+  if (blob) blob->Release();
+  if (errors) errors->Release();
+  return device->translated_root;
+}
+
+// A compute pipeline from the shader's native code, translated to host
+// bytecode (see shader/translate.h).
+HRESULT create_translated_compute_pipeline(Device* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+                                           void** pipeline, const void* caller) {
+  LIB_LOG(lib::kDebug, "d3d12", "translating a compute shader of %llu bytes",
+          static_cast<unsigned long long>(desc->CS.BytecodeLength));
+  NativeComputeProgram program;
+  if (!native_compute_program(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, &program)) {
+    dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
+    HolyUnimplementedFrom(kLibrary, "compute pipeline: unreadable native program", caller);
+    return E_NOTIMPL;
+  }
+  ComputeShaderInfo info;
+  for (int axis = 0; axis < 3; ++axis) info.threads[axis] = program.threads[axis];
+  info.user_sgprs = program.user_sgprs;
+  std::vector<uint8_t> bytecode;
+  std::string error;
+  const ULONGLONG start = GetTickCount64();
+  if (!translate_compute(program.block.data() + program.code_offset, program.block.size() - program.code_offset,
+                         info, &bytecode, &error)) {
+    dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
+    LIB_LOG(lib::kError, "d3d12", "native compute shader not translatable: %s", error.c_str());
+    HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), caller);
+    return E_NOTIMPL;
+  }
+  ID3D12RootSignature* root = translated_root_signature(self);
+  if (!root) return E_FAIL;
+  D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
+  host.pRootSignature = root;
+  host.CS = {bytecode.data(), bytecode.size()};
+  ID3D12PipelineState* state = nullptr;
+  const HRESULT hr = self->host->CreateComputePipelineState(&host, IID_PPV_ARGS(&state));
+  LIB_LOG(lib::kInfo, "d3d12", "translated compute shader (%u threads, %zu bytes of host bytecode) in %llu ms: 0x%08lX",
+          info.threads[0] * info.threads[1] * info.threads[2], bytecode.size(),
+          static_cast<unsigned long long>(GetTickCount64() - start), static_cast<unsigned long>(hr));
+  if (FAILED(hr)) {
+    dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
+    return hr;
+  }
+  Wrapper* wrapper = wrap(state, &kPipelineInfo, kPipelineVtable.data());
+  wrapper->flags = kTranslatedPipeline;
+  *pipeline = wrapper;
+  return S_OK;
+}
+
 // Observed: device slot 62 takes a D3D12_COMPUTE_PIPELINE_STATE_DESC, two
 // null pointers, the interface id and the out pointer. Shaders that keep
 // their DXIL run from a rebuilt desktop container; shaders that carry only
-// native GPU code are not supported yet and report themselves.
+// native GPU code, and those whose DXIL the host refuses, run translated.
 HRESULT STDMETHODCALLTYPE create_compute_pipeline_state_x(Device* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
                                                           void*, void*, REFIID, void** pipeline) {
   if (!pipeline || !desc) return E_POINTER;
   *pipeline = nullptr;
   std::vector<uint8_t> shader;
   const ShaderFormat format = rebuild_desktop_container(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, shader);
-  if (format == ShaderFormat::NativeOnly || format == ShaderFormat::Unknown) {
+  if (format == ShaderFormat::NativeOnly) {
+    return create_translated_compute_pipeline(self, desc, pipeline, _ReturnAddress());
+  }
+  if (format == ShaderFormat::Unknown) {
     dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
-    HolyUnimplementedFrom(kLibrary, "compute pipeline with a native-only shader", _ReturnAddress());
+    HolyUnimplementedFrom(kLibrary, "compute pipeline with an unknown shader format", _ReturnAddress());
     return E_NOTIMPL;
+  }
+  const uint64_t hash = shader_hash(desc->CS.pShaderBytecode, desc->CS.BytecodeLength);
+  if (host_refused_before(hash)) {
+    NativeComputeProgram probe;
+    if (native_compute_program(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, &probe)) {
+      return create_translated_compute_pipeline(self, desc, pipeline, _ReturnAddress());
+    }
   }
   D3D12_COMPUTE_PIPELINE_STATE_DESC host = *desc;
   host.pRootSignature = host_of<ID3D12RootSignature>(desc->pRootSignature);
@@ -258,8 +345,16 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline_state_x(Device* self, const D3
   ID3D12PipelineState* state = nullptr;
   const HRESULT hr = self->host->CreateComputePipelineState(&host, IID_PPV_ARGS(&state));
   if (FAILED(hr)) {
+    discard_host_caches_after_run();
+    remember_host_refusal(hash);
+    // Console containers keep a desktop-compatible DXIL program next to the
+    // native code; when the host refuses the former, the latter is used.
+    NativeComputeProgram probe;
+    const bool native = native_compute_program(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, &probe);
+    LIB_LOG(lib::kWarn, "d3d12", "the host refused a compute pipeline (0x%08lX)%s", static_cast<unsigned long>(hr),
+            native ? "; translating its native code" : "");
+    if (native) return create_translated_compute_pipeline(self, desc, pipeline, _ReturnAddress());
     dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
-    LIB_LOG(lib::kError, "d3d12", "the host refused a compute pipeline (0x%08lX)", static_cast<unsigned long>(hr));
     return hr;
   }
   *pipeline = wrap(state, &kPipelineInfo, kPipelineVtable.data());

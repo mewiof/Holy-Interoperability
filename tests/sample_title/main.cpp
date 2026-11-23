@@ -3,12 +3,16 @@
 // It is linked like a console title (console memory library, lifecycle API
 // set, a library nobody provides) and checks, from the inside, that the
 // environment the launcher builds behaves like the one a title expects.
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+
+#include "tests/sample_title/checks.h"
 
 extern "C" {
 __declspec(dllimport) void* XMemAlloc(SIZE_T size, unsigned long long attributes);
@@ -19,17 +23,25 @@ __declspec(dllimport) ULONG NTAPI RegisterAppStateChangeNotification(void (*rout
                                                                      void* context, void** registration);
 __declspec(dllimport) void NTAPI UnregisterAppStateChangeNotification(void* registration);
 __declspec(dllimport) int HolySampleMissingFunction(int value);
+__declspec(dllimport) HRESULT WINAPI GameInputCreate(void** game_input);
+__declspec(dllimport) int SamplePackageResolve(const char* host);
+__declspec(dllimport) int SamplePackageLoadsConsoleRuntime();
 }
 
 namespace {
-
 int g_failures = 0;
-thread_local int t_value = 42;
+}  // namespace
+
+bool g_expect_online = false;
 
 void check(bool ok, const char* what) {
   std::printf("  [%s] %s\n", ok ? "ok" : "FAILED", what);
   if (!ok) ++g_failures;
 }
+
+namespace {
+
+thread_local int t_value = 42;
 
 std::string read_all(HANDLE file) {
   std::string out;
@@ -248,6 +260,55 @@ void test_lifecycle() {
   if (registration) UnregisterAppStateChangeNotification(registration);
 }
 
+// The console input library, with no input device attached.
+void test_input() {
+  void* input = nullptr;
+  check(GameInputCreate(&input) == S_OK && input != nullptr, "GameInputCreate returns the input interface");
+  if (!input) return;
+  using GetCurrentReadingFn = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, void*, void**);
+  using RegisterDeviceCallbackFn =
+      HRESULT(STDMETHODCALLTYPE*)(void*, void*, uint32_t, uint32_t, uint32_t, void*, void*, uint64_t*);
+  void** vtable = *static_cast<void***>(input);
+  void* reading = reinterpret_cast<void*>(1);
+  const HRESULT hr = reinterpret_cast<GetCurrentReadingFn>(vtable[4])(input, 0x40000, nullptr, &reading);
+  check(hr == static_cast<HRESULT>(0x838A0003) && reading == nullptr,
+        "with no device attached there is no gamepad reading");
+  static int s_device_callbacks = 0;
+  uint64_t token = 0;
+  const auto callback = +[](uint64_t, void*, void*, uint64_t, uint32_t, uint32_t) { ++s_device_callbacks; };
+  const HRESULT registered = reinterpret_cast<RegisterDeviceCallbackFn>(vtable[9])(
+      input, nullptr, 0x40000, 1, 2, nullptr, reinterpret_cast<void*>(callback), &token);
+  check(registered == S_OK && token != 0 && s_device_callbacks == 0, "blocking device enumeration finds no devices");
+}
+
+// The offline switch, seen from the title image and from a DLL the package
+// ships.
+void test_offline() {
+  WSADATA data;
+  WSAStartup(MAKEWORD(2, 2), &data);
+  addrinfo* result = nullptr;
+  const int status = getaddrinfo("example.com", "80", nullptr, &result);
+  check(status == WSAHOST_NOT_FOUND && result == nullptr, "offline, host names do not resolve");
+  if (result) freeaddrinfo(result);
+  result = nullptr;
+  check(getaddrinfo("localhost", "80", nullptr, &result) == 0, "offline, the local host still resolves");
+  if (result) freeaddrinfo(result);
+
+  SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  sockaddr_in remote{};
+  remote.sin_family = AF_INET;
+  remote.sin_port = htons(80);
+  inet_pton(AF_INET, "192.0.2.1", &remote.sin_addr);
+  const int connected = connect(s, reinterpret_cast<sockaddr*>(&remote), sizeof(remote));
+  check(connected == SOCKET_ERROR && WSAGetLastError() == WSAENETUNREACH,
+        "offline, connections to other hosts are unreachable");
+  closesocket(s);
+
+  check(SamplePackageResolve("example.com") == WSAHOST_NOT_FOUND, "offline applies to DLLs the package ships");
+  check(SamplePackageLoadsConsoleRuntime() != 0,
+        "a packaged DLL loading a console library gets this project's implementation");
+}
+
 }  // namespace
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR command_line, int) {
@@ -264,6 +325,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR command_line, int) {
   test_lifecycle();
   test_console_identity();
   test_virtual_memory();
+  g_expect_online = command_line && std::strstr(command_line, "--expect-online");
+  test_game_runtime();
+  test_input();
+  if (!(command_line && std::strstr(command_line, "--expect-online"))) test_offline();
   if (command_line && std::strstr(command_line, "--expect-sandbox")) test_sandbox_is_enforced_by_the_os();
 
   if (command_line && std::strstr(command_line, "--call-missing")) {

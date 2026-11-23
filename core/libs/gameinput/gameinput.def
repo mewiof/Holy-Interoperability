@@ -1,0 +1,4 @@
+; The console input library is imported by ordinal.
+LIBRARY holy_gameinput
+EXPORTS
+    GameInputCreate @1

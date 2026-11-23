@@ -21,14 +21,16 @@ Legend: **done** — implemented and tested; **partial** — some of it works; *
 - done: lifecycle notification registration.
 - open: processor topology. Titles assume the console's core and thread count and set affinities
   accordingly; hosts with fewer logical processors need masks clamped and counts reported consistently.
-- open: path interposition below the import table (code that reaches the host file API without going through
-  the title's imports currently sees host paths; the sandbox still protects the package).
-- open: an offline switch that fails network initialisation cleanly.
+- partial: path interposition below the import table. DLLs the package ships now get the same interposers
+  as the title image; code that reaches host functions in other ways (dynamic lookups of host exports) still
+  sees host paths, and the sandbox still protects the package.
+- done: the offline switch (default): the process sees a disconnected host network.
 
 ## 2. Memory (`xmem`) — partial
 
 - done: `XMemAlloc` / `XMemFree` and the default-allocator pair.
 - done: `XMemVirtualAlloc` with console page-size and graphics-protection flags.
+- done: commit on demand when the host's commit charge cannot cover a title's up-front pools.
 - open: physical page allocation and mapping (`XMemAllocatePhysicalPages`, `XMemMapPhysicalPages`,
   `XMemMapPhysicalPagesScatter`, `XMemFreePhysicalPages`, `XMemTransferMemory`). Intended design: a
   section-backed pool of "physical" pages mapped into placeholder reservations, which also gives the aliased
@@ -36,16 +38,19 @@ Legend: **done** — implemented and tested; **partial** — some of it works; *
 - open: `XMemVirtualQuery`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`.
 - open: honouring a title's exported allocation hooks.
 
-## 3. Game runtime (`xgameruntime`) — next
+## 3. Game runtime (`xgameruntime`) — partial
 
 A title's statically linked client library loads the runtime and looks up `InitializeApiImpl` (plus `Ex` and
 `Ex2` variants), `QueryApiImpl`, `UninitializeApiImpl` and `XErrorReport`. Everything else is reached through
 provider interfaces obtained from `QueryApiImpl`.
 
-- next: establish the calling contract of the entry points and the interface-query protocol.
-- open: provider interfaces, roughly in start-up order: task queues and async blocks, system information,
-  package and installation queries, persistent local storage, users, game saves, lifecycle, input-related
-  services, store queries.
+- done: entry points and the interface-query protocol; unknown interfaces and unbound slots report
+  themselves by interface id and slot.
+- done: task queues, async blocks, the time-sensitive thread assertion.
+- done (the functions titles have been seen to call): connectivity hint, user add (nobody signed in) and
+  change events, system analytics info and device identity, title id.
+- open: the rest of the user service, package and installation queries, persistent local storage, game
+  saves, store queries.
 - Policy for services with no local equivalent: the runtime does not sign users in to anything, does not
   emulate online services, and never reports ownership of add-on content.
 
@@ -66,10 +71,14 @@ The largest piece.
 Hardware audio processing interfaces. Plan: software implementations of the processing the title requests,
 output through the host's audio stack.
 
-## 6. Input (`gameinput`) — open
+## 6. Input (`gameinput`) — partial
 
 The console flavour of the input API, built under an alias because the host has a different DLL of the same
-name. Plan: implement on top of the host's controller APIs.
+name.
+
+- done: `GameInputCreate` and the `IGameInput` methods titles call first, answering as a console with no
+  input device attached.
+- open: surfacing host controllers (and keyboard and mouse) as devices and readings.
 
 ## 7. Storage (`xcrdapi`) — open
 

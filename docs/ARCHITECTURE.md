@@ -81,7 +81,8 @@ Rules worth knowing:
   the policy: terminate (default) or return zero (`--unimplemented continue`, exploration only).
 - The same thunk can sit in front of implemented imports to trace calls (`--trace`).
 - DLLs shipped in a package are loaded by the OS and resolve *their* console imports through the DLL search
-  path, which includes `libs/`. `HOLY_UNIMPLEMENTED_EXPORT` exists so such a DLL can load while a symbol it
+  path, which includes `libs/`. Their imports of interposed host functions are then pointed at the
+  interposers, so code the package ships sees the same environment as the title image. `HOLY_UNIMPLEMENTED_EXPORT` exists so such a DLL can load while a symbol it
   needs is still a placeholder; placeholders are marked and never count as implemented.
 
 `holy inspect` runs the same policy statically ([core/analysis](../core/analysis)), parsing package and
@@ -110,6 +111,12 @@ runtime answers that single query (see [PLATFORM_NOTES.md](PLATFORM_NOTES.md)).
 
 **Lifecycle.** Suspend/resume and constrained-mode registrations succeed; a desktop process is never
 suspended by a lifecycle manager, so the callbacks do not fire.
+
+**Network.** Offline by default: connectivity queries report no network, and the host's name resolution,
+socket and HTTP functions fail as on a disconnected PC (see [PLATFORM_NOTES.md](PLATFORM_NOTES.md)).
+
+**Memory commit.** Console titles commit their memory pools up front. When the host cannot cover that commit
+charge, the memory library reserves instead and the runtime commits pages on first touch.
 
 **Crash reports.** Error-severity exceptions are logged first-chance (rate limited) and, if unhandled, with
 registers and a module+offset stack trace, before the title's own filter runs.

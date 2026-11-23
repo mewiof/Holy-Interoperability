@@ -39,12 +39,14 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Title environment: package mount, read-only package, scratch storage, console identity, lifecycle registration | Working, tested end to end |
 | `xmem` (title memory) | Heap and virtual allocation implemented; physical-page APIs missing |
 | `d3d12_xs` (graphics) | Entry points only; no device, no rendering |
-| `xgameruntime` (game runtime) | Skeleton; entry-point contract identified, provider interfaces missing |
-| Audio, input, storage and texture-layout console libraries | Not started |
+| `xgameruntime` (game runtime) | Entry points, task queues and async calls, networking (offline), users (nobody signed in), system identity; other services missing |
+| `gameinput` (input) | Interface present; no input devices surfaced yet |
+| Offline switch, interposers for DLLs the package ships | Working, tested end to end |
+| Audio, storage and texture-layout console libraries | Not started |
 
-What this means in practice: a retail title image loads, all of its C++ static initialisation runs (including
-its memory-system setup), and it reaches its main entry point, where it stops at game runtime
-initialisation. No title is playable.
+What this means in practice: a retail title image loads, runs its static initialisation, initialises the
+game runtime, creates its task queues, queries networking, user and system services and the input API, and
+stops where it opens the console's fast-storage API. Nothing is rendered yet and no title is playable.
 
 Progress is measured as *console library coverage*: of the console-only symbols a title imports, how many
 have a real implementation. `holy inspect` prints it for any package. Placeholder exports never count.

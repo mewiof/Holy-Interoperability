@@ -36,10 +36,22 @@ endfunction()
 
 holy_add_import_stub(sample_stub_lifecycle "api-ms-win-core-psm-appnotify-l1-1-0" sample_title/stub_lifecycle.cpp)
 holy_add_import_stub(sample_stub_missing "holy_sample_missing" sample_title/stub_missing.cpp)
+holy_add_import_stub(sample_stub_gameinput "GameInput" sample_title/stub_gameinput.cpp)
+target_sources(sample_stub_gameinput PRIVATE sample_title/stub_gameinput.def)
 
-add_executable(sample_title WIN32 sample_title/main.cpp)
+# A helper DLL shipped inside the sample package, next to the executable.
+add_library(sample_package_lib SHARED sample_title/package_lib.cpp)
+holy_target_defaults(sample_package_lib)
+target_link_libraries(sample_package_lib PRIVATE ws2_32)
+set_target_properties(sample_package_lib PROPERTIES
+  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+  RUNTIME_OUTPUT_DIRECTORY "${HOLY_SAMPLE_DIR}"
+  PDB_OUTPUT_DIRECTORY "${HOLY_SAMPLE_DIR}")
+
+add_executable(sample_title WIN32 sample_title/checks.h sample_title/main.cpp sample_title/runtime_checks.cpp)
 holy_target_defaults(sample_title)
-target_link_libraries(sample_title PRIVATE holy_lib_xmem sample_stub_lifecycle sample_stub_missing advapi32)
+target_link_libraries(sample_title PRIVATE holy_lib_xmem sample_stub_lifecycle sample_stub_missing
+  sample_stub_gameinput sample_package_lib advapi32 ws2_32)
 set_target_properties(sample_title PROPERTIES
   # Like a real title, the sample uses the DLL C runtime.
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
@@ -63,6 +75,9 @@ set_tests_properties(e2e.run_sandboxed PROPERTIES PASS_REGULAR_EXPRESSION "SAMPL
 
 add_test(NAME e2e.run_unsandboxed COMMAND holy run "${HOLY_SAMPLE_DIR}" --no-sandbox --timeout 60)
 set_tests_properties(e2e.run_unsandboxed PROPERTIES PASS_REGULAR_EXPRESSION "SAMPLE TITLE: PASS")
+
+add_test(NAME e2e.run_online COMMAND holy run "${HOLY_SAMPLE_DIR}" --network host --timeout 60 -- --expect-online)
+set_tests_properties(e2e.run_online PROPERTIES PASS_REGULAR_EXPRESSION "SAMPLE TITLE: PASS")
 
 add_test(NAME e2e.unimplemented_traps COMMAND holy run "${HOLY_SAMPLE_DIR}" --timeout 60 -- --call-missing)
 set_tests_properties(e2e.unimplemented_traps PROPERTIES

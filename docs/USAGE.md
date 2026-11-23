@@ -38,6 +38,7 @@ holy run <package-dir> [options] [-- <title arguments>]
 | `--data-dir <dir>` | writable per-title directory; default is per user and per title (see below) |
 | `--no-sandbox` | do not lower the title's integrity level |
 | `--console <series-x\|series-s>` | console model reported to the title; default `series-x` |
+| `--network <offline\|host>` | `offline` (default): the title sees a disconnected network; `host`: it may use the host's |
 | `--unimplemented <trap\|continue>` | what a call into an unimplemented import does; default `trap` |
 | `--trace <patterns>` | comma separated import-library patterns to trace, e.g. `xmem.dll,d3d12*` |
 | `--log-level <level>` | `trace`, `debug`, `info` (default), `warn`, `error` |
@@ -56,6 +57,13 @@ E [import]   rcx=… rdx=… r8=… r9=…
 ```
 
 That line is the project's to-do list for the title, in order. See [ROADMAP.md](ROADMAP.md).
+
+### The network
+
+By default the title runs offline: it is told there is no connectivity, host names do not resolve, and
+connections to anything but the local host fail, for the title image and for every DLL the package ships.
+`--network host` lets it use the host's network. The project never signs anyone in or emulates an online
+service either way.
 
 ### The sandbox
 

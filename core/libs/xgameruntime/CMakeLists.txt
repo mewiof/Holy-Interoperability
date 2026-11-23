@@ -2,4 +2,15 @@
 # so the implementation is built under an alias (see core/common/provider.cpp).
 holy_add_system_library(holy_lib_xgameruntime
   OUTPUT_NAME holy_xgameruntime
-  SOURCES xgameruntime.cpp)
+  SOURCES
+    core_interface.cpp
+    networking.cpp
+    provider.cpp
+    provider.h
+    services.h
+    system.cpp
+    task_queue.cpp
+    task_queue.h
+    user.cpp
+    xgameruntime.cpp
+  LIBS holy_package bcrypt advapi32)

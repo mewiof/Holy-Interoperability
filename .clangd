@@ -1,0 +1,4 @@
+# Point editors at the compile database of the default preset
+# (cmake --preset clang-cl).
+CompileFlags:
+  CompilationDatabase: build/clang-cl

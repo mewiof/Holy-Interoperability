@@ -1,0 +1,52 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "clang-cl",
+      "displayName": "Ninja + clang-cl (RelWithDebInfo)",
+      "description": "Works from any shell; clang-cl locates the MSVC libraries and Windows SDK on its own.",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_COMPILER": "clang-cl"
+      }
+    },
+    {
+      "name": "msvc",
+      "displayName": "Ninja + MSVC (RelWithDebInfo)",
+      "description": "Run from a Visual Studio x64 developer prompt.",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_COMPILER": "cl"
+      }
+    },
+    {
+      "name": "vs",
+      "displayName": "Visual Studio (default installed version, x64)",
+      "inherits": "base",
+      "architecture": "x64"
+    }
+  ],
+  "buildPresets": [
+    { "name": "clang-cl", "configurePreset": "clang-cl" },
+    { "name": "msvc", "configurePreset": "msvc" },
+    { "name": "vs", "configurePreset": "vs", "configuration": "RelWithDebInfo" }
+  ],
+  "testPresets": [
+    { "name": "clang-cl", "configurePreset": "clang-cl", "output": { "outputOnFailure": true } },
+    { "name": "msvc", "configurePreset": "msvc", "output": { "outputOnFailure": true } },
+    { "name": "vs", "configurePreset": "vs", "configuration": "RelWithDebInfo", "output": { "outputOnFailure": true } }
+  ]
+}

@@ -1,0 +1,7 @@
+add_subdirectory(common)
+add_subdirectory(pe)
+add_subdirectory(package)
+add_subdirectory(analysis)
+add_subdirectory(loader)
+add_subdirectory(runtime)
+add_subdirectory(libs)

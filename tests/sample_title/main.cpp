@@ -1,0 +1,277 @@
+// Sample title: a stand-in for a console title, written for this repository.
+//
+// It is linked like a console title (console memory library, lifecycle API
+// set, a library nobody provides) and checks, from the inside, that the
+// environment the launcher builds behaves like the one a title expects.
+#include <windows.h>
+
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+
+extern "C" {
+__declspec(dllimport) void* XMemAlloc(SIZE_T size, unsigned long long attributes);
+__declspec(dllimport) void XMemFree(void* address, unsigned long long attributes);
+__declspec(dllimport) void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
+                                             unsigned long long allocator_id, DWORD protect);
+__declspec(dllimport) ULONG NTAPI RegisterAppStateChangeNotification(void (*routine)(BOOLEAN, void*),
+                                                                     void* context, void** registration);
+__declspec(dllimport) void NTAPI UnregisterAppStateChangeNotification(void* registration);
+__declspec(dllimport) int HolySampleMissingFunction(int value);
+}
+
+namespace {
+
+int g_failures = 0;
+thread_local int t_value = 42;
+
+void check(bool ok, const char* what) {
+  std::printf("  [%s] %s\n", ok ? "ok" : "FAILED", what);
+  if (!ok) ++g_failures;
+}
+
+std::string read_all(HANDLE file) {
+  std::string out;
+  char buffer[256];
+  DWORD read = 0;
+  while (ReadFile(file, buffer, sizeof(buffer), &read, nullptr) && read > 0) out.append(buffer, read);
+  return out;
+}
+
+DWORD WINAPI thread_main(void* parameter) {
+  // A fresh thread must see the initial value of the thread-local, not the
+  // main thread's modified copy.
+  *static_cast<int*>(parameter) = t_value;
+  return 0;
+}
+
+void lifecycle_callback(BOOLEAN, void*) {}
+
+void test_thread_local_storage() {
+  check(t_value == 42, "static TLS is initialised on the main thread");
+  t_value = 7;
+  int seen = 0;
+  HANDLE thread = CreateThread(nullptr, 0, &thread_main, &seen, 0, nullptr);
+  WaitForSingleObject(thread, INFINITE);
+  CloseHandle(thread);
+  check(seen == 42, "static TLS is initialised on new threads");
+}
+
+void test_exceptions() {
+  bool caught = false;
+  try {
+    throw std::runtime_error("expected");
+  } catch (const std::runtime_error& error) {
+    caught = std::strcmp(error.what(), "expected") == 0;
+  }
+  check(caught, "C++ exceptions unwind through the title image");
+}
+
+void test_memory() {
+  auto* small = static_cast<unsigned char*>(XMemAlloc(100, 0));
+  check(small != nullptr && small[0] == 0 && small[99] == 0, "XMemAlloc returns zeroed heap memory");
+  if (small) std::memset(small, 0xAB, 100);
+  XMemFree(small, 0);
+
+  const SIZE_T large_size = 8 * 1024 * 1024;
+  auto* large = static_cast<unsigned char*>(XMemAlloc(large_size, 0));
+  check(large != nullptr && (reinterpret_cast<uintptr_t>(large) & 0xFFF) == 0,
+        "XMemAlloc returns page-aligned memory for large requests");
+  if (large) large[large_size - 1] = 1;
+  XMemFree(large, 0);
+
+  // 64 KiB alignment requested through the attribute word (log2 = 16 in bits 24..28).
+  auto* aligned = XMemAlloc(4096, 16ull << 24);
+  check(aligned != nullptr && (reinterpret_cast<uintptr_t>(aligned) & 0xFFFF) == 0,
+        "XMemAlloc honours the alignment attribute");
+  XMemFree(aligned, 16ull << 24);
+}
+
+void test_package_files() {
+  HANDLE mounted = CreateFileW(L"G:\\data\\hello.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+  check(mounted != INVALID_HANDLE_VALUE, "the package is mounted on G:");
+  if (mounted != INVALID_HANDLE_VALUE) {
+    check(read_all(mounted).rfind("hello from the package", 0) == 0,
+          "package files are readable through the mount");
+    CloseHandle(mounted);
+  }
+
+  FILE* stream = std::fopen("data\\hello.txt", "rb");
+  check(stream != nullptr, "package files are readable relative to the current directory");
+  if (stream) std::fclose(stream);
+
+  check(GetFileAttributesW(L"G:\\data") != INVALID_FILE_ATTRIBUTES,
+        "directory queries work through the mount");
+}
+
+void test_package_is_read_only() {
+  HANDLE created = CreateFileW(L"G:\\holy_write_probe.tmp", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+  const DWORD error = GetLastError();
+  check(created == INVALID_HANDLE_VALUE && error == ERROR_ACCESS_DENIED,
+        "creating a file in the package is denied");
+  if (created != INVALID_HANDLE_VALUE) CloseHandle(created);
+
+  HANDLE reopened = CreateFileW(L"data\\hello.txt", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+  check(reopened == INVALID_HANDLE_VALUE, "opening a package file for writing is denied");
+  if (reopened != INVALID_HANDLE_VALUE) CloseHandle(reopened);
+
+  FILE* stream = std::fopen("holy_write_probe2.tmp", "w");
+  check(stream == nullptr, "fopen for writing in the package is denied");
+  if (stream) std::fclose(stream);
+
+  check(!DeleteFileW(L"G:\\data\\hello.txt") && GetLastError() == ERROR_ACCESS_DENIED,
+        "deleting a package file is denied");
+  check(!CreateDirectoryW(L"G:\\holy_dir_probe", nullptr), "creating a directory in the package is denied");
+}
+
+void test_scratch_storage() {
+  HANDLE file = CreateFileW(L"T:\\sample_scratch.bin", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  check(file != INVALID_HANDLE_VALUE, "temporary storage on T: is writable");
+  if (file == INVALID_HANDLE_VALUE) return;
+  DWORD written = 0;
+  check(WriteFile(file, "scratch", 7, &written, nullptr) && written == 7,
+        "writes to temporary storage succeed");
+  SetFilePointer(file, 0, nullptr, FILE_BEGIN);
+  check(read_all(file) == "scratch", "temporary storage reads back what was written");
+  CloseHandle(file);
+  check(DeleteFileW(L"T:\\sample_scratch.bin") != 0, "temporary files can be deleted");
+}
+
+void test_library_loading() {
+  HMODULE xmem = LoadLibraryW(L"xmem.dll");
+  check(xmem != nullptr, "LoadLibrary resolves a console library by name");
+  check(xmem && GetProcAddress(xmem, "XMemAlloc") != nullptr, "the console library exports its entry points");
+  check(GetModuleHandleW(L"xmem.dll") == xmem && xmem != nullptr, "GetModuleHandle agrees with LoadLibrary");
+
+  // This console library shares its name with an unrelated host system DLL.
+  // The request must either fail or be answered by this project's own
+  // implementation, never by the host's file.
+  HMODULE colliding = LoadLibraryW(L"xgameruntime.dll");
+  bool safe = colliding == nullptr;
+  if (colliding) {
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(colliding, path, MAX_PATH);
+    safe = std::wcsstr(path, L"\\libs\\holy_") != nullptr;
+  }
+  check(safe, "a console library name is never satisfied by a same-named host DLL");
+}
+
+// The sandbox must hold even when the runtime's path layer is not involved:
+// reach the host's CreateFileW directly, the way code outside the title image
+// (a packaged DLL, the C runtime) would, and try to write into the package.
+void test_sandbox_is_enforced_by_the_os() {
+  DWORD integrity_rid = 0;
+  HANDLE token = nullptr;
+  if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+    BYTE buffer[256];
+    DWORD size = 0;
+    if (GetTokenInformation(token, TokenIntegrityLevel, buffer, sizeof(buffer), &size)) {
+      const auto* label = reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(buffer);
+      integrity_rid = *GetSidSubAuthority(label->Label.Sid, *GetSidSubAuthorityCount(label->Label.Sid) - 1);
+    }
+    CloseHandle(token);
+  }
+  check(integrity_rid == SECURITY_MANDATORY_LOW_RID, "the title runs at low integrity");
+
+  using CreateFileFn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+  const auto direct_create =
+      reinterpret_cast<CreateFileFn>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "CreateFileW"));
+  check(direct_create != nullptr, "the host CreateFileW is reachable directly");
+  if (!direct_create) return;
+
+  wchar_t exe_path[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+  std::wstring probe(exe_path);
+  probe.resize(probe.find_last_of(L'\\') + 1);
+  const std::wstring existing = probe + L"data\\hello.txt";
+  probe += L"holy_direct_write_probe.tmp";
+
+  HANDLE created =
+      direct_create(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  check(created == INVALID_HANDLE_VALUE, "the OS refuses to create a file in the package");
+  if (created != INVALID_HANDLE_VALUE) {
+    CloseHandle(created);
+    DeleteFileW(probe.c_str());
+  }
+  HANDLE modified = direct_create(existing.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+  check(modified == INVALID_HANDLE_VALUE, "the OS refuses write access to an existing package file");
+  if (modified != INVALID_HANDLE_VALUE) CloseHandle(modified);
+}
+
+// Same query the console platform code makes to find out which model it is on.
+void test_console_identity() {
+  HKEY key = nullptr;
+  const LSTATUS opened =
+      RegOpenKeyW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\OEM", &key);
+  check(opened == ERROR_SUCCESS, "the console identity key can be opened");
+  if (opened != ERROR_SUCCESS) return;
+  DWORD mode = 0, size = sizeof(mode), type = 0;
+  const LSTATUS queried =
+      RegQueryValueExW(key, L"ConsoleMode", nullptr, &type, reinterpret_cast<LPBYTE>(&mode), &size);
+  check(queried == ERROR_SUCCESS && type == REG_DWORD && (mode == 0x64 || mode == 0x60),
+        "the title is told it runs on a current-generation console");
+  RegCloseKey(key);
+}
+
+void test_virtual_memory() {
+  // Reserve with 64 KiB pages (MEM_RESERVE | MEM_LARGE_PAGES | MEM_PHYSICAL), then commit part of it.
+  const SIZE_T size = 64 * 1024 * 1024;
+  const auto virtual_alloc = &XMemVirtualAlloc;
+  auto* region = static_cast<unsigned char*>(virtual_alloc(nullptr, size, 0x20402000, 0x21, PAGE_READWRITE));
+  check(region != nullptr && (reinterpret_cast<uintptr_t>(region) & 0xFFFF) == 0,
+        "XMemVirtualAlloc reserves address space with console page-size flags");
+  if (!region) return;
+  auto* committed =
+      static_cast<unsigned char*>(virtual_alloc(region, 0x10000, 0x20401000, 0x21, PAGE_READWRITE));
+  check(committed == region, "XMemVirtualAlloc commits inside a reservation");
+  if (committed) {
+    committed[0] = 1;
+    committed[0xFFFF] = 2;
+  }
+  // GPU-only protection bits must not make a reservation fail.
+  void* graphics = virtual_alloc(nullptr, size, 0x20402000, 3, 0x801);
+  check(graphics != nullptr, "XMemVirtualAlloc accepts graphics protection flags");
+  if (graphics) VirtualFree(graphics, 0, MEM_RELEASE);
+  VirtualFree(region, 0, MEM_RELEASE);
+}
+
+void test_lifecycle() {
+  void* registration = nullptr;
+  const ULONG status = RegisterAppStateChangeNotification(&lifecycle_callback, nullptr, &registration);
+  check(status == ERROR_SUCCESS && registration != nullptr, "lifecycle notifications can be registered");
+  if (registration) UnregisterAppStateChangeNotification(registration);
+}
+
+}  // namespace
+
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR command_line, int) {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  std::printf("SAMPLE TITLE: starting\n");
+
+  test_thread_local_storage();
+  test_exceptions();
+  test_memory();
+  test_package_files();
+  test_package_is_read_only();
+  test_scratch_storage();
+  test_library_loading();
+  test_lifecycle();
+  test_console_identity();
+  test_virtual_memory();
+  if (command_line && std::strstr(command_line, "--expect-sandbox")) test_sandbox_is_enforced_by_the_os();
+
+  if (command_line && std::strstr(command_line, "--call-missing")) {
+    // Traps by default; with `--unimplemented continue` the call returns zero.
+    const int result = HolySampleMissingFunction(5);
+    check(result == 0, "a call into an unimplemented import returns zero in continue mode");
+  }
+
+  std::printf(g_failures == 0 ? "SAMPLE TITLE: PASS\n" : "SAMPLE TITLE: FAIL (%d)\n", g_failures);
+  return g_failures;
+}

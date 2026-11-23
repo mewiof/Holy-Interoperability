@@ -1,0 +1,26 @@
+# Build output
+/build/
+/out/
+CMakeUserPresets.json
+compile_commands.json
+
+# IDE
+/.vs/
+/.vscode/
+/.idea/
+*.user
+
+# Local-only material. Nothing under these paths is ever committed: title
+# packages, dumps, logs and notes that could identify a specific title stay on
+# the developer's machine.
+/local/
+/titles/
+/dumps/
+*.log
+*.dmp
+
+# Console package and container formats. The project never contains them.
+*.xvd
+*.xvc
+*.xvi
+*.msixvc

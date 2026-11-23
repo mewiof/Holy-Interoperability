@@ -103,11 +103,15 @@ void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_
   self->host->CreateShaderResourceView(backing.whole, &host, host_cpu_handle(dest));
 }
 
+// Observed: titles create constant buffer views whose size is not a multiple
+// of 256 bytes (128), which the desktop requires; the view is widened to the
+// next multiple (shaders read no further than the title's size).
 void STDMETHODCALLTYPE create_constant_buffer_view(Device* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                                                    SIZE_T dest) {
   D3D12_CONSTANT_BUFFER_VIEW_DESC host = {};
   if (desc) {
     host = *desc;
+    host.SizeInBytes = (desc->SizeInBytes + 255u) & ~255u;
     host.BufferLocation = translate_gpu_va(self, desc->BufferLocation);
     if (desc->BufferLocation && !host.BufferLocation) {
       LIB_LOG(lib::kError, "d3d12", "constant buffer at %p lies in no GPU memory",

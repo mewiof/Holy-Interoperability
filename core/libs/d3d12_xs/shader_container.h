@@ -16,13 +16,17 @@ enum class ShaderFormat {
 
 ShaderFormat rebuild_desktop_container(const void* blob, size_t size, std::vector<uint8_t>& out);
 
-// The native program of a console compute shader container and the
-// parameters its translation needs.
-struct NativeComputeProgram {
-  std::vector<uint8_t> block;  // the decompressed native program block
-  size_t code_offset = 0;      // machine code start within `block`
-  uint32_t user_sgprs = 0;     // SGPRs initialised from the root table pointer
-  uint32_t threads[3] = {};    // thread group size
+// The native program of a console shader container.
+struct NativeProgram {
+  std::vector<uint8_t> block;    // the decompressed native program block
+  size_t code_offset = 0;        // machine code start within `block`
+  uint32_t root_parameters = 0;  // matches the root signature's parameter count
+};
+bool native_program(const void* blob, size_t size, NativeProgram* out);
+
+// A compute shader's native program and its thread group size.
+struct NativeComputeProgram : NativeProgram {
+  uint32_t threads[3] = {};
 };
 bool native_compute_program(const void* blob, size_t size, NativeComputeProgram* out);
 

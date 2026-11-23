@@ -2,6 +2,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <functional>
 #include <set>
 #include <tuple>
 #include <utility>
@@ -28,10 +29,16 @@ std::string format(const char* fmt, ...) {
 
 // Temp register file: one register value per temp (x component).
 constexpr uint32_t kVccLoR = 106, kVccHiR = 107, kM0R = 108, kExecLoR = 109, kExecHiR = 110, kSccR = 111;
-constexpr uint32_t kNextR = 112, kLaneR = 113, kBarrierR = 114;
+constexpr uint32_t kNextR = 112, kLaneR = 113, kBarrierR = 114, kExportedR = 115;
 constexpr uint32_t kScratch = 116, kScratchCount = 112;
 constexpr uint32_t kVgprBase = kScratch + kScratchCount;
+// Graphics outputs are kept in temps and written when the program ends:
+// output register r component c lives in kOutputBase + 4 r + c (r 34 is depth).
+constexpr uint32_t kOutputBase = kVgprBase + 256;
+constexpr uint32_t kOutputRegisters = 35;
+constexpr uint32_t kDepthRegister = 34;
 constexpr uint32_t kNoRegister = 0xFFFFFFFFu;
+constexpr uint32_t kEndBlock = 0xFFFFFFFFu;  // "next block" once the program has ended
 constexpr uint32_t kNoView = 0xFFFFFFFFu;
 
 Operand R(uint32_t r) { return dxbc::temp(r); }
@@ -41,7 +48,15 @@ bool is_temp(const Operand& o) { return ((o[0] >> 12) & 0xFF) == dxbc::kTemp; }
 
 class Translator {
  public:
+  enum class Stage { Compute, Vertex, Pixel };
+
   Translator(const uint8_t* code, size_t size, const ComputeShaderInfo& info) : code_(code), size_(size), info_(info) {}
+  Translator(const uint8_t* code, size_t size, GraphicsStage stage)
+      : code_(code), size_(size), stage_(stage == GraphicsStage::Vertex ? Stage::Vertex : Stage::Pixel) {
+    info_.user_sgprs = 16;
+  }
+
+  const ShaderInterface& link() const { return iface_; }
 
   bool run(std::vector<uint8_t>* out, std::string* error);
 
@@ -414,6 +429,29 @@ class Translator {
   bool emit_flat(const Instruction& inst);
   bool emit_mubuf(const Instruction& inst);
   bool emit_ds(const Instruction& inst);
+  bool emit_export(const Instruction& inst);
+  bool emit_interp(const Instruction& inst);
+  // Ends the program: the dispatcher leaves its loop (a single structured
+  // exit; host drivers have refused programs that return from inside it).
+  void end_program() { put(kNextR, I(kEndBlock)); }
+  // After the dispatcher: graphics outputs are written from their temps;
+  // pixel shaders that exported nothing (killed lanes) are discarded.
+  void epilogue(dxbc::Program& program) {
+    if (stage_ == Stage::Pixel) program.emit(dx::kDiscard, {R(kExportedR)});
+    for (uint32_t reg = 0; reg < kOutputRegisters; ++reg) {
+      for (uint32_t c = 0; c < 4; ++c) {
+        if (!(written_[reg] & (1u << c))) continue;
+        const Operand value = R(kOutputBase + 4 * reg + c);
+        if (reg == kDepthRegister) program.emit(dx::kMov, {dxbc::output_depth(), value});
+        else program.emit(dx::kMov, {dxbc::output_register(reg, 1u << c), value});
+      }
+    }
+    program.emit(dx::kRet, {});
+  }
+  void set_output(uint32_t reg, uint32_t component, const Operand& value) {
+    written_[reg] |= 1u << component;
+    put(kOutputBase + 4 * reg + component, value);
+  }
 
   const uint8_t* code_;
   size_t size_;
@@ -425,6 +463,9 @@ class Translator {
   uint32_t vgprs_ = 3;
   bool barrier_ = false;
   bool lds_ = false;
+  Stage stage_ = Stage::Compute;
+  ShaderInterface iface_;
+  uint8_t written_[kOutputRegisters] = {};  // components exported per output register
 };
 
 bool Translator::emit_sop2(const Instruction& inst) {
@@ -1371,6 +1412,70 @@ bool Translator::emit_vector(const Instruction& inst) {
   }
 }
 
+bool Translator::emit_export(const Instruction& inst) {
+  const uint32_t target = inst.target;
+  if (target == 9) return true;  // null export
+  auto vgpr = [&](int i) { return R(vreg(inst.src[i] - rdna::kVgpr0)); };
+  if (stage_ == Stage::Vertex) {
+    uint32_t reg;
+    if (target == 12) {
+      reg = 0;
+      iface_.position = true;
+    } else if (target >= 13 && target <= 15) {
+      return true;  // further position exports (point size, clip distances): not used
+    } else if (target >= 32 && target < 64) {
+      reg = target - 32 + 1;
+      iface_.params |= 1u << (target - 32);
+    } else {
+      return fail(format("vertex export target %u", target));
+    }
+    for (int c = 0; c < 4; ++c) {
+      if (inst.enable & (1 << c)) set_output(reg, static_cast<uint32_t>(c), vgpr(c));
+    }
+    return true;
+  }
+  if (stage_ != Stage::Pixel) return fail("export in a compute program");
+  // Lanes no longer in EXEC are not written by the hardware: discard them.
+  emit(dx::kDiscard, {active()});
+  put(kExportedR, I(1));
+  if (target < 8) {
+    iface_.targets |= 1u << target;
+    for (int c = 0; c < 4; ++c) {
+      if (!(inst.enable & (1 << c))) continue;
+      Operand value;
+      if (inst.compressed) {
+        const Operand packed = vgpr(c / 2);
+        value = op1(dx::kF16tof32, c % 2 ? shr(packed, I(16)) : packed);
+      } else {
+        value = vgpr(c);
+      }
+      set_output(target, static_cast<uint32_t>(c), value);
+    }
+    return true;
+  }
+  if (target == 8) {
+    iface_.depth = true;
+    if (inst.enable & 1) set_output(kDepthRegister, 0, vgpr(0));
+    return true;
+  }
+  return fail(format("pixel export target %u", target));
+}
+
+bool Translator::emit_interp(const Instruction& inst) {
+  if (stage_ != Stage::Pixel) return fail("interpolation outside a pixel shader");
+  const uint32_t attribute = static_cast<uint32_t>(inst.imm), channel = inst.src[1] & 3;
+  if (attribute >= 31) return fail("interpolation attribute");
+  iface_.params |= 1u << attribute;
+  if (inst.op == 2) {
+    iface_.flat_params |= 1u << attribute;
+  } else if (inst.op > 2) {
+    return fail(format("VINTRP op %u", inst.op));
+  }
+  const uint32_t d = vreg(inst.dst);
+  put(d, select(active(), dxbc::input_register(attribute + 1, channel), R(d)));
+  return true;
+}
+
 bool Translator::emit(const Instruction& inst) {
   scratch_ = 0;
   switch (inst.encoding) {
@@ -1386,7 +1491,11 @@ bool Translator::emit(const Instruction& inst) {
     case Encoding::FLAT: return emit_flat(inst);
     case Encoding::MUBUF:
     case Encoding::MTBUF: return emit_mubuf(inst);
-    case Encoding::DS: return emit_ds(inst);
+    case Encoding::DS:
+      if (stage_ != Stage::Compute) return fail("group shared memory in a graphics stage");
+      return emit_ds(inst);
+    case Encoding::EXP: return emit_export(inst);
+    case Encoding::VINTRP: return emit_interp(inst);
     default: return fail(rdna::mnemonic(inst));
   }
 }
@@ -1431,25 +1540,26 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
     if (i + 1 < program_.size()) leaders.insert(program_[i + 1].pc);
   }
 
-  // Body: switch over block addresses inside the dispatcher loop.
-  dxbc::Program& body = p_;
-  emit(dx::kSwitch, {R(kNextR)});
+  // Blocks, each translated on its own, then selected by a balanced tree of
+  // comparisons on the next block's address inside the dispatcher loop.
+  std::vector<std::pair<uint32_t, dxbc::Program>> blocks;
   for (size_t i = 0; i < program_.size(); ++i) {
     const Instruction& inst = program_[i];
     scratch_ = 0;
     if (leaders.count(inst.pc)) {
       if (i != 0) {
         if (!is_branch(program_[i - 1])) put(kNextR, I(inst.pc));
-        emit(dx::kBreak, {});
+        blocks.back().second = std::move(p_);
+        p_ = dxbc::Program();
       }
-      emit(dx::kCase, {I(inst.pc)});
+      blocks.emplace_back(inst.pc, dxbc::Program());
     }
     if (inst.encoding == Encoding::SOPP) {
       const uint32_t target = static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm);
       const uint32_t next = i + 1 < program_.size() ? program_[i + 1].pc : 0xFFFFFFFFu;
       auto branch = [&](const Operand& taken) { put(kNextR, select(taken, I(target), I(next))); };
       switch (inst.op) {
-        case 1: emit(dx::kRet, {}); continue;
+        case 1: end_program(); continue;
         case 2: put(kNextR, I(target)); continue;
         case 4: branch(eq(R(kSccR), I(0))); continue;
         case 5: branch(R(kSccR)); continue;
@@ -1476,24 +1586,93 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       return false;
     }
   }
-  emit(dx::kRet, {});
-  emit(dx::kDefault, {});
-  emit(dx::kRet, {});
-  emit(dx::kEndswitch, {});
+  end_program();
+  blocks.back().second = std::move(p_);
+  p_ = dxbc::Program();
+  dxbc::Program body;
+  std::function<void(size_t, size_t)> tree = [&](size_t first, size_t last) {
+    if (last - first == 1) {
+      body.append(blocks[first].second);
+      return;
+    }
+    const size_t middle = (first + last) / 2;
+    body.emit(dx::kUlt, {D(kScratch), R(kNextR), I(blocks[middle].first)});
+    body.emit(dx::kIf, {R(kScratch)}, dxbc::kTestNonZero);
+    tree(first, middle);
+    body.emit(dx::kElse, {});
+    tree(middle, last);
+    body.emit(dx::kEndif, {});
+  };
+  // The end marker (and any address past the program) selects no block.
+  body.emit(dx::kUlt, {D(kScratch), R(kNextR), I(kEndBlock)});
+  body.emit(dx::kIf, {R(kScratch)}, dxbc::kTestNonZero);
+  tree(0, blocks.size());
+  body.emit(dx::kEndif, {});
 
   // Program: declarations, register initialisation, dispatcher loop.
-  dxbc::Program program;
+  if (stage_ == Stage::Pixel && (iface_.params & iface_.flat_params) != iface_.flat_params) {
+    *error = "an attribute is read both with and without interpolation";
+    return false;
+  }
+  dxbc::Program program(stage_ == Stage::Compute  ? dxbc::ProgramType::Compute
+                        : stage_ == Stage::Vertex ? dxbc::ProgramType::Vertex
+                                                  : dxbc::ProgramType::Pixel);
+  std::vector<dxbc::SignatureElement> inputs, outputs;
   program.dcl_global_flags(1);  // refactoring allowed
   program.dcl_constant_buffer(0, kTranslatedSpace, kSystemVectors, true);
   program.dcl_uav_raw_range(0, 0, kRegionTableSize - 1, kTranslatedSpace);
-  program.dcl_input(dxbc::kThreadGroupId, 0x7);
-  program.dcl_input(dxbc::kThreadIdInGroup, 0x7);
-  program.dcl_input(dxbc::kThreadIdInGroupFlattened, 0);
-  program.dcl_temps(kVgprBase + vgprs_);
-  if (lds_) program.dcl_tgsm_raw(0, info_.lds_bytes > 32768 ? 32768 : info_.lds_bytes);
-  program.dcl_thread_group(info_.threads[0], info_.threads[1], info_.threads[2]);
+  if (stage_ == Stage::Compute) {
+    program.dcl_input(dxbc::kThreadGroupId, 0x7);
+    program.dcl_input(dxbc::kThreadIdInGroup, 0x7);
+    program.dcl_input(dxbc::kThreadIdInGroupFlattened, 0);
+  } else if (stage_ == Stage::Vertex) {
+    program.dcl_input_sgv(0, 1, dxbc::kVertexId);
+    program.dcl_input_sgv(1, 1, dxbc::kInstanceId);
+    inputs.push_back({"SV_VertexID", 0, dxbc::kVertexId, dxbc::kUint32, 0, 1, 1});
+    inputs.push_back({"SV_InstanceID", 0, dxbc::kInstanceId, dxbc::kUint32, 1, 1, 1});
+    program.dcl_output_siv(0, 0xF, dxbc::kPosition);
+    outputs.push_back({"SV_Position", 0, dxbc::kPosition, dxbc::kFloat32, 0, 0xF, 0});
+    for (uint32_t n = 0; n < 32; ++n) {
+      if (!(iface_.params & (1u << n))) continue;
+      program.dcl_output(n + 1, 0xF);
+      outputs.push_back({"TEXCOORD", n, dxbc::kUndefined, dxbc::kFloat32, n + 1, 0xF, 0});
+    }
+  } else {
+    for (uint32_t n = 0; n < 32; ++n) {
+      if (!(iface_.params & (1u << n))) continue;
+      const bool flat = (iface_.flat_params & (1u << n)) != 0;
+      program.dcl_input_ps(n + 1, 0xF, flat ? dxbc::kConstant : dxbc::kLinear);
+      inputs.push_back({"TEXCOORD", n, dxbc::kUndefined, dxbc::kFloat32, n + 1, 0xF, 0xF});
+    }
+    for (uint32_t t = 0; t < 8; ++t) {
+      if (!(iface_.targets & (1u << t))) continue;
+      program.dcl_output(t, 0xF);
+      outputs.push_back({"SV_Target", t, dxbc::kUndefined, dxbc::kFloat32, t, 0xF, 0});
+    }
+    if (iface_.depth) {
+      program.dcl_output_depth();
+      outputs.push_back({"SV_Depth", 0, dxbc::kUndefined, dxbc::kFloat32, 0xFFFFFFFFu, 1, 0xE});
+    }
+  }
+  bool any_output = false;
+  for (uint8_t mask : written_) any_output = any_output || mask != 0;
+  program.dcl_temps(any_output ? kOutputBase + 4 * kOutputRegisters : kVgprBase + vgprs_);
+  if (stage_ == Stage::Compute) {
+    if (lds_) program.dcl_tgsm_raw(0, info_.lds_bytes > 32768 ? 32768 : info_.lds_bytes);
+    program.dcl_thread_group(info_.threads[0], info_.threads[1], info_.threads[2]);
+  }
   auto init = [&](uint32_t reg, const Operand& value) { program.emit(dx::kMov, {D(reg), value}); };
+  // Every temp a path may read before writing starts at zero: host drivers
+  // have refused programs that read undefined temps (outputs exported on
+  // some paths only, scratch values).
   for (uint32_t i = 0; i < 106; ++i) init(i, I(0));
+  for (uint32_t i = kScratch; i < kVgprBase; ++i) init(i, I(0));
+  if (any_output) {
+    for (uint32_t i = kOutputBase; i < kOutputBase + 4 * kOutputRegisters; ++i) init(i, I(0));
+  }
+  init(kLaneR, I(0));
+  init(kBarrierR, I(0));
+  init(kExportedR, I(0));
   for (uint32_t i = 0; i < vgprs_; ++i) init(kVgprBase + i, I(0));
   init(kVccLoR, I(0));
   init(kVccHiR, I(0));
@@ -1505,28 +1684,43 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   for (uint32_t i = 0; i < info_.user_sgprs && i < 16; ++i) {
     init(i, dxbc::cb(0, kSystemUserVector + i / 4, i % 4));
   }
-  uint32_t next_sgpr = info_.user_sgprs;
-  for (uint32_t axis = 0; axis < 3; ++axis) {
-    if (info_.tgid_enabled[axis]) init(next_sgpr++, dxbc::input(dxbc::kThreadGroupId, axis));
+  if (stage_ == Stage::Compute) {
+    uint32_t next_sgpr = info_.user_sgprs;
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+      if (info_.tgid_enabled[axis]) init(next_sgpr++, dxbc::input(dxbc::kThreadGroupId, axis));
+    }
+    for (uint32_t axis = 0; axis < 3; ++axis) init(kVgprBase + axis, dxbc::input(dxbc::kThreadIdInGroup, axis));
+    program.emit(dx::kAnd, {D(kLaneR), dxbc::input(dxbc::kThreadIdInGroupFlattened, 0), I(info_.wave_size - 1)});
+  } else {
+    init(kLaneR, I(0));
+    init(kExportedR, I(0));
+    if (stage_ == Stage::Vertex) {
+      init(kVgprBase + 0, dxbc::input_register(0, 0));
+      if (vgprs_ > 3) init(kVgprBase + 3, dxbc::input_register(1, 0));
+    }
   }
-  for (uint32_t axis = 0; axis < 3; ++axis) init(kVgprBase + axis, dxbc::input(dxbc::kThreadIdInGroup, axis));
-  program.emit(dx::kAnd, {D(kLaneR), dxbc::input(dxbc::kThreadIdInGroupFlattened, 0), I(info_.wave_size - 1)});
   if (barrier_) {
     // The dispatcher stops at barriers; every thread reaches the same number
     // of them in programs that are correct on the console.
     program.emit(dx::kLoop, {});
     program.emit(dx::kMov, {D(kBarrierR), I(0)});
   }
+  // kLaneR is free after initialisation in graphics stages; kScratch holds
+  // the loop exit test.
   program.emit(dx::kLoop, {});
   program.append(body);
+  program.emit(dx::kIeq, {D(kScratch), R(kNextR), I(kEndBlock)});
+  program.emit(dx::kBreakc, {R(kScratch)}, dxbc::kTestNonZero);
   if (barrier_) program.emit(dx::kBreakc, {R(kBarrierR)}, dxbc::kTestNonZero);
   program.emit(dx::kEndloop, {});
   if (barrier_) {
+    program.emit(dx::kIeq, {D(kScratch), R(kNextR), I(kEndBlock)});
+    program.emit(dx::kBreakc, {R(kScratch)}, dxbc::kTestNonZero);
     program.emit(dx::kSync, {}, dxbc::kSyncThreads | dxbc::kSyncGroupMemory | dxbc::kSyncUavGroup);
     program.emit(dx::kEndloop, {});
   }
-  program.emit(dx::kRet, {});
-  *out = program.container();
+  epilogue(program);
+  *out = program.container(inputs, outputs);
   return true;
 }
 
@@ -1536,6 +1730,14 @@ bool translate_compute(const uint8_t* code, size_t size, const ComputeShaderInfo
                        std::string* error) {
   Translator translator(code, size, info);
   return translator.run(dxbc, error);
+}
+
+bool translate_graphics(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,
+                        ShaderInterface* link, std::string* error) {
+  Translator translator(code, size, stage);
+  if (!translator.run(dxbc, error)) return false;
+  if (link) *link = translator.link();
+  return true;
 }
 
 }  // namespace holy::d3d12

@@ -164,6 +164,9 @@ HRESULT STDMETHODCALLTYPE schedule_frame_event_x(Device*, UINT type, UINT64 offs
 
 // Slot 15: GetDescriptorHandleIncrementSize(type), as on the desktop.
 UINT STDMETHODCALLTYPE get_descriptor_handle_increment_size(Device* self, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+  if (static_cast<uint32_t>(type) >= D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES) {
+    LIB_LOG(lib::kError, "d3d12", "descriptor increment for heap type %u", static_cast<unsigned>(type));
+  }
   return self->host->GetDescriptorHandleIncrementSize(type);
 }
 
@@ -224,6 +227,44 @@ const auto kRootSignatureVtable = [] {
   return table;
 }();
 
+// Logs why the host device was removed, with the device-removed extended
+// data when it was enabled.
+void report_device_removal(Device* device) {
+  const HRESULT reason = device->host->GetDeviceRemovedReason();
+  if (reason == S_OK) return;
+  LIB_LOG(lib::kError, "d3d12", "the host device was removed (reason 0x%08lX)", static_cast<unsigned long>(reason));
+  ID3D12InfoQueue* queue = nullptr;
+  if (SUCCEEDED(device->host->QueryInterface(IID_PPV_ARGS(&queue)))) {
+    const UINT64 count = queue->GetNumStoredMessages();
+    for (UINT64 i = count > 20 ? count - 20 : 0; i < count; ++i) {
+      SIZE_T length = 0;
+      queue->GetMessage(i, nullptr, &length);
+      std::vector<char> storage(length);
+      auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+      if (SUCCEEDED(queue->GetMessage(i, message, &length))) {
+        LIB_LOG(lib::kError, "d3d12", "  debug layer: %s", message->pDescription);
+      }
+    }
+    queue->Release();
+  }
+  ID3D12DeviceRemovedExtendedData* dred = nullptr;
+  if (FAILED(device->host->QueryInterface(IID_PPV_ARGS(&dred)))) return;
+  D3D12_DRED_PAGE_FAULT_OUTPUT fault{};
+  if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault))) {
+    LIB_LOG(lib::kError, "d3d12", "  page fault at GPU address 0x%llx",
+            static_cast<unsigned long long>(fault.PageFaultVA));
+  }
+  D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs{};
+  if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
+    for (const D3D12_AUTO_BREADCRUMB_NODE* node = breadcrumbs.pHeadAutoBreadcrumbNode; node; node = node->pNext) {
+      const UINT done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+      LIB_LOG(lib::kError, "d3d12", "  command list %p: %u of %u operations completed", node->pCommandList, done,
+              node->BreadcrumbCount);
+    }
+  }
+  dred->Release();
+}
+
 HRESULT STDMETHODCALLTYPE create_root_signature(Device* self, UINT, const void* blob, SIZE_T size, REFIID,
                                                 void** signature) {
   if (!signature) return E_POINTER;
@@ -233,7 +274,36 @@ HRESULT STDMETHODCALLTYPE create_root_signature(Device* self, UINT, const void* 
   if (FAILED(hr)) {
     LIB_LOG(lib::kError, "d3d12", "root signature of %llu bytes refused by the host (0x%08lX)",
             static_cast<unsigned long long>(size), static_cast<unsigned long>(hr));
+    report_device_removal(self);
     return hr;
+  }
+  ID3D12VersionedRootSignatureDeserializer* reader = nullptr;
+  if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&reader)))) {
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
+    if (SUCCEEDED(reader->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc) {
+      std::string text;
+      for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
+        const D3D12_ROOT_PARAMETER1& p = desc->Desc_1_1.pParameters[i];
+        char item[96];
+        if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+          std::snprintf(item, sizeof(item), "[%u: %u constants b%u vis %u] ", i, p.Constants.Num32BitValues,
+                        p.Constants.ShaderRegister, static_cast<unsigned>(p.ShaderVisibility));
+        } else if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+          std::snprintf(item, sizeof(item), "[%u: table of %u ranges vis %u] ", i,
+                        p.DescriptorTable.NumDescriptorRanges, static_cast<unsigned>(p.ShaderVisibility));
+        } else {
+          std::snprintf(item, sizeof(item), "[%u: root %s r%u vis %u] ", i,
+                        p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV   ? "CBV"
+                        : p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ? "SRV"
+                                                                           : "UAV",
+                        p.Descriptor.ShaderRegister, static_cast<unsigned>(p.ShaderVisibility));
+        }
+        text += item;
+      }
+      LIB_LOG(lib::kDebug, "d3d12", "root signature %p: %u parameters %s", static_cast<void*>(host),
+              desc->Desc_1_1.NumParameters, text.c_str());
+    }
+    reader->Release();
   }
   *signature = wrap(host, &kRootSignatureInfo, kRootSignatureVtable.data());
   return S_OK;
@@ -397,6 +467,8 @@ const auto kPipelineVtable = [] {
 // The root signature of translated pipelines: the region views (u0-u63,
 // space 8) as a descriptor table, the system constants (b0, space 8) as a
 // root constant buffer view.
+}  // namespace
+
 ID3D12RootSignature* translated_root_signature(Device* device) {
   static std::mutex lock;
   std::lock_guard<std::mutex> guard(lock);
@@ -423,6 +495,8 @@ ID3D12RootSignature* translated_root_signature(Device* device) {
   return device->translated_root;
 }
 
+namespace {
+
 // A compute pipeline from the shader's native code, translated to host
 // bytecode (see shader/translate.h).
 HRESULT create_translated_compute_pipeline(Device* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
@@ -437,7 +511,6 @@ HRESULT create_translated_compute_pipeline(Device* self, const D3D12_COMPUTE_PIP
   }
   ComputeShaderInfo info;
   for (int axis = 0; axis < 3; ++axis) info.threads[axis] = program.threads[axis];
-  info.user_sgprs = program.user_sgprs;
   std::vector<uint8_t> bytecode;
   std::string error;
   const ULONGLONG start = GetTickCount64();
@@ -571,6 +644,21 @@ Device* create_device(const void* parameters) {
           words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], words[8], words[9],
           words[10], words[11], words[12], words[13], words[14], words[15]);
 
+  // With debug logging, device removal records what the GPU was doing
+  // (the documented device-removed extended data).
+  if (HolyLogEnabled(lib::kDebug)) {
+    ID3D12Debug* layer = nullptr;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&layer)))) {
+      layer->EnableDebugLayer();
+      layer->Release();
+    }
+    ID3D12DeviceRemovedExtendedDataSettings* dred = nullptr;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
+      dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      dred->Release();
+    }
+  }
   ID3D12Device* host = nullptr;
   const HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&host));
   if (FAILED(hr)) {

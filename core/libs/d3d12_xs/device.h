@@ -54,6 +54,11 @@ struct Resource {
 };
 
 Device* create_device(const void* parameters);
+
+// The root signature of pipelines translated from native code: the region
+// views (u0-u63, space 8) as a descriptor table and the system constants
+// (b0, space 8) as a root constant buffer view; every stage sees both.
+ID3D12RootSignature* translated_root_signature(Device* device);
 HRESULT create_committed_resource(Device* device, const D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS flags,
                                   const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
                                   void** out);

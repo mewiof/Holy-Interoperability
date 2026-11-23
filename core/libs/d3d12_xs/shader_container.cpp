@@ -231,61 +231,78 @@ ShaderFormat rebuild_desktop_container(const void* blob, size_t size, std::vecto
 // Observed layout of the native program (all offsets little-endian dwords):
 // the console block in the DXIL part starts with "XDAT" and a version; from
 // byte 16 follow (offset, size, kind) entries, offsets relative to "XDAT",
-// up to the first entry's data. Kind 10 is the DXIL bitcode, kind 16 a zlib
-// stream holding the native program block ("FSSM"); its recorded size has
-// been seen to exceed the part by a few bytes. In that block, the dword
-// at 0xC0 is the offset of the code record, whose machine code starts 0x28
-// bytes in; the dword at 0xF8 matches the number of user SGPRs the code reads
-// as its root table pointer and arguments. The thread group size is the
-// desktop one, in the PSV0 part's runtime information (bytes 40-51).
-bool native_compute_program(const void* blob, size_t size, NativeComputeProgram* out) {
+// up to the first entry's data. One entry is a zlib stream holding the native
+// program block ("FSSM"): kind 16 in version 5 blocks, kind 7 in version 3
+// blocks; its recorded size has been seen to exceed the part by a few bytes.
+// In the program block, the dword at 0xC0 is the offset of the code record,
+// whose machine code starts 0x28 bytes in; the dword at 0xF8 equals the
+// number of root signature parameters. A compute shader's thread group size
+// is the desktop one, in the PSV0 part's runtime information (bytes 40-51).
+namespace {
+
+struct Parts {
+  const uint8_t* dxil = nullptr;
+  uint32_t dxil_size = 0;
+  const uint8_t* psv = nullptr;
+  uint32_t psv_size = 0;
+};
+
+bool find_parts(const void* blob, size_t size, Parts* out) {
   const auto* bytes = static_cast<const uint8_t*>(blob);
   if (!bytes || size < 32 || std::memcmp(bytes, "DXBC", 4) != 0) return false;
   const uint32_t count = read32(bytes + 28);
   if (count > 64 || 32 + 4ull * count > size) return false;
-  const uint8_t* dxil = nullptr;
-  uint32_t dxil_size = 0;
-  bool have_threads = false;
   for (uint32_t i = 0; i < count; ++i) {
     const uint32_t offset = read32(bytes + 32 + 4 * i);
     if (offset + 8ull > size) return false;
     const uint32_t part_size = read32(bytes + offset + 4);
     if (offset + 8ull + part_size > size) return false;
-    const uint8_t* data = bytes + offset + 8;
     if (std::memcmp(bytes + offset, "DXIL", 4) == 0) {
-      dxil = data;
-      dxil_size = part_size;
-    } else if (std::memcmp(bytes + offset, "PSV0", 4) == 0 && part_size >= 52 && read32(data) >= 48) {
-      for (int axis = 0; axis < 3; ++axis) out->threads[axis] = read32(data + 40 + 4 * axis);
-      have_threads = true;
+      out->dxil = bytes + offset + 8;
+      out->dxil_size = part_size;
+    } else if (std::memcmp(bytes + offset, "PSV0", 4) == 0) {
+      out->psv = bytes + offset + 8;
+      out->psv_size = part_size;
     }
   }
-  if (!dxil || !have_threads) return false;
+  return out->dxil != nullptr;
+}
+
+}  // namespace
+
+bool native_program(const void* blob, size_t size, NativeProgram* out) {
+  Parts parts;
+  if (!find_parts(blob, size, &parts)) return false;
   const uint8_t* xdat = nullptr;
-  for (uint32_t at = 0; at + 16 <= dxil_size && at < 256; at += 4) {
-    if (std::memcmp(dxil + at, "XDAT", 4) == 0) {
-      xdat = dxil + at;
+  for (uint32_t at = 0; at + 16 <= parts.dxil_size && at < 256; at += 4) {
+    if (std::memcmp(parts.dxil + at, "XDAT", 4) == 0) {
+      xdat = parts.dxil + at;
       break;
     }
   }
   if (!xdat) return false;
-  const size_t available = static_cast<size_t>(dxil + dxil_size - xdat);
+  const size_t available = static_cast<size_t>(parts.dxil + parts.dxil_size - xdat);
   const uint32_t first = read32(xdat + 16);
   for (uint32_t entry = 16; entry + 12 <= first && entry + 12 <= available; entry += 12) {
-    const uint32_t offset = read32(xdat + entry), length = read32(xdat + entry + 4), kind = read32(xdat + entry + 8);
-    if (kind != 16 || offset >= available) continue;
-    // Observed: the recorded size can run a few bytes past the part; the
-    // stream itself ends inside it (its checksum is verified).
+    const uint32_t offset = read32(xdat + entry), length = read32(xdat + entry + 4);
+    if (offset >= available || xdat[offset] != 0x78) continue;  // not a zlib stream
     const size_t stream = std::min<size_t>(length, available - offset);
-    if (!zlib_inflate(xdat + offset, stream, &out->block)) return false;
-    if (out->block.size() < 0x100 || std::memcmp(out->block.data(), "FSSM", 4) != 0) return false;
+    if (!zlib_inflate(xdat + offset, stream, &out->block)) continue;
+    if (out->block.size() < 0x100 || std::memcmp(out->block.data(), "FSSM", 4) != 0) continue;
     const uint32_t record = read32(out->block.data() + 0xC0);
     if (record + 0x28ull >= out->block.size()) return false;
     out->code_offset = record + 0x28;
-    out->user_sgprs = read32(out->block.data() + 0xF8);
-    return out->user_sgprs <= 16;
+    out->root_parameters = read32(out->block.data() + 0xF8);
+    return true;
   }
   return false;
+}
+
+bool native_compute_program(const void* blob, size_t size, NativeComputeProgram* out) {
+  Parts parts;
+  if (!find_parts(blob, size, &parts) || !parts.psv || parts.psv_size < 52 || read32(parts.psv) < 48) return false;
+  for (int axis = 0; axis < 3; ++axis) out->threads[axis] = read32(parts.psv + 40 + 4 * axis);
+  return native_program(blob, size, out);
 }
 
 }  // namespace holy::d3d12

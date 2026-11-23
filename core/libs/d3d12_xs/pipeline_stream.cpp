@@ -5,8 +5,10 @@
 // desktop's CreatePipelineState. The stream is a sequence of subobjects, each
 // a type followed by its description, aligned to pointer size (the desktop
 // layout). Shader subobjects carry console containers: those with a desktop
-// program are rebuilt (shader_container.h); graphics shaders with only native
-// code cannot be translated yet and report themselves.
+// program are rebuilt (shader_container.h). When the vertex and pixel shaders
+// carry only native code, both are translated (shader/translate.h) and the
+// pipeline uses the translated root signature; other stages with native code,
+// and pipelines mixing native and desktop shaders, report themselves.
 #include "core/libs/d3d12_xs/pipeline_stream.h"
 
 #include <intrin.h>
@@ -16,6 +18,7 @@
 #include <vector>
 
 #include "core/libs/d3d12_xs/forward.h"
+#include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/d3d12_xs/shader_container.h"
 #include "core/libs/d3d12_xs/shader_dump.h"
 #include "core/libs/support.h"
@@ -83,6 +86,11 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
   std::vector<std::vector<uint8_t>> shaders;  // rebuilt containers kept alive until creation
   shaders.reserve(8);
   std::string summary;
+  // Native-only shaders found: subobject type, where its description sits.
+  std::vector<std::pair<uint32_t, size_t>> native;
+  bool desktop_shader = false;
+  size_t root_at = 0;
+  bool have_root = false;
   for (size_t at = 0; at + 4 <= copy.size();) {
     uint32_t type;
     std::memcpy(&type, copy.data() + at, 4);
@@ -100,6 +108,17 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
       std::memcpy(&title, copy.data() + inner, sizeof(title));
       void* host = title ? host_of<ID3D12RootSignature>(title) : nullptr;
       std::memcpy(copy.data() + inner, &host, sizeof(host));
+      root_at = inner;
+      have_root = true;
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
+      D3D12_INPUT_LAYOUT_DESC layout_desc;
+      std::memcpy(&layout_desc, copy.data() + inner, sizeof(layout_desc));
+      for (UINT i = 0; i < layout_desc.NumElements && layout_desc.pInputElementDescs; ++i) {
+        const D3D12_INPUT_ELEMENT_DESC& e = layout_desc.pInputElementDescs[i];
+        LIB_LOG(lib::kDebug, "d3d12", "input element %u: %s%u format %u slot %u offset %u class %u step %u", i,
+                e.SemanticName ? e.SemanticName : "?", e.SemanticIndex, static_cast<unsigned>(e.Format), e.InputSlot,
+                e.AlignedByteOffset, static_cast<unsigned>(e.InputSlotClass), e.InstanceDataStepRate);
+      }
     } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK) {
       const UINT zero = 0;
       std::memcpy(copy.data() + inner, &zero, sizeof(zero));
@@ -113,22 +132,70 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
         std::vector<uint8_t> rebuilt;
         const ShaderFormat format = rebuild_desktop_container(bytecode.pShaderBytecode, bytecode.BytecodeLength, rebuilt);
         if (format == ShaderFormat::NativeOnly || format == ShaderFormat::Unknown) {
-          dump_shader(bytecode.pShaderBytecode, bytecode.BytecodeLength, "pipeline");
-          LIB_LOG(lib::kError, "d3d12", "pipeline stream shader (subobject type %u) has only native code", type);
-          HolyUnimplementedFrom(kLibrary, "graphics pipeline with native-only shaders", caller);
-          return E_NOTIMPL;
+          native.emplace_back(type, inner);
+          at = align_up(inner + layout.size, sizeof(void*));
+          continue;
         }
-        LIB_LOG(lib::kDebug, "d3d12", "pipeline stream shader type %u: %llu bytes, %s, %016llx", type,
-                static_cast<unsigned long long>(bytecode.BytecodeLength),
-                format == ShaderFormat::Rebuilt ? "rebuilt" : "desktop",
-                static_cast<unsigned long long>(shader_hash(bytecode.pShaderBytecode, bytecode.BytecodeLength)));
-        dump_shader(bytecode.pShaderBytecode, bytecode.BytecodeLength, "pipeline");
+        desktop_shader = true;
         shaders.push_back(std::move(rebuilt));
         const D3D12_SHADER_BYTECODE host{shaders.back().data(), shaders.back().size()};
         std::memcpy(copy.data() + inner, &host, sizeof(host));
       }
     }
     at = align_up(inner + layout.size, sizeof(void*));
+  }
+  bool translated = false;
+  if (!native.empty()) {
+    // Vertex and pixel shaders with native code only are translated.
+    std::vector<uint8_t> vs, ps;
+    ShaderInterface vs_link, ps_link;
+    bool have_vs = false, have_ps = false;
+    for (const auto& [type, inner] : native) {
+      D3D12_SHADER_BYTECODE bytecode;
+      std::memcpy(&bytecode, copy.data() + inner, sizeof(bytecode));
+      if (type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+        dump_shader(bytecode.pShaderBytecode, bytecode.BytecodeLength, "pipeline");
+        HolyUnimplementedFrom(kLibrary, "graphics pipeline with a native-only shader other than vertex and pixel",
+                              caller);
+        return E_NOTIMPL;
+      }
+      NativeProgram program;
+      std::string error;
+      const bool vertex = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
+      std::vector<uint8_t>& out = vertex ? vs : ps;
+      if (!native_program(bytecode.pShaderBytecode, bytecode.BytecodeLength, &program) ||
+          !translate_graphics(program.block.data() + program.code_offset, program.block.size() - program.code_offset,
+                              vertex ? GraphicsStage::Vertex : GraphicsStage::Pixel, &out,
+                              vertex ? &vs_link : &ps_link, &error)) {
+        dump_shader(bytecode.pShaderBytecode, bytecode.BytecodeLength, "pipeline");
+        LIB_LOG(lib::kError, "d3d12", "native %s shader not translatable: %s", vertex ? "vertex" : "pixel",
+                error.empty() ? "unreadable native program" : error.c_str());
+        HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), caller);
+        return E_NOTIMPL;
+      }
+      (vertex ? have_vs : have_ps) = true;
+    }
+    if (desktop_shader || !have_vs || !have_root) {
+      HolyUnimplementedFrom(kLibrary, "graphics pipeline mixing native and desktop shaders", caller);
+      return E_NOTIMPL;
+    }
+    if (have_ps && (ps_link.params & ~vs_link.params) != 0) {
+      LIB_LOG(lib::kError, "d3d12", "pixel shader reads attributes 0x%x the vertex shader does not export (0x%x)",
+              ps_link.params, vs_link.params);
+      return E_INVALIDARG;
+    }
+    for (const auto& [type, inner] : native) {
+      std::vector<uint8_t>& out = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ? vs : ps;
+      shaders.push_back(std::move(out));
+      const D3D12_SHADER_BYTECODE host{shaders.back().data(), shaders.back().size()};
+      std::memcpy(copy.data() + inner, &host, sizeof(host));
+    }
+    ID3D12RootSignature* root = translated_root_signature(device);
+    if (!root) return E_FAIL;
+    std::memcpy(copy.data() + root_at, &root, sizeof(root));
+    translated = true;
+    LIB_LOG(lib::kDebug, "d3d12", "translated vertex shader exports 0x%x; pixel shader reads 0x%x, writes targets 0x%x",
+            vs_link.params, ps_link.params, ps_link.targets);
   }
   ID3D12Device2* device2 = nullptr;
   if (FAILED(device->host->QueryInterface(IID_PPV_ARGS(&device2)))) return E_NOINTERFACE;
@@ -142,7 +209,9 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
     discard_host_caches_after_run();
     return hr;
   }
-  *pipeline = wrap(state, info, vtable);
+  Wrapper* wrapper = wrap(state, info, vtable);
+  if (translated) wrapper->flags = kTranslatedPipeline;
+  *pipeline = wrapper;
   return S_OK;
 }
 

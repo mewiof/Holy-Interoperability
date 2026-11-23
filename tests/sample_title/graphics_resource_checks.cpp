@@ -195,19 +195,17 @@ void put32(std::vector<uint8_t>& out, uint32_t value) {
   for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(value >> (8 * i)));
 }
 
-// A console compute shader container that carries only native code (layout
-// in docs/PLATFORM_NOTES.md): PSV0 with the thread group size, and a DXIL
-// part whose console block holds a zlib stream (one stored block) with the
-// native program block. The program: s_mov_b32 s5, 7; v_mov_b32 v1, s5;
-// s_endpgm.
-std::vector<uint8_t> native_only_container() {
-  std::vector<uint8_t> block(0x134, 0);
+// A console shader container that carries only native code (layout in
+// docs/PLATFORM_NOTES.md): PSV0 with the thread group size, and a DXIL part
+// whose console block holds a zlib stream (one stored block) with the native
+// program block.
+std::vector<uint8_t> native_only_container(const std::vector<uint32_t>& code) {
+  std::vector<uint8_t> block(0x128 + 4 * code.size(), 0);
   std::memcpy(block.data(), "FSSM", 4);
-  const uint32_t record = 0x100, user_sgprs = 2;
-  const uint32_t code[3] = {0xBE850387u, 0x7E020205u, 0xBF810000u};
+  const uint32_t record = 0x100, root_parameters = 2;
   std::memcpy(block.data() + 0xC0, &record, 4);
-  std::memcpy(block.data() + 0xF8, &user_sgprs, 4);
-  std::memcpy(block.data() + 0x128, code, sizeof(code));
+  std::memcpy(block.data() + 0xF8, &root_parameters, 4);
+  std::memcpy(block.data() + 0x128, code.data(), 4 * code.size());
   uint32_t a = 1, b = 0;
   for (uint8_t byte : block) {
     a = (a + byte) % 65521;
@@ -252,7 +250,8 @@ std::vector<uint8_t> native_only_container() {
 }
 
 void test_native_pipeline(void* device) {
-  const std::vector<uint8_t> container = native_only_container();
+  // s_mov_b32 s5, 7; v_mov_b32 v1, s5; s_endpgm
+  const std::vector<uint8_t> container = native_only_container({0xBE850387u, 0x7E020205u, 0xBF810000u});
   D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
   pso.CS = {container.data(), container.size()};
   void* pipeline = nullptr;
@@ -395,6 +394,51 @@ void test_pipeline_stream(void* device) {
   check(call<HRESULT>(device, 86, &desc, __uuidof(ID3D12PipelineState), &pipeline) == S_OK && pipeline,
         "the device creates graphics pipelines from pipeline state streams");
   if (pipeline) call<ULONG>(pipeline, 2);
+
+  // The same stream with vertex and pixel shaders that carry only native
+  // code: exp param0 v0..v3; exp pos0 v0..v3 done; s_endpgm, and
+  // v_interp_mov_f32 v2, p0, attr0.x; exp mrt0 v2 done; s_endpgm.
+  const std::vector<uint8_t> native_vs =
+      native_only_container({0xF800020Fu, 0x03020100u, 0xF80008CFu, 0x03020100u, 0xBF810000u});
+  const std::vector<uint8_t> native_ps = native_only_container({0xC80A0002u, 0xF8000801u, 0x00000002u, 0xBF810000u});
+  stream.vs.value = {native_vs.data(), native_vs.size()};
+  stream.ps.value = {native_ps.data(), native_ps.size()};
+  void* native = nullptr;
+  check(call<HRESULT>(device, 86, &desc, __uuidof(ID3D12PipelineState), &native) == S_OK && native,
+        "graphics pipelines translate vertex and pixel shaders that carry only native code");
+  if (native) call<ULONG>(native, 2);
+}
+
+// Constant buffer views narrower than the desktop's 256-byte granularity.
+void test_small_constant_buffer_view(void* device) {
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 1};
+  void* heap = nullptr;
+  call<HRESULT>(device, 14, &heap_desc, __uuidof(ID3D12DescriptorHeap), &heap);
+  D3D12_HEAP_PROPERTIES upload{};
+  upload.Type = D3D12_HEAP_TYPE_UPLOAD;
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 0x10000;
+  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  void* resource = nullptr;
+  call<HRESULT>(device, 27, &upload, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ,
+                static_cast<const D3D12_CLEAR_VALUE*>(nullptr), __uuidof(ID3D12Resource), &resource);
+  if (!heap || !resource) {
+    check(false, "a buffer and a descriptor heap for constant buffer views exist");
+    return;
+  }
+  const uint64_t address = call<uint64_t>(resource, 11);  // GetGPUVirtualAddress
+  D3D12_CONSTANT_BUFFER_VIEW_DESC view{address, 128};
+  call<void>(device, 17, &view, call<uint64_t>(heap, 9));
+  D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 1};
+  void* query = nullptr;
+  check(call<HRESULT>(device, 39, &query_desc, __uuidof(ID3D12QueryHeap), &query) == S_OK && query,
+        "a 128-byte constant buffer view leaves the device usable");
+  if (query) call<ULONG>(query, 2);
+  call<ULONG>(resource, 2);
+  call<ULONG>(heap, 2);
 }
 
 void test_display_and_pacing(void* device) {
@@ -428,5 +472,6 @@ void test_graphics_resources(void* device) {
   test_native_pipeline(device);
   test_device_objects(device);
   test_pipeline_stream(device);
+  test_small_constant_buffer_view(device);
   test_display_and_pacing(device);
 }

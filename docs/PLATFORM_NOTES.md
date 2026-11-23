@@ -137,6 +137,10 @@ Notes describe the platform, never a title.
   `GetResourceAllocationInfo` keep the desktop meanings. A descriptor heap's CPU memory comes from `XMemAlloc`
   with object type 4 and allocator id 0x80: titles place it with an allocation hook and require the heap's CPU
   start to be their address. Titles ask for shader-visible heaps of 1,245,184 descriptors.
+- *observed*: titles create constant buffer views of 128 bytes; the desktop requires multiples of 256 and removes
+  the device otherwise. Views are widened to the next multiple of 256.
+- *observed*: titles ask for the descriptor increment of heap type 4, which the desktop does not have; what the
+  type is has not been established (the host answers 0, logged as an error).
 - *observed*: slot 70 makes a shader-resource view from a `D3D12_RESOURCE_DESC` and a
   `D3D12_SHADER_RESOURCE_VIEW_DESC` followed by the resource's GPU address, into a destination descriptor;
   titles flush the destination's cache lines afterwards.
@@ -172,8 +176,8 @@ Notes describe the platform, never a title.
   the out pointer, as the desktop `CreatePipelineState`. Streams use the desktop subobject layout; the first
   ones titles create carry root signature, vertex, pixel and empty hull/domain/geometry shaders, blend, sample
   mask, rasterizer, depth-stencil (type 21), sample description, input layout, topology and target formats.
-  Their shaders carry only native code; graphics shaders are not translated yet, so such pipelines report
-  themselves.
+  Their shaders carry only native code and are translated (see Graphics shaders); hull, domain and geometry
+  shaders with native code, and pipelines mixing native and desktop shaders, report themselves.
 - Implementation:
   - GPU addresses are title addresses, as on the console. Each piece of title memory resources are placed in
     gets a host heap opened over the same memory (from the physical-page section, or from the committed
@@ -326,12 +330,18 @@ Notes describe the platform, never a title.
   part; the stream itself ends inside it. The DXIL program header in front of the console block is a valid
   desktop program header (its bitcode offset skips the block), so such containers also pass as desktop ones.
 - *observed*: in the `FSSM` block, the dword at 0xC0 is the offset of the code record, whose machine code starts
-  0x28 bytes in; the dword at 0xF8 matches the number of user SGPRs the code reads (root table pointer and
-  arguments: 3 and 4 in the two programs studied, each consistent with its use of `s[0:1]` and the following
-  registers). The thread group size is in `PSV0` as on the desktop (runtime information bytes 40-51).
-- *assumed*: the workgroup id SGPRs (x, y, z) follow the user SGPRs, lane registers `v0`-`v2` hold the thread id
-  in the group, and a program is wave64 when it writes `EXEC` with 64-bit scalar operations (wave32 otherwise).
-  Not yet confirmed by running translated code against known results.
+  0x28 bytes in; the dword at 0xF8 equals the number of root signature parameters (3, 4 and 1 in the shaders
+  compared with their root signatures). The native program sits in the console block entry of kind 16 (block
+  version 5) or 7 (version 3). The thread group size is in `PSV0` as on the desktop (runtime information
+  bytes 40-51).
+- *observed* register inputs: compute programs read `s[0:1]` first (the root table address: root parameters
+  packed in root-signature order, constants 4 bytes each, root descriptors 8 bytes) and a workgroup id in `s4`.
+  Vertex shaders read a single root descriptor directly in `s[8:9]`; pixel shaders take `M0` from `s10`, the
+  register after ten user SGPRs, as the primitive mask interpolation uses.
+- *assumed*: compute programs have four user SGPRs with the workgroup ids (x, y, z) after them; lane registers
+  `v0`-`v2` hold the thread id in the group; graphics root data starts at `s8`; vertex shaders get the vertex id in
+  `v0` and the instance id in `v3`; a program is wave64 when it writes `EXEC` with 64-bit scalar operations
+  (wave32 otherwise). Not yet confirmed by running translated code against known results.
 - *documented*: the native code is RDNA 2 (public AMD instruction set reference); decoding follows it.
 - *documented*: host bytecode (DXBC, shader model 5.1) follows the desktop runtime's tokenized program format;
   a container needs input and output signature parts besides `SHEX`, and the DXBC checksum.
@@ -345,8 +355,18 @@ Notes describe the platform, never a title.
   through raw views (u0-u63, space 8). Scalar and vector ALU, scalar loads, buffer loads and stores
   (untyped, and typed for the 8/16/32-bit integer, normalised and float formats seen), global and flat
   memory, atomics and group shared memory (32 KiB, the host's limit) are translated. Not translated, and
-  reported as such: cross-lane operations (DPP, lane reads with a lane mask), image instructions, exports
-  (graphics shaders), and anything else not listed.
+  reported as such: cross-lane operations (DPP, lane reads with a lane mask), image instructions, and anything
+  else not listed.
+- Implementation, native graphics programs (vertex and pixel): the same translation, with the 16 user SGPRs
+  from the system constants. Parameter exports (`PARAMn`) become `TEXCOORDn` outputs in register n + 1 and the
+  first position export `SV_Position`; a pixel shader's attribute n is the input `TEXCOORDn`, interpolated by
+  the host (`v_interp_p1`/`p2` read it, `v_interp_mov` reads it without interpolation); colour exports become
+  `SV_Target` outputs (packed 16-bit exports are taken as half floats), the depth export `SV_Depth`. Pixel lanes
+  no longer in `EXEC` at an export, and lanes that export nothing, are discarded. Other position exports
+  (point size, clip distances) are dropped. Pipelines use the translated root signature.
+- *observed* host behaviour: the host driver refuses (`E_OUTOFMEMORY`) translated programs that read temporary
+  registers on paths where they were never written, and accepts the same programs with every such register
+  set to zero first; translated programs therefore start by zeroing every register they use.
 - *observed*: on the host GPU used for development, one packaged compute program is refused
   (`E_OUTOFMEMORY`), and a sandboxed (low-integrity) process that has seen this refusal leaves the driver's
   shader cache in a state that makes every later process using it fail fast inside the driver. Mitigations:

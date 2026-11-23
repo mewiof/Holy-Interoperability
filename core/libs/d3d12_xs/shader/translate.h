@@ -25,7 +25,9 @@ namespace holy::d3d12 {
 
 struct ComputeShaderInfo {
   uint32_t threads[3] = {64, 1, 1};
-  uint32_t user_sgprs = 2;  // s[0:1] = root table address
+  // SGPRs initialised from the HolySystem user values; the workgroup ids
+  // follow. Assumed for compute programs: 4 (s[0:1] the root table address).
+  uint32_t user_sgprs = 4;
   // 32 or 64; 0: decided from the code (assumed: 64 when it writes EXEC with
   // 64-bit scalar operations, 32 otherwise).
   uint32_t wave_size = 0;
@@ -47,5 +49,26 @@ inline constexpr uint32_t kSystemVectors = 69;
 
 bool translate_compute(const uint8_t* code, size_t size, const ComputeShaderInfo& info, std::vector<uint8_t>* dxbc,
                        std::string* error);
+
+// Graphics stages. Vertex shaders get the vertex id in v0 and the instance id
+// in v3 (assumed); all 16 user SGPRs come from the HolySystem user values.
+// Parameter exports (PARAMn) become TEXCOORDn outputs in register n + 1; a
+// pixel shader's attribute n is the input TEXCOORDn in register n + 1,
+// interpolated by the host (v_interp_p1/p2 read it; v_interp_mov reads it
+// without interpolation). Colour exports become SV_Target outputs (packed
+// 16-bit exports are taken as half floats), the depth export SV_Depth.
+enum class GraphicsStage { Vertex, Pixel };
+
+// What a translated graphics shader exports or reads, to link stages.
+struct ShaderInterface {
+  uint32_t params = 0;       // vertex: parameters exported; pixel: attributes read
+  uint32_t flat_params = 0;  // pixel: attributes read without interpolation
+  uint32_t targets = 0;      // pixel: render targets written
+  bool position = false;     // vertex: exports a position
+  bool depth = false;        // pixel: writes depth
+};
+
+bool translate_graphics(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,
+                        ShaderInterface* link, std::string* error);
 
 }  // namespace holy::d3d12

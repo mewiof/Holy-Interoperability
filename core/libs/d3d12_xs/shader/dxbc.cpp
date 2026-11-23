@@ -55,6 +55,13 @@ Operand abs(Operand operand) {
   return operand;
 }
 Operand input(OperandType type, uint32_t component) { return {select(component) | type_bits(type)}; }
+Operand input_register(uint32_t index, uint32_t component) {
+  return {select(component) | type_bits(kInput) | dimension(1), index};
+}
+Operand output_register(uint32_t index, uint32_t mask) {
+  return {kFourComponents | kMaskMode | (mask << 4) | type_bits(kOutput) | dimension(1), index};
+}
+Operand output_depth() { return {kOneComponent | type_bits(kOutputDepth)}; }
 Operand cb(uint32_t id, uint32_t reg, uint32_t component) {
   return {select(component) | type_bits(kConstantBuffer) | dimension(3), id, 0, reg};
 }
@@ -74,12 +81,19 @@ Operand uav_indexed(uint32_t id, uint32_t temp_index, Access access) {
   out.insert(out.end(), rel.begin(), rel.end());
   return out;
 }
+Operand uav(uint32_t id, uint32_t index, Access access) {
+  uint32_t components = access == Access::Load ? swizzle_xxxx() : access == Access::Store ? mask_x() : 0u;
+  return {components | type_bits(kUav) | dimension(2), id, index};
+}
+Operand srv_xyzw(uint32_t id, uint32_t index) {
+  return {swizzle_xxxx() | (0xE4u << 4) | type_bits(kResource) | dimension(2), id, index};
+}
 Operand group_shared(uint32_t id, Access access) {
   uint32_t components = access == Access::Load ? swizzle_xxxx() : access == Access::Store ? mask_x() : 0u;
   return {components | type_bits(kGroupShared) | dimension(1), id};
 }
 
-Program::Program() { tokens_ = {0x00050051u, 0u}; }
+Program::Program(ProgramType type) { tokens_ = {(static_cast<uint32_t>(type) << 16) | 0x51u, 0u}; }
 
 void Program::emit(uint32_t opcode, const std::vector<Operand>& operands, uint32_t controls) {
   size_t length = 1;
@@ -102,6 +116,12 @@ void Program::dcl_uav_raw_range(uint32_t id, uint32_t first, uint32_t last, uint
                  {swizzle_xxxx() | (0xE4u << 4) | type_bits(kUav) | dimension(3), id, first, last, space});
 }
 
+void Program::dcl_resource_raw_range(uint32_t id, uint32_t first, uint32_t last, uint32_t space) {
+  tokens_.push_back(kDclResourceRaw | (6u << 24));
+  tokens_.insert(tokens_.end(),
+                 {swizzle_xxxx() | (0xE4u << 4) | type_bits(kResource) | dimension(3), id, first, last, space});
+}
+
 void Program::dcl_input(OperandType type, uint32_t mask) {
   tokens_.push_back(kDclInput | (2u << 24));
   tokens_.push_back(mask == 0 ? type_bits(type) : (kFourComponents | kMaskMode | (mask << 4) | type_bits(type)));
@@ -117,17 +137,64 @@ void Program::dcl_thread_group(uint32_t x, uint32_t y, uint32_t z) {
   tokens_.insert(tokens_.end(), {kDclThreadGroup | (4u << 24), x, y, z});
 }
 
+void Program::dcl_input_sgv(uint32_t reg, uint32_t mask, SystemValue name) {
+  tokens_.insert(tokens_.end(), {kDclInputSgv | (4u << 24),
+                                 kFourComponents | kMaskMode | (mask << 4) | type_bits(kInput) | dimension(1), reg,
+                                 static_cast<uint32_t>(name)});
+}
+
+void Program::dcl_input_ps(uint32_t reg, uint32_t mask, Interpolation mode) {
+  tokens_.insert(tokens_.end(), {kDclInputPs | (static_cast<uint32_t>(mode) << 11) | (3u << 24),
+                                 kFourComponents | kMaskMode | (mask << 4) | type_bits(kInput) | dimension(1), reg});
+}
+
+void Program::dcl_output(uint32_t reg, uint32_t mask) {
+  tokens_.insert(tokens_.end(), {kDclOutput | (3u << 24), output_register(reg, mask)[0], reg});
+}
+
+void Program::dcl_output_siv(uint32_t reg, uint32_t mask, SystemValue name) {
+  tokens_.insert(tokens_.end(),
+                 {kDclOutputSiv | (4u << 24), output_register(reg, mask)[0], reg, static_cast<uint32_t>(name)});
+}
+
+void Program::dcl_output_depth() { tokens_.insert(tokens_.end(), {kDclOutput | (2u << 24), output_depth()[0]}); }
+
 void Program::append(const Program& other) {
   tokens_.insert(tokens_.end(), other.tokens_.begin() + 2, other.tokens_.end());
 }
 
-std::vector<uint8_t> Program::container() const {
+namespace {
+
+// A signature chunk's contents: count, 8, 24-byte elements, then the names.
+std::vector<uint8_t> signature_chunk(const std::vector<SignatureElement>& elements) {
+  std::vector<uint8_t> out(8 + 24 * elements.size());
+  const uint32_t count = static_cast<uint32_t>(elements.size()), eight = 8;
+  std::memcpy(out.data(), &count, 4);
+  std::memcpy(out.data() + 4, &eight, 4);
+  for (size_t i = 0; i < elements.size(); ++i) {
+    const SignatureElement& e = elements[i];
+    const uint32_t name = static_cast<uint32_t>(out.size());
+    out.insert(out.end(), e.name, e.name + std::strlen(e.name) + 1);
+    const uint32_t fields[5] = {name, e.index, e.system_value, e.component_type, e.reg};
+    std::memcpy(out.data() + 8 + 24 * i, fields, sizeof(fields));
+    out[8 + 24 * i + 20] = e.mask;
+    out[8 + 24 * i + 21] = e.rw_mask;
+  }
+  while (out.size() % 4) out.push_back(0);
+  return out;
+}
+
+}  // namespace
+
+std::vector<uint8_t> Program::container(const std::vector<SignatureElement>& inputs,
+                                        const std::vector<SignatureElement>& outputs) const {
   std::vector<uint32_t> shex = tokens_;
   shex[1] = static_cast<uint32_t>(shex.size());
-  // Chunks: ISGN and OSGN (no elements), SHEX.
-  const uint32_t signature[2] = {0, 8};
+  // Chunks: ISGN, OSGN, SHEX.
+  const std::vector<uint8_t> in_chunk = signature_chunk(inputs), out_chunk = signature_chunk(outputs);
   const uint32_t header = 32 + 3 * 4;
-  const uint32_t isgn = header, osgn = isgn + 8 + 8, code = osgn + 8 + 8;
+  const uint32_t isgn = header, osgn = isgn + 8 + static_cast<uint32_t>(in_chunk.size());
+  const uint32_t code = osgn + 8 + static_cast<uint32_t>(out_chunk.size());
   const uint32_t total = code + 8 + static_cast<uint32_t>(shex.size() * 4);
   std::vector<uint8_t> out(total);
   auto put = [&](uint32_t at, const void* data, size_t size) { std::memcpy(out.data() + at, data, size); };
@@ -140,11 +207,11 @@ std::vector<uint8_t> Program::container() const {
   put32(36, osgn);
   put32(40, code);
   put(isgn, "ISGN", 4);
-  put32(isgn + 4, 8);
-  put(isgn + 8, signature, 8);
+  put32(isgn + 4, static_cast<uint32_t>(in_chunk.size()));
+  put(isgn + 8, in_chunk.data(), in_chunk.size());
   put(osgn, "OSGN", 4);
-  put32(osgn + 4, 8);
-  put(osgn + 8, signature, 8);
+  put32(osgn + 4, static_cast<uint32_t>(out_chunk.size()));
+  put(osgn + 8, out_chunk.data(), out_chunk.size());
   put(code, "SHEX", 4);
   put32(code + 4, static_cast<uint32_t>(shex.size() * 4));
   put(code + 8, shex.data(), shex.size() * 4);

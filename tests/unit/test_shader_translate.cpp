@@ -156,13 +156,13 @@ TEST(native_compute_program_is_found) {
 
   NativeComputeProgram program;
   EXPECT(native_compute_program(container.data(), container.size(), &program));
-  EXPECT(program.user_sgprs == 3);
+  EXPECT(program.root_parameters == 3);
   EXPECT(program.threads[0] == 8 && program.threads[1] == 4 && program.threads[2] == 2);
   EXPECT(program.code_offset == 0x128);
   EXPECT(program.block.size() == block.size());
 
-  // Without the native program entry the container is not usable.
-  container[container.size() - dxil.size() + 24] = 15;  // entry kind
+  // Without a native program stream the container is not usable.
+  container[container.size() - dxil.size() + 32] = 0x12;  // stream header byte
   NativeComputeProgram none;
   EXPECT(!native_compute_program(container.data(), container.size(), &none));
 }
@@ -185,8 +185,35 @@ TEST(translated_program_is_valid_bytecode) {
   EXPECT(text.find("cs_5_1") != std::string::npos);
   EXPECT(text.find("dcl_thread_group 64, 1, 1") != std::string::npos);
   EXPECT(text.find("dcl_uav_raw U0[0:63], space=8") != std::string::npos);
-  EXPECT(text.find("switch") != std::string::npos);
-  EXPECT(text.find("case l(16)") != std::string::npos);
+  // Blocks at 0, 12 and 16, selected by comparisons on the next block.
+  EXPECT(text.find("loop") != std::string::npos);
+  EXPECT(text.find("l(16)") != std::string::npos);
+}
+
+TEST(translated_graphics_stages_link) {
+  // Vertex: exp param0 v0..v3; exp pos0 v0..v3 done; s_endpgm.
+  const std::vector<uint8_t> vs_code = words({0xF800020Fu, 0x03020100u, 0xF80008CFu, 0x03020100u, 0xBF810000u});
+  // Pixel: v_interp_mov_f32 v2, p0, attr0.x; exp mrt0 v2 done; s_endpgm.
+  const std::vector<uint8_t> ps_code = words({0xC80A0002u, 0xF8000801u, 0x00000002u, 0xBF810000u});
+  std::vector<uint8_t> vs, ps;
+  ShaderInterface vs_link, ps_link;
+  std::string error;
+  EXPECT(translate_graphics(vs_code.data(), vs_code.size(), GraphicsStage::Vertex, &vs, &vs_link, &error));
+  EXPECT(translate_graphics(ps_code.data(), ps_code.size(), GraphicsStage::Pixel, &ps, &ps_link, &error));
+  EXPECT(vs_link.position && vs_link.params == 1);
+  EXPECT(ps_link.params == 1 && ps_link.flat_params == 1 && ps_link.targets == 1 && !ps_link.depth);
+  const std::string vs_text = disassemble(vs), ps_text = disassemble(ps);
+  EXPECT(vs_text.find("vs_5_1") != std::string::npos);
+  EXPECT(vs_text.find("dcl_input_sgv v0.x, vertex_id") != std::string::npos);
+  EXPECT(vs_text.find("dcl_output_siv o0.xyzw, position") != std::string::npos);
+  EXPECT(vs_text.find("dcl_output o1.xyzw") != std::string::npos);
+  EXPECT(vs_text.find("TEXCOORD") != std::string::npos);
+  EXPECT(ps_text.find("ps_5_1") != std::string::npos);
+  EXPECT(ps_text.find("dcl_input_ps constant v1.xyzw") != std::string::npos);
+  EXPECT(ps_text.find("dcl_output o0.xyzw") != std::string::npos);
+  EXPECT(ps_text.find("SV_Target") != std::string::npos);
+  // Exports into a stage that has none are reported.
+  EXPECT(!translate_compute(vs_code.data(), vs_code.size(), ComputeShaderInfo{}, &vs, &error));
 }
 
 TEST(untranslatable_code_is_reported) {

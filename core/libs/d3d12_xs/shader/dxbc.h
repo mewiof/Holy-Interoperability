@@ -23,7 +23,9 @@ enum Opcode : uint32_t {
   kMax = 52, kMov = 54, kMovc = 55, kMul = 56, kNe = 57, kNot = 59, kOr = 60, kRet = 62, kRoundNe = 64,
   kRoundNi = 65, kRoundPi = 66, kRoundZ = 67, kRsq = 68, kSqrt = 75, kSwitch = 76, kSincos = 77, kUdiv = 78,
   kUlt = 79, kUge = 80, kUmul = 81, kUmad = 82, kUmax = 83, kUmin = 84, kUshr = 85, kUtof = 86, kXor = 87,
-  kDclConstantBuffer = 89, kDclInput = 95, kDclTemps = 104, kDclGlobalFlags = 106, kDclThreadGroup = 155,
+  kDiscard = 13, kDclConstantBuffer = 89, kDclInput = 95, kDclInputSgv = 96, kDclInputPs = 98,
+  kDclInputPsSiv = 100, kDclOutput = 101, kDclOutputSiv = 103, kDclTemps = 104, kDclGlobalFlags = 106,
+  kDclThreadGroup = 155, kDclResourceRaw = 161,
   kDclUavRaw = 157, kDclTgsmRaw = 159, kRcp = 129, kF32tof16 = 130, kF16tof32 = 131, kUaddc = 132,
   kUsubb = 133, kCountbits = 134, kFirstbitHi = 135, kFirstbitLo = 136, kFirstbitShi = 137, kUbfe = 138,
   kIbfe = 139, kBfi = 140, kBfrev = 141, kLdRaw = 165, kStoreRaw = 166, kAtomicAnd = 169, kAtomicOr = 170,
@@ -42,7 +44,9 @@ inline constexpr uint32_t kSyncUavGlobal = 1u << 14;
 
 // Operand types.
 enum OperandType : uint32_t {
-  kTemp = 0, kImmediate32 = 4, kConstantBuffer = 8, kNull = 13, kUav = 30, kGroupShared = 31,
+  kTemp = 0, kInput = 1, kOutput = 2, kImmediate32 = 4, kResource = 7, kConstantBuffer = 8, kOutputDepth = 12,
+  kNull = 13,
+  kUav = 30, kGroupShared = 31,
   kThreadId = 32, kThreadGroupId = 33, kThreadIdInGroup = 34, kThreadIdInGroupFlattened = 36,
 };
 
@@ -57,6 +61,29 @@ Operand immf(float value);
 Operand neg(Operand operand);
 Operand abs(Operand operand);
 Operand input(OperandType type, uint32_t component);
+// vN.c and oN with a write mask; the depth output.
+Operand input_register(uint32_t index, uint32_t component);
+Operand output_register(uint32_t index, uint32_t mask);
+Operand output_depth();
+
+// System-value names in declarations and signatures.
+enum SystemValue : uint32_t { kUndefined = 0, kPosition = 1, kVertexId = 6, kInstanceId = 8 };
+// Interpolation modes of pixel shader inputs.
+enum Interpolation : uint32_t { kConstant = 1, kLinear = 2, kLinearNoPerspective = 4 };
+// Signature component types.
+enum ComponentType : uint32_t { kUint32 = 1, kFloat32 = 3 };
+
+struct SignatureElement {
+  const char* name;
+  uint32_t index;
+  uint32_t system_value;
+  uint32_t component_type;
+  uint32_t reg;  // 0xFFFFFFFF for registers without an index (depth)
+  uint8_t mask;
+  uint8_t rw_mask;  // inputs: components read; outputs: components never written
+};
+
+enum class ProgramType : uint32_t { Pixel = 0, Vertex = 1, Compute = 5 };
 // CBn[0][register].component and CBn[0][temp.x + register].component.
 Operand cb(uint32_t id, uint32_t reg, uint32_t component);
 Operand cb_indexed(uint32_t id, uint32_t temp_index, uint32_t reg, uint32_t component);
@@ -65,11 +92,14 @@ enum class Access { Load, Store, Atomic };
 // Un[0][temp.x] (non-uniform) and gN.
 Operand uav_indexed(uint32_t id, uint32_t temp_index, Access access);
 Operand group_shared(uint32_t id, Access access);
+// Un[index] (static index) and Tn[index].xyzw.
+Operand uav(uint32_t id, uint32_t index, Access access);
+Operand srv_xyzw(uint32_t id, uint32_t index);
 
 class Program {
  public:
-  // Program type 5 (compute), version 5.1.
-  Program();
+  // Version 5.1 of the given program type.
+  explicit Program(ProgramType type = ProgramType::Compute);
 
   void emit(uint32_t opcode, const std::vector<Operand>& operands, uint32_t controls = 0);
   void emit(uint32_t opcode) { emit(opcode, {}); }
@@ -77,17 +107,24 @@ class Program {
   void dcl_global_flags(uint32_t flags);
   void dcl_constant_buffer(uint32_t id, uint32_t space, uint32_t vectors, bool dynamic);
   void dcl_uav_raw_range(uint32_t id, uint32_t first, uint32_t last, uint32_t space);
+  void dcl_resource_raw_range(uint32_t id, uint32_t first, uint32_t last, uint32_t space);
   void dcl_input(OperandType type, uint32_t mask);
   void dcl_temps(uint32_t count);
   void dcl_tgsm_raw(uint32_t id, uint32_t bytes);
   void dcl_thread_group(uint32_t x, uint32_t y, uint32_t z);
+  void dcl_input_sgv(uint32_t reg, uint32_t mask, SystemValue name);
+  void dcl_input_ps(uint32_t reg, uint32_t mask, Interpolation mode);
+  void dcl_output(uint32_t reg, uint32_t mask);
+  void dcl_output_siv(uint32_t reg, uint32_t mask, SystemValue name);
+  void dcl_output_depth();
 
   // Appends `other`'s instructions (no version/length header).
   void append(const Program& other);
   size_t size() const { return tokens_.size(); }
 
-  // The complete DXBC container (empty input/output signatures, SHEX, checksum).
-  std::vector<uint8_t> container() const;
+  // The complete DXBC container (input/output signatures, SHEX, checksum).
+  std::vector<uint8_t> container(const std::vector<SignatureElement>& inputs = {},
+                                 const std::vector<SignatureElement>& outputs = {}) const;
 
  private:
   std::vector<uint32_t> tokens_;

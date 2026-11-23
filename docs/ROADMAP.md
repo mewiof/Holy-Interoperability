@@ -64,16 +64,15 @@ The largest piece.
   creation and `Close`; console DXGI display modes; frame interval and frame events; descriptor heaps placed by
   the title; views; root signatures; committed and placed resources (buffers placed in title memory through
   host heaps over that memory); compute pipelines from shaders that keep their DXIL, and from native code.
-- partial: shader translation from native GPU code (titles' own shaders carry nothing else): compute
-  programs are translated straight into host bytecode (DXBC) without a shader compiler, covering scalar and
-  vector ALU, scalar, buffer, global and group-shared memory and atomics. Open: image instructions,
-  cross-lane operations, graphics stages (exports, interpolation), and checking translated code against
-  known results once dispatches run.
+- partial: shader translation from native GPU code (titles' own shaders carry nothing else): compute, vertex
+  and pixel programs are translated straight into host bytecode (DXBC) without a shader compiler, covering
+  scalar and vector ALU, scalar, buffer, global and group-shared memory, atomics, exports and interpolation.
+  Open: image instructions, cross-lane operations, hull/domain/geometry stages, and checking translated code
+  against known results once draws and dispatches run.
 - done: query heaps, command signatures, desktop-order committed resources, console samplers (field meaning
-  partly assumed), heaps over title memory, pipeline state streams with desktop programs.
-- next: graphics shader translation (vertex and pixel shaders: exports, interpolation, images), which the
-  title's first graphics pipelines need; then command recording (for translated pipelines: root tables and
-  the region table).
+  partly assumed), heaps over title memory, pipeline state streams (desktop or translated programs).
+- next: `xg_xs` texture layout (the title asks for swizzle modes next), then command recording (for translated
+  pipelines: root data in user SGPRs, root tables and the region table) and presentation.
 - open: textures placed in title memory (console layouts via `xg_xs`), presentation.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.

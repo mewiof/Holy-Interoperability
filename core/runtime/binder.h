@@ -31,6 +31,12 @@ BindSummary bind_title_imports(uint8_t* image_base, uint32_t image_size, pe::Dat
 // LoadLibrary as a title sees it: bare console library names resolve to this
 // project's implementations, mounted drive paths are translated.
 HMODULE load_library_for_title(const wchar_t* requested, DWORD flags);
+
+// Applies the runtime's interposers to the host imports of every DLL loaded
+// from the package that has not been processed yet. The OS loader binds
+// those DLLs; without this, code the package ships would reach the host's
+// file, library-loading and network functions directly.
+void rebind_package_modules();
 HMODULE module_handle_for_title(const wchar_t* requested);
 
 }  // namespace holy::rt

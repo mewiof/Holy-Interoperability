@@ -11,6 +11,7 @@
 #include "core/runtime/binder.h"
 #include "core/runtime/crash.h"
 #include "core/runtime/hooks.h"
+#include "core/runtime/memory.h"
 #include "core/runtime/state.h"
 
 namespace holy::rt {
@@ -75,6 +76,7 @@ void boot() {
   s.title_base = image_base;
   s.title_size = nt_headers(image_base)->OptionalHeader.SizeOfImage;
   s.trap_unimplemented = (g_boot.flags & kBootTrapUnimplemented) != 0;
+  s.offline = (g_boot.flags & kBootOffline) != 0;
   s.console_model = g_boot.console_model;
   s.runtime_dir = parent_dir(module_path(g_self));
   s.providers.libs_dir = join_path(s.runtime_dir, L"libs");
@@ -84,9 +86,9 @@ void boot() {
 
   log::set_level(static_cast<log::Level>(g_boot.log_level));
   const bool have_log_file = log::open_file(runtime_log_path(g_boot.data_dir));
-  LOG_INFO(kComponent, "Holy Interoperability runtime starting (%s, unimplemented imports %s)",
+  LOG_INFO(kComponent, "Holy Interoperability runtime starting (%s, %s, unimplemented imports %s)",
            (g_boot.flags & kBootSandboxed) ? "sandboxed" : "not sandboxed",
-           s.trap_unimplemented ? "trap" : "continue");
+           s.offline ? "offline" : "host network", s.trap_unimplemented ? "trap" : "continue");
   if (!have_log_file) LOG_WARN(kComponent, "cannot create the runtime log file in the data directory");
 
   // Libraries shipped in the package link against console system libraries by
@@ -95,6 +97,7 @@ void boot() {
   AddDllDirectory(s.providers.libs_dir.c_str());
 
   install_crash_handlers();
+  install_commit_on_demand();
   bind_title_imports(image_base, s.title_size, {g_boot.original_import_rva, g_boot.original_import_size});
   restore_directories(image_base, g_boot);
   LOG_INFO(kComponent, "imports bound; handing control to the title");
@@ -138,6 +141,30 @@ void HolyUnimplemented(const char* library, const char* symbol) {
   }
 }
 
+void HolyUnimplementedFrom(const char* library, const char* symbol, const void* caller) {
+  LOG_ERROR("import", "unimplemented %s!%s (called from %s)", library ? library : "?", symbol ? symbol : "?",
+            holy::rt::describe_address(caller).c_str());
+  if (holy::rt::state().active && holy::rt::state().trap_unimplemented) {
+    holy::rt::fatal_exit(holy::kExitUnimplementedImport);
+  }
+}
+
+void HolyDescribeAddress(const void* address, char* buffer, size_t size) {
+  if (!buffer || size == 0) return;
+  const std::string text = holy::rt::describe_address(address);
+  const size_t count = text.size() < size - 1 ? text.size() : size - 1;
+  std::memcpy(buffer, text.data(), count);
+  buffer[count] = '\0';
+}
+
+void HolyCommitOnDemand(void* base, size_t size, uint32_t protect) {
+  holy::rt::register_commit_on_demand(base, size, protect);
+}
+
+int HolyEnsureCommitted(const void* address, size_t size) {
+  return holy::rt::ensure_committed(address, size) ? 1 : 0;
+}
+
 const wchar_t* HolyPackageDir(void) {
   return holy::rt::g_boot.package_dir;
 }
@@ -145,9 +172,12 @@ const wchar_t* HolyDataDir(void) {
   return holy::rt::g_boot.data_dir;
 }
 
+int HolyIsOffline(void) {
+  return holy::rt::state().offline ? 1 : 0;
+}
+
 int HolyHasOverride(const char* library, const char* symbol) {
-  (void)library;
-  return (symbol && holy::rt::find_override(symbol)) ? 1 : 0;
+  return (library && symbol && holy::rt::find_override(library, symbol)) ? 1 : 0;
 }
 
 }  // extern "C"

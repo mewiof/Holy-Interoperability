@@ -19,7 +19,7 @@
 namespace holy {
 
 inline constexpr uint64_t kBootMagic = 0x544F4F42594C4F48ull;  // "HOLYBOOT"
-inline constexpr uint32_t kBootVersion = 2;
+inline constexpr uint32_t kBootVersion = 3;
 
 // Console model the title is told it runs on. The values are the ones the
 // console OS publishes in its "ConsoleMode" registry value.
@@ -32,6 +32,7 @@ inline constexpr char kBootAnchorSymbol[] = "HolyRuntimeAnchor";
 enum BootFlags : uint32_t {
   kBootTrapUnimplemented = 1u << 0,  // terminate on the first call to an unimplemented import
   kBootSandboxed = 1u << 1,          // informational: the process runs at low integrity
+  kBootOffline = 1u << 2,            // the title sees a host without network connectivity
 };
 
 struct BootBlock {

@@ -42,6 +42,8 @@ void print_usage() {
       "      --data-dir <dir>      per-title writable directory (default: per-user, per-title)\n"
       "      --no-sandbox          do not lower the title's integrity level\n"
       "      --console <model>     console model reported to the title: series-x (default), series-s\n"
+      "      --network <mode>      offline (default): the title sees a disconnected host;\n"
+      "                            host: the title may use the host's network\n"
       "      --unimplemented <trap|continue>\n"
       "                            what a call into an unimplemented import does (default: trap)\n"
       "      --trace <patterns>    comma separated import library patterns to trace, e.g. xmem.dll,d3d12*\n"
@@ -222,6 +224,16 @@ int cmd_run(const std::vector<std::wstring>& args) {
         options.unimplemented = loader::UnimplementedPolicy::Continue;
       else {
         std::fprintf(stderr, "--unimplemented expects trap or continue\n");
+        return kUsage;
+      }
+    } else if (arg == L"--network") {
+      if (!value(L"--network", text)) return kUsage;
+      if (text == L"offline")
+        options.offline = true;
+      else if (text == L"host")
+        options.offline = false;
+      else {
+        std::fprintf(stderr, "--network expects offline or host\n");
         return kUsage;
       }
     } else if (arg == L"--console") {

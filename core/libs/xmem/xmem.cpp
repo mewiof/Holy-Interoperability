@@ -32,6 +32,28 @@ constexpr SIZE_T kDefaultAlignment = 16;
 constexpr SIZE_T kPageAllocationThreshold = 1024 * 1024;
 constexpr SIZE_T kAllocationGranularity = 0x10000;
 
+// Commit charge on the host can run out long before physical memory does:
+// a console title commits its pools up front, the host charges every
+// committed page against RAM plus paging file. When a commit is refused for
+// that reason the range is reserved instead and committed on first touch (see
+// core/runtime/memory.h).
+bool commit_exhausted(DWORD error) {
+  return error == ERROR_COMMITMENT_LIMIT || error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY ||
+         error == ERROR_COMMITMENT_MINIMUM;
+}
+
+std::atomic<bool> g_deferral_reported{false};
+
+void defer_commit(void* base, SIZE_T size, DWORD protect) {
+  const auto begin = reinterpret_cast<uintptr_t>(base) & ~static_cast<uintptr_t>(0xFFF);
+  const uintptr_t end = (reinterpret_cast<uintptr_t>(base) + size + 0xFFF) & ~static_cast<uintptr_t>(0xFFF);
+  HolyCommitOnDemand(reinterpret_cast<void*>(begin), end - begin, protect);
+  if (!g_deferral_reported.exchange(true)) {
+    LIB_LOG(holy::lib::kWarn, "xmem",
+            "the host is short of commit charge; title memory is now committed on first touch");
+  }
+}
+
 struct Attributes {
   uint32_t page_size;
   uint32_t alignment_log2;
@@ -57,6 +79,10 @@ void* allocate_pages(SIZE_T size, SIZE_T alignment) {
   void* block = nullptr;
   if (alignment <= kAllocationGranularity) {
     block = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!block && commit_exhausted(GetLastError())) {
+      block = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
+      if (block) defer_commit(block, size, PAGE_READWRITE);
+    }
   } else {
     // Over-reserve to find an aligned address, then claim exactly that range.
     for (int attempt = 0; attempt < 8 && !block; ++attempt) {
@@ -66,6 +92,10 @@ void* allocate_pages(SIZE_T size, SIZE_T alignment) {
           (reinterpret_cast<uintptr_t>(probe) + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
       VirtualFree(probe, 0, MEM_RELEASE);
       block = VirtualAlloc(reinterpret_cast<void*>(aligned), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+      if (!block && commit_exhausted(GetLastError())) {
+        block = VirtualAlloc(reinterpret_cast<void*>(aligned), size, MEM_RESERVE, PAGE_NOACCESS);
+        if (block) defer_commit(block, size, PAGE_READWRITE);
+      }
     }
   }
   if (block) {
@@ -169,10 +199,22 @@ HOLY_EXPORT void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_
   if ((host_protect & 0xFF) == 0) host_protect |= PAGE_NOACCESS;
 
   void* result = nullptr;
-  if (!address && (allocation_type & MEM_RESERVE) && (allocation_type & kMem4MbPages)) {
+  const bool aligned_reservation = !address && (allocation_type & MEM_RESERVE) && (allocation_type & kMem4MbPages);
+  if (aligned_reservation) {
     result = reserve_aligned(size, k4Mb, host_type, host_protect);
   } else {
     result = VirtualAlloc(address, size, host_type, host_protect);
+  }
+  if (!result && (host_type & MEM_COMMIT) && commit_exhausted(GetLastError())) {
+    // Keep the reservation semantics of the request; defer only the commit.
+    if (host_type & MEM_RESERVE) {
+      const DWORD reserve_type = host_type & ~static_cast<DWORD>(MEM_COMMIT);
+      result = aligned_reservation ? reserve_aligned(size, k4Mb, reserve_type, PAGE_NOACCESS)
+                                   : VirtualAlloc(address, size, reserve_type, PAGE_NOACCESS);
+    } else {
+      result = address;  // committing inside an existing reservation
+    }
+    if (result) defer_commit(result, size, host_protect);
   }
   const DWORD error = GetLastError();
 

@@ -385,7 +385,7 @@ LaunchResult launch(const LaunchOptions& options) {
   block.version = kBootVersion;
   block.struct_size = sizeof(BootBlock);
   block.flags = (options.unimplemented == UnimplementedPolicy::Trap ? kBootTrapUnimplemented : 0u) |
-                (options.sandbox ? kBootSandboxed : 0u);
+                (options.sandbox ? kBootSandboxed : 0u) | (options.offline ? kBootOffline : 0u);
   block.log_level = static_cast<uint32_t>(options.runtime_log_level);
   block.console_model = static_cast<uint32_t>(options.console_model);
   if (!copy_to(block.package_dir, std::size(block.package_dir), manifest->root) ||

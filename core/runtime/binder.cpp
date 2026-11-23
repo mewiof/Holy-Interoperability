@@ -1,6 +1,11 @@
 #include "core/runtime/binder.h"
 
+#include <psapi.h>
+
+#include <algorithm>
 #include <deque>
+#include <map>
+#include <set>
 #include <string>
 
 #include "core/analysis/import_report.h"
@@ -90,6 +95,74 @@ HMODULE load_provider(const Provider& provider, const std::string& library_name)
   }
 }
 
+uint32_t mapped_size(const void* module) {
+  const auto* base = static_cast<const uint8_t*>(module);
+  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+  return nt->OptionalHeader.SizeOfImage;
+}
+
+// Name of the export a loaded host module publishes under `ordinal`, so that
+// by-ordinal imports can be interposed like named ones.
+std::string export_name(HMODULE module, uint16_t ordinal) {
+  static SRWLOCK lock = SRWLOCK_INIT;
+  static auto* cache = new std::map<std::pair<HMODULE, uint16_t>, std::string>();
+  if (!module) return {};
+  AcquireSRWLockExclusive(&lock);
+  auto found = cache->find({module, ordinal});
+  if (found == cache->end()) {
+    std::string name;
+    const auto image = pe::Image::parse({reinterpret_cast<const uint8_t*>(module), mapped_size(module)},
+                                        pe::Layout::Mapped);
+    if (image) {
+      for (const pe::ExportSymbol& symbol : image->exports()) {
+        if (symbol.ordinal == ordinal && !symbol.name.empty()) {
+          name = symbol.name;
+          break;
+        }
+      }
+    }
+    found = cache->emplace(std::make_pair(module, ordinal), std::move(name)).first;
+  }
+  std::string result = found->second;
+  ReleaseSRWLockExclusive(&lock);
+  return result;
+}
+
+const Override* host_override(const std::string& library, const pe::ImportSymbol& symbol, HMODULE module) {
+  if (!symbol.by_ordinal) return find_override(library, symbol.name);
+  const std::string name = export_name(module, symbol.ordinal);
+  return name.empty() ? nullptr : find_override(library, name);
+}
+
+// Points a package DLL's imports of interposed host functions at the
+// interposers. The OS loader has bound everything else already.
+void rebind_package_module(HMODULE module) {
+  auto* base = reinterpret_cast<uint8_t*>(module);
+  const uint32_t size = mapped_size(module);
+  const auto image = pe::Image::parse({base, size}, pe::Layout::Mapped);
+  if (!image) return;
+  size_t rebound = 0;
+  for (const pe::ImportLibrary& library : image->imports()) {
+    const Provider provider = locate_provider(state().providers, library.name);
+    if (provider.kind != ProviderKind::Host) continue;
+    HMODULE host = nullptr;
+    for (const pe::ImportSymbol& symbol : library.symbols) {
+      if (symbol.by_ordinal && !host) host = static_cast<HMODULE>(analysis::load_host_library(library.name));
+      const Override* entry = host_override(library.name, symbol, host);
+      if (!entry || static_cast<uint64_t>(symbol.iat_rva) + sizeof(void*) > size) continue;
+      void** slot = reinterpret_cast<void**>(base + symbol.iat_rva);
+      DWORD old_protection = 0;
+      if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old_protection)) continue;
+      *slot = entry->hook;
+      VirtualProtect(slot, sizeof(void*), old_protection, &old_protection);
+      ++rebound;
+    }
+  }
+  LOG_DEBUG(kComponent, "package library %s: %zu host imports interposed",
+            narrow(base_name(module_path(module))).c_str(), rebound);
+}
+
 bool is_bare_name(const std::wstring& name) {
   return name.find_first_of(L"\\/:") == std::wstring::npos;
 }
@@ -138,7 +211,7 @@ BindSummary bind_title_imports(uint8_t* image_base, uint32_t image_size, pe::Dat
       ++summary.symbols;
       void* target = nullptr;
       const Override* override_entry =
-          (provider.kind == ProviderKind::Host && !symbol.by_ordinal) ? find_override(symbol.name) : nullptr;
+          provider.kind == ProviderKind::Host ? host_override(library.name, symbol, module) : nullptr;
       if (override_entry) {
         target = override_entry->hook;
         ++summary.overridden;
@@ -195,7 +268,25 @@ BindSummary bind_title_imports(uint8_t* image_base, uint32_t image_size, pe::Dat
            summary.symbols, summary.libraries, summary.from_host, summary.from_package, summary.from_runtime,
            summary.overridden, summary.unimplemented);
   for (const std::string& name : unimplemented) LOG_INFO(kComponent, "  unimplemented: %s", name.c_str());
+  rebind_package_modules();
   return summary;
+}
+
+void rebind_package_modules() {
+  static SRWLOCK lock = SRWLOCK_INIT;
+  static auto* done = new std::set<HMODULE>();
+  HMODULE modules[1024];
+  DWORD needed = 0;
+  if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) return;
+  const size_t count = std::min<size_t>(needed / sizeof(HMODULE), std::size(modules));
+  AcquireSRWLockExclusive(&lock);
+  for (size_t i = 0; i < count; ++i) {
+    HMODULE module = modules[i];
+    if (reinterpret_cast<uint8_t*>(module) == state().title_base || done->count(module)) continue;
+    done->insert(module);
+    if (vfs::is_inside(state().vfs.package_root, module_path(module))) rebind_package_module(module);
+  }
+  ReleaseSRWLockExclusive(&lock);
 }
 
 HMODULE load_library_for_title(const wchar_t* requested, DWORD flags) {
@@ -207,6 +298,7 @@ HMODULE load_library_for_title(const wchar_t* requested, DWORD flags) {
   if (!is_bare_name(name)) {
     const std::wstring path = vfs::translate(state().vfs, name);
     HMODULE module = LoadLibraryExW(path.c_str(), nullptr, flags);
+    if (module) rebind_package_modules();
     LOG_DEBUG("loader", "LoadLibrary(%s) -> %p", log_path(path).c_str(), static_cast<void*>(module));
     return module;
   }
@@ -237,6 +329,7 @@ HMODULE load_library_for_title(const wchar_t* requested, DWORD flags) {
   if (flags & kSearchFlags) flags |= LOAD_LIBRARY_SEARCH_USER_DIRS;
   HMODULE module = LoadLibraryExW(requested, nullptr, flags);
   const DWORD load_error = GetLastError();
+  if (module) rebind_package_modules();
   LOG_DEBUG("loader", "LoadLibrary(%s) -> %p", file.c_str(), static_cast<void*>(module));
   if (!module && provider.kind == ProviderKind::Package) {
     LOG_ERROR("loader", "package library %s failed to load (error %lu)", file.c_str(), load_error);

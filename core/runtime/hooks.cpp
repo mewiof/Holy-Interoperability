@@ -10,6 +10,8 @@
 #include "core/common/strings.h"
 #include "core/runtime/binder.h"
 #include "core/runtime/crash.h"
+#include "core/runtime/memory.h"
+#include "core/runtime/network.h"
 #include "core/runtime/state.h"
 
 namespace holy::rt {
@@ -194,6 +196,15 @@ BOOL WINAPI hook_MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   const std::wstring target = host_path(to);
   if (deny_package_write(target, "move")) return FALSE;
   return MoveFileExW(source.c_str(), target.c_str(), flags);
+}
+
+// The kernel reports a read into title memory that is committed on demand as
+// an error rather than faulting it in, so the buffer is committed first.
+BOOL WINAPI hook_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
+  const DWORD error = GetLastError();
+  ensure_committed(buffer, size);
+  SetLastError(error);
+  return ReadFile(file, buffer, size, read, overlapped);
 }
 
 BOOL WINAPI hook_GetDiskFreeSpaceExW(LPCWSTR directory, PULARGE_INTEGER available, PULARGE_INTEGER total,
@@ -402,6 +413,7 @@ const Override kOverrides[] = {
     HOLY_OVERRIDE(RemoveDirectoryW),
     HOLY_OVERRIDE(MoveFileExW),
     HOLY_OVERRIDE(GetDiskFreeSpaceExW),
+    HOLY_OVERRIDE(ReadFile),
     HOLY_OVERRIDE(fopen),
     HOLY_OVERRIDE(_wfopen),
     HOLY_OVERRIDE(_wstat64),
@@ -421,7 +433,8 @@ const Override kOverrides[] = {
 
 }  // namespace
 
-const Override* find_override(std::string_view symbol) {
+const Override* find_override(std::string_view library, std::string_view symbol) {
+  if (const Override* network = find_network_override(library, symbol)) return network;
   for (const Override& entry : kOverrides) {
     if (symbol == entry.symbol) return &entry;
   }

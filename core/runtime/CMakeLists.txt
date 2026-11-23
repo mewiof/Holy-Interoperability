@@ -8,6 +8,10 @@ add_library(holyrt SHARED
   dllmain.cpp
   hooks.cpp
   hooks.h
+  memory.cpp
+  memory.h
+  network.cpp
+  network.h
   state.cpp
   state.h
   thunks.cpp

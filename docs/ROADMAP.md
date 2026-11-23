@@ -59,11 +59,12 @@ The largest piece.
 
 - done: `D3D12ConfigureVirtualMemoryX` (accepted and recorded), root-signature helpers (forwarded).
 - partial: `D3D12XboxCreateDevice` on the host's Direct3D 12; command queues, fences, allocators, command-list
-  creation and `Close`.
-- blocked: the next calls titles make are console command-list methods that take hardware-register-style
-  values (see [PLATFORM_NOTES.md](PLATFORM_NOTES.md)); their contracts cannot be established from call sites
-  and desktop documentation alone.
-- open: console DXGI objects (device, adapter, output with the console's display-mode query).
+  creation and `Close`; console DXGI display modes; frame interval and frame events; descriptor heaps placed by
+  the title; views; root signatures; committed and placed resources (buffers placed in title memory through
+  host heaps over that memory); compute pipelines from shaders that keep their DXIL.
+- next: shader translation from native GPU code (titles' own shaders carry nothing else), and a packaged
+  compute shader whose DXIL the host driver refuses.
+- open: textures placed in title memory (console layouts via `xg_xs`), command recording, presentation.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.
 - open: shader translation. Titles ship only native console GPU machine code (see

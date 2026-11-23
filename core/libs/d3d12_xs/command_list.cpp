@@ -35,12 +35,25 @@ HRESULT STDMETHODCALLTYPE list_close(CommandList* self) {
   return self->host->Close();
 }
 
+// Slots 131 and 132 (observed once per list at start-up: (0xc3c0,
+// 0x80020000, 0, 0xffffffffff00) and (0x700000, 0, 0, 0xffffffffff00), no
+// result checked). Assumed: they program GPU state through register offset,
+// value and mask, as the console GPU's driver interface allows. The host
+// driver owns its GPU's register state, so the values are recorded in the
+// log and not applied.
+void STDMETHODCALLTYPE list_hardware_state(CommandList*, uint32_t a, uint32_t b, uint32_t c, uint64_t mask) {
+  LIB_LOG(lib::kDebug, "d3d12", "hardware state 0x%x 0x%x 0x%x mask 0x%llx (not applied on the host)", a, b, c,
+          static_cast<unsigned long long>(mask));
+}
+
 const auto kListVtable = [] {
   auto table = lib::make_reporting_vtable<kCommandListSlots>();
   table[0] = reinterpret_cast<void*>(&list_query_interface);
   table[1] = reinterpret_cast<void*>(&list_add_ref);
   table[2] = reinterpret_cast<void*>(&list_release);
   table[9] = reinterpret_cast<void*>(&list_close);
+  table[131] = reinterpret_cast<void*>(&list_hardware_state);
+  table[132] = reinterpret_cast<void*>(&list_hardware_state);
   return table;
 }();
 

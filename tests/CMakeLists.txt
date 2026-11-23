@@ -5,6 +5,8 @@ add_executable(holy_unit_tests
   unit/test_manifest.cpp
   unit/test_pe.cpp
   unit/test_provider.cpp
+  unit/test_shader_container.cpp
+  ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader_container.cpp
   unit/test_strings.cpp
   unit/test_vfs.cpp
   unit/test_xml.cpp)
@@ -48,8 +50,8 @@ set_target_properties(sample_package_lib PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${HOLY_SAMPLE_DIR}"
   PDB_OUTPUT_DIRECTORY "${HOLY_SAMPLE_DIR}")
 
-add_executable(sample_title WIN32 sample_title/checks.h sample_title/graphics_checks.cpp sample_title/main.cpp
-  sample_title/runtime_checks.cpp)
+add_executable(sample_title WIN32 sample_title/alloc_hooks.cpp sample_title/checks.h sample_title/graphics_checks.cpp
+  sample_title/graphics_resource_checks.cpp sample_title/main.cpp sample_title/runtime_checks.cpp)
 holy_target_defaults(sample_title)
 target_link_libraries(sample_title PRIVATE holy_lib_xmem holy_lib_xcrdapi holy_lib_d3d12_xs sample_stub_lifecycle sample_stub_missing
   sample_stub_gameinput sample_package_lib advapi32 ws2_32)

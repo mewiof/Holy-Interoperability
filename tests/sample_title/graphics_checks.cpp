@@ -73,4 +73,5 @@ void test_graphics() {
             list,
         "the device creates a command list");
   check(list && call<HRESULT>(list, 9) == S_OK, "a new command list closes");
+  test_graphics_resources(device);
 }

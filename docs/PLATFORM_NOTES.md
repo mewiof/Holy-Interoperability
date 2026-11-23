@@ -42,11 +42,17 @@ Notes describe the platform, never a title.
 
 ## Memory (`xmem.dll`)
 
-- *assumed*: `XMemAlloc(size, attributes)` returns a pointer and `XMemFree(address, attributes)` releases
-  it, with a 64-bit `attributes` word that packs object type (bits 0–13), page size (14–15), allocator id
-  (16–23), log2 alignment (24–28) and memory type (29–32). This follows public documentation of the previous
-  console generation and has not yet been confirmed against calls from a title; the first allocations are
-  logged at debug level so it can be.
+- *observed*: `XMemAlloc(size, attributes)` returns a pointer and `XMemFree(address, attributes)` releases
+  it. The 64-bit `attributes` word packs object type (bits 0–13), page size (14–15), allocator id (16–23),
+  log2 alignment (24–28) and memory type (29–32): titles' own allocation hooks test exactly the object-type,
+  page-size and allocator-id fields.
+- *observed*: a title may export `__XMemAllocationHooks__`, a table whose first two entries are an allocation
+  function with `XMemAlloc`'s signature and a release function with `XMemFree`'s. Every `XMemAlloc`/`XMemFree`
+  goes to them; they chain to `XMemAllocDefault`/`XMemFreeDefault`. Titles register callbacks in them per
+  allocator id and thread to place system allocations at addresses of their choosing.
+- *documented* flags also seen in `XMemVirtualAlloc`: `MEM_RESERVE_PLACEHOLDER` (titles reserve placeholder
+  regions) and `MEM_REPLACE_PLACEHOLDER` (titles replace parts of them with committed or reserved memory);
+  protection may carry every `PAGE_GRAPHICS_*` bit, `PAGE_GRAPHICS_NOCACHE` included.
 - *observed*: `XMemVirtualAlloc(address, size, allocation_type, allocator_id, protect)` returns a pointer and
   null on failure, which titles treat as fatal during start-up.
 - *documented*: the page-size bits in `allocation_type` are the ones the public `winnt.h` names
@@ -71,10 +77,13 @@ Notes describe the platform, never a title.
   flags.
 - *observed*: `XMemTransferMemory(uint32_t, size_t bytes)` is called with sizes rounded to 2 MiB and capped at
   16 MiB; the result is not acted on (*assumed* `HRESULT`).
-- Implementation: each physical allocation is a pagefile-backed section reserved without commit; page ids
-  are opaque. Mapping turns the target reservation into a placeholder reservation (once, while it has no
-  committed memory) and maps 64 KiB views of the section into it, so a page mapped at two addresses is the
-  same memory. Pages are committed when first mapped, or on first touch when the host is short of commit.
+- Implementation: page ids are opaque. A page gets its storage when first mapped: a 64 KiB slice of a
+  committed pagefile-backed section laid out like the region it is mapped into (one section per chunk of up to
+  1 GiB), at the offset of the granule. Pages a title maps side by side are therefore contiguous in one section,
+  which lets the graphics library open one GPU heap over them. Mapping replaces 64 KiB placeholders with views
+  of the slices, so a page mapped at two addresses is the same memory; private reservations titles carved out of
+  a placeholder become placeholders again when pages are mapped into them. Without enough commit charge,
+  sections are reserved and pages committed when mapped or touched.
   `XMemTransferMemory` has nothing to move between partitions on a host and succeeds.
 - Open: `XMemVirtualQuery`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable` signatures.
 
@@ -107,9 +116,46 @@ Notes describe the platform, never a title.
 - *observed*: titles query the device for `IDXGIDevice` and walk adapter and output through it; the console
   output's display-mode query is at slot 21 and fills 32-byte entries, which is not the desktop
   `IDXGIOutput` order.
-- Implementation: device creation on the host's Direct3D 12, the device slots above, queues, fences and
-  allocators (fences and allocators forward to host objects), and command-list creation and `Close`. Every
-  other slot, and any interface query other than the device's own, reports itself.
+- *observed*: the interface methods use the C calling convention: structures of up to eight bytes (descriptor
+  handles) come back in `rax`, larger ones through a result pointer passed before the object.
+- *observed*: titles reach `IDXGIDevice` through the device, then `GetAdapter` (slot 7), `EnumOutputs`
+  (adapter slot 7) and a display-mode query at output slot 21, `(format, flags, count*, modes*)` with 32-byte
+  entries in the `DXGI_MODE_DESC1` layout; titles pick 120 Hz when a mode has it.
+- *observed*: frame pacing as in public sample code: device slot 78 `SetFrameIntervalX(output, length_us,
+  period, flags)`, slot 79 `ScheduleFrameEventX(type, offset_us, output, flags)`.
+- *observed*: device slots 14 `CreateDescriptorHeap`, 15 `GetDescriptorHandleIncrementSize`, 16
+  `CreateRootSignature`, 17–24 the desktop view creation and descriptor copy methods, and 25
+  `GetResourceAllocationInfo` keep the desktop meanings. A descriptor heap's CPU memory comes from `XMemAlloc`
+  with object type 4 and allocator id 0x80: titles place it with an allocation hook and require the heap's CPU
+  start to be their address. Titles ask for shader-visible heaps of 1,245,184 descriptors.
+- *observed*: slot 70 makes a shader-resource view from a `D3D12_RESOURCE_DESC` and a
+  `D3D12_SHADER_RESOURCE_VIEW_DESC` followed by the resource's GPU address, into a destination descriptor;
+  titles flush the destination's cache lines afterwards.
+- *observed*: slot 127 has the shape of the desktop `CreateCommittedResource3` (heap properties, heap flags,
+  description, initial state, clear value, protected session, castable formats). Titles create their display
+  buffers with it (`ALLOW_DISPLAY`) inside an allocation hook that serves allocator id 0x80 with 64 KiB pages
+  from an arena sized for those buffers, and then require the arena to be used up: the console runtime takes a
+  committed resource's memory from `XMemAlloc`.
+- *observed*: slot 133 `CreatePlacedResourceX(gpu_address, desc, state, clear, riid, out)` places a resource
+  at an address in memory the title allocated; resource descriptions may carry flag bits above the desktop's
+  (0x20000, 0x100000, 0x200000), and root signatures flag bits 0x1000000 and 0x2000000.
+- *observed*: slot 62 creates compute pipelines from a `D3D12_COMPUTE_PIPELINE_STATE_DESC`, two null pointers,
+  the interface id and the out pointer.
+- *assumed*: command-list slots 131 and 132 program GPU state by register offset, value and mask; they are
+  recorded and not applied, since the host driver owns its GPU's state.
+- Implementation:
+  - GPU addresses are title addresses, as on the console. Each piece of title memory resources are placed in
+    gets a host heap opened over the same memory (from the physical-page section, or from the committed
+    address) and a buffer spanning it; title GPU addresses translate into it, placed buffers are placed in it,
+    and a placed buffer's `Map` yields the title's memory.
+  - Descriptor heaps take their CPU memory from `XMemAlloc` as above; title CPU handles translate to host heaps
+    by offset. Shader-visible heaps above the host's limit of 1,000,000 descriptors are created at the limit
+    (partial: descriptors past it are refused).
+  - Committed resources are host committed resources; the matching `XMemAlloc` is made so titles' accounting
+    holds.
+  - Root signature flag bits above the desktop's are dropped. Compute pipelines whose shaders keep their DXIL
+    run from a rebuilt desktop container; shaders with only native GPU code report themselves.
+  - Every other slot, and any interface query other than the device's own and `IDXGIDevice`, reports itself.
 
 ## Game runtime (`xgameruntime.dll`)
 
@@ -230,11 +276,16 @@ Notes describe the platform, never a title.
 
 ## Graphics shaders
 
-- *observed*: shader containers in titles are DXBC-style containers whose `DXIL` part carries no LLVM bitcode
-  (a `NOBC` marker) but a console block (`XDAT`, with a zlib-compressed `FSSM` payload). The payload holds the
-  console GPU's native machine code (RDNA-family instruction encodings: `s_waitcnt`, exports, `s_endpgm`,
-  `s_code_end` padding) plus metadata. Titles therefore ship no portable shader code; running their shaders on
-  a host GPU requires translating that machine code.
+- *observed*: console shader containers have the desktop container layout, but their `DXIL` part holds a
+  console block (`XDAT`) with a zlib-compressed `FSSM` payload: the console GPU's native machine code
+  (RDNA-family instruction encodings: `s_waitcnt`, exports, `s_endpgm`, `s_code_end` padding) and metadata.
+  Inside the block sits a DXIL program header followed either by LLVM bitcode (shaders in some packaged
+  libraries) or by a 4-byte `NOBC` marker (titles' own shaders).
+- *documented*: the container digest is the DXBC checksum (MD5 with a modified final block); the
+  implementation reproduces console containers' digests byte for byte and the host compiler's.
+- Implementation: containers with bitcode are rebuilt as desktop containers (plain DXIL program, desktop parts
+  kept, `RTS0` flags masked, digest recomputed) and run on the host; one such packaged compute shader is
+  refused by the host driver. Shaders with only native code need translation, which is not implemented yet.
 - *observed*: titles do not write GPU command packets themselves; draws and dispatches go through the
   console D3D12 interfaces.
 

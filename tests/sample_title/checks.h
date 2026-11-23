@@ -8,3 +8,4 @@ extern bool g_expect_online;
 
 void test_game_runtime();
 void test_graphics();
+void test_graphics_resources(void* device);

@@ -80,7 +80,11 @@ void test_descriptor_heap(void* device) {
   const uint64_t cpu = call<uint64_t>(heap, 9);
   check(cpu == reinterpret_cast<uint64_t>(preset),
         "a descriptor heap's memory comes from XMemAlloc, object type 4, allocator 0x80");
-  check(call<uint64_t>(heap, 10) != 0, "a shader-visible heap has a GPU start");
+  const uint64_t gpu = call<uint64_t>(heap, 10);
+  check(gpu != 0 && gpu + static_cast<uint64_t>(kCount) * increment <= 0x100000000ull,
+        "a shader-visible heap's GPU range lies below 4 GiB, as native code addresses it");
+  check(increment == 32 && call<UINT>(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) == 16,
+        "resource descriptors take 32 bytes and samplers 16, as native code indexes them");
   D3D12_DESCRIPTOR_HEAP_DESC back{};
   using DescFn = D3D12_DESCRIPTOR_HEAP_DESC*(STDMETHODCALLTYPE*)(D3D12_DESCRIPTOR_HEAP_DESC*, void*);
   reinterpret_cast<DescFn>((*static_cast<void***>(heap))[8])(&back, heap);

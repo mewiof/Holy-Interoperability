@@ -6,6 +6,7 @@
 
 #include <atomic>
 
+#include "core/libs/d3d12_xs/bindings.h"
 #include "core/libs/vtable.h"
 
 
@@ -55,6 +56,10 @@ struct CommandList {
   ID3D12GraphicsCommandList7* host7 = nullptr;  // enhanced barriers (null if the host has none)
   D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
   DescriptorHeap* heaps[2] = {};  // bound shader-visible heaps: CBV/SRV/UAV, sampler
+  RootBinding graphics, compute;
+  const void* pipeline = nullptr;  // the title's current pipeline (a Wrapper)
+  bool translated = false;         // it runs translated native code
+  D3D12_VERTEX_BUFFER_VIEW vertex_buffers[16] = {};  // title addresses
 };
 
 struct Resource {

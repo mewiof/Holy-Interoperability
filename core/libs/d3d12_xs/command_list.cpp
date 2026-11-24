@@ -16,10 +16,12 @@
 #include <string>
 #include <vector>
 
+#include "core/libs/d3d12_xs/bindings.h"
 #include "core/libs/d3d12_xs/descriptors.h"
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
+#include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/support.h"
 
 namespace holy::d3d12 {
@@ -61,6 +63,11 @@ HRESULT STDMETHODCALLTYPE list_reset_x(CommandList* self, void* allocator, void*
     return E_NOTIMPL;
   }
   self->heaps[0] = self->heaps[1] = nullptr;
+  self->graphics = RootBinding{};
+  self->compute = RootBinding{};
+  self->pipeline = nullptr;
+  self->translated = false;
+  std::memset(self->vertex_buffers, 0, sizeof(self->vertex_buffers));
   const HRESULT hr = self->host->Reset(host_allocator, nullptr);
   LIB_LOG(FAILED(hr) ? lib::kError : lib::kTrace, "d3d12", "list %p reset with allocator %p -> 0x%08lX",
           static_cast<void*>(self), allocator, static_cast<unsigned long>(hr));
@@ -280,13 +287,308 @@ void STDMETHODCALLTYPE list_hardware_state(CommandList*, uint32_t a, uint32_t b,
           static_cast<unsigned long long>(mask));
 }
 
+// --- pipeline state, root arguments, draws and dispatches ----------------------------
+//
+// Observed: slots 0-25 keep the desktop order (12 DrawInstanced, 13
+// DrawIndexedInstanced, 14 Dispatch, 20-25 topology, viewports, scissors,
+// blend factor, stencil reference, pipeline state); from desktop slot 28
+// (SetDescriptorHeaps) to 48 (ClearRenderTargetView) the slots are the
+// desktop's plus four (33-46 root signatures and arguments, 47 index buffer,
+// 48 vertex buffers, 50 render targets, 51 depth-stencil clears), and
+// OMSetDepthBounds (desktop 62) is slot 70.
+
+bool is_translated(const void* pipeline) {
+  return pipeline && (static_cast<const Wrapper*>(pipeline)->flags & kTranslatedPipeline) != 0;
+}
+
+void STDMETHODCALLTYPE list_set_pipeline_state(CommandList* self, void* pipeline) {
+  self->pipeline = pipeline;
+  self->translated = is_translated(pipeline);
+  if (auto* host = pipeline_host(pipeline)) {
+    self->host->SetPipelineState(host);
+  } else if (pipeline) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) LIB_LOG(lib::kError, "d3d12", "pipeline %p has no host pipeline; its draws are dropped", pipeline);
+    self->pipeline = nullptr;
+    self->translated = false;
+  }
+}
+
+void set_root_signature(CommandList* self, bool compute, void* signature) {
+  RootBinding& binding = compute ? self->compute : self->graphics;
+  if (binding.signature != signature) {
+    std::memset(binding.packed, 0, sizeof(binding.packed));
+    std::memset(binding.values, 0, sizeof(binding.values));
+  }
+  binding.signature = signature;
+  binding.host_is_title = false;
+  bind_title_root(self, compute);
+}
+void STDMETHODCALLTYPE list_set_compute_root_signature(CommandList* self, void* signature) {
+  set_root_signature(self, true, signature);
+}
+void STDMETHODCALLTYPE list_set_graphics_root_signature(CommandList* self, void* signature) {
+  set_root_signature(self, false, signature);
+}
+
+// Records a root argument and, while the title's root signature is bound on
+// the host, sets it there too.
+const RootParameterLayout* parameter(CommandList* self, bool compute, UINT index) {
+  const RootBinding& binding = compute ? self->compute : self->graphics;
+  const RootLayout* layout = root_layout(binding.signature);
+  if (!layout || index >= layout->parameters.size() || index >= 64) {
+    LIB_LOG(lib::kError, "d3d12", "root argument %u for a root signature without it", index);
+    return nullptr;
+  }
+  return &layout->parameters[index];
+}
+
+void set_table(CommandList* self, bool compute, UINT index, uint64_t handle) {
+  if (!parameter(self, compute, index)) return;
+  RootBinding& binding = compute ? self->compute : self->graphics;
+  binding.values[index] = handle;
+  binding.packed[root_layout(binding.signature)->parameters[index].offset] = static_cast<uint32_t>(handle);
+  if (!binding.host_is_title) return;
+  const D3D12_GPU_DESCRIPTOR_HANDLE host = host_gpu_handle(handle);
+  if (!host.ptr) return;
+  compute ? self->host->SetComputeRootDescriptorTable(index, host) : self->host->SetGraphicsRootDescriptorTable(index, host);
+}
+void STDMETHODCALLTYPE list_set_compute_root_table(CommandList* self, UINT index, uint64_t handle) {
+  set_table(self, true, index, handle);
+}
+void STDMETHODCALLTYPE list_set_graphics_root_table(CommandList* self, UINT index, uint64_t handle) {
+  set_table(self, false, index, handle);
+}
+
+void set_constants(CommandList* self, bool compute, UINT index, UINT count, const void* values, UINT first) {
+  const RootParameterLayout* p = parameter(self, compute, index);
+  if (!p || first + count > p->dwords) return;
+  RootBinding& binding = compute ? self->compute : self->graphics;
+  std::memcpy(binding.packed + p->offset + first, values, 4ull * count);
+  if (!binding.host_is_title) return;
+  compute ? self->host->SetComputeRoot32BitConstants(index, count, values, first)
+          : self->host->SetGraphicsRoot32BitConstants(index, count, values, first);
+}
+void STDMETHODCALLTYPE list_set_compute_root_constant(CommandList* self, UINT index, UINT value, UINT first) {
+  set_constants(self, true, index, 1, &value, first);
+}
+void STDMETHODCALLTYPE list_set_graphics_root_constant(CommandList* self, UINT index, UINT value, UINT first) {
+  set_constants(self, false, index, 1, &value, first);
+}
+void STDMETHODCALLTYPE list_set_compute_root_constants(CommandList* self, UINT index, UINT count, const void* values,
+                                                       UINT first) {
+  set_constants(self, true, index, count, values, first);
+}
+void STDMETHODCALLTYPE list_set_graphics_root_constants(CommandList* self, UINT index, UINT count, const void* values,
+                                                        UINT first) {
+  set_constants(self, false, index, count, values, first);
+}
+
+void set_view(CommandList* self, bool compute, UINT index, uint64_t address, D3D12_ROOT_PARAMETER_TYPE type) {
+  const RootParameterLayout* p = parameter(self, compute, index);
+  if (!p) return;
+  RootBinding& binding = compute ? self->compute : self->graphics;
+  binding.values[index] = address;
+  binding.packed[p->offset] = static_cast<uint32_t>(address);
+  binding.packed[p->offset + 1] = static_cast<uint32_t>(address >> 32);
+  if (!binding.host_is_title) return;
+  const uint64_t host = translate_gpu_va(self->device, address);
+  if (!host && address) {
+    LIB_LOG(lib::kError, "d3d12", "root view at %p lies in no GPU memory", reinterpret_cast<void*>(address));
+    return;
+  }
+  ID3D12GraphicsCommandList* l = self->host;
+  if (type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+    compute ? l->SetComputeRootConstantBufferView(index, host) : l->SetGraphicsRootConstantBufferView(index, host);
+  } else if (type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+    compute ? l->SetComputeRootShaderResourceView(index, host) : l->SetGraphicsRootShaderResourceView(index, host);
+  } else {
+    compute ? l->SetComputeRootUnorderedAccessView(index, host) : l->SetGraphicsRootUnorderedAccessView(index, host);
+  }
+}
+void STDMETHODCALLTYPE list_set_compute_root_cbv(CommandList* self, UINT index, uint64_t address) {
+  set_view(self, true, index, address, D3D12_ROOT_PARAMETER_TYPE_CBV);
+}
+void STDMETHODCALLTYPE list_set_graphics_root_cbv(CommandList* self, UINT index, uint64_t address) {
+  set_view(self, false, index, address, D3D12_ROOT_PARAMETER_TYPE_CBV);
+}
+void STDMETHODCALLTYPE list_set_compute_root_srv(CommandList* self, UINT index, uint64_t address) {
+  set_view(self, true, index, address, D3D12_ROOT_PARAMETER_TYPE_SRV);
+}
+void STDMETHODCALLTYPE list_set_graphics_root_srv(CommandList* self, UINT index, uint64_t address) {
+  set_view(self, false, index, address, D3D12_ROOT_PARAMETER_TYPE_SRV);
+}
+void STDMETHODCALLTYPE list_set_compute_root_uav(CommandList* self, UINT index, uint64_t address) {
+  set_view(self, true, index, address, D3D12_ROOT_PARAMETER_TYPE_UAV);
+}
+void STDMETHODCALLTYPE list_set_graphics_root_uav(CommandList* self, UINT index, uint64_t address) {
+  set_view(self, false, index, address, D3D12_ROOT_PARAMETER_TYPE_UAV);
+}
+
+void STDMETHODCALLTYPE list_set_index_buffer(CommandList* self, const D3D12_INDEX_BUFFER_VIEW* view) {
+  if (!view) {
+    self->host->IASetIndexBuffer(nullptr);
+    return;
+  }
+  D3D12_INDEX_BUFFER_VIEW host = *view;
+  host.BufferLocation = translate_gpu_va(self->device, view->BufferLocation);
+  if (!host.BufferLocation && view->BufferLocation) {
+    LIB_LOG(lib::kError, "d3d12", "index buffer at %p lies in no GPU memory", reinterpret_cast<void*>(view->BufferLocation));
+    return;
+  }
+  self->host->IASetIndexBuffer(&host);
+}
+
+void STDMETHODCALLTYPE list_set_vertex_buffers(CommandList* self, UINT first, UINT count,
+                                               const D3D12_VERTEX_BUFFER_VIEW* views) {
+  D3D12_VERTEX_BUFFER_VIEW host[16] = {};
+  UINT n = 0;
+  for (UINT i = 0; i < count && first + i < 16; ++i, ++n) {
+    self->vertex_buffers[first + i] = views ? views[i] : D3D12_VERTEX_BUFFER_VIEW{};
+    host[i] = self->vertex_buffers[first + i];
+    host[i].BufferLocation = translate_gpu_va(self->device, host[i].BufferLocation);
+  }
+  self->host->IASetVertexBuffers(first, n, views ? host : nullptr);
+}
+
+void STDMETHODCALLTYPE list_set_render_targets(CommandList* self, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
+                                               BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* depth) {
+  D3D12_CPU_DESCRIPTOR_HANDLE host[8] = {};
+  const UINT n = count > 8 ? 8 : count;
+  for (UINT i = 0; i < n && targets; ++i) {
+    host[i] = host_cpu_handle(targets[single ? 0 : i].ptr);
+    if (single) break;
+  }
+  D3D12_CPU_DESCRIPTOR_HANDLE host_depth{};
+  if (depth) host_depth = host_cpu_handle(depth->ptr);
+  self->host->OMSetRenderTargets(n, targets ? host : nullptr, single, depth ? &host_depth : nullptr);
+}
+
+void STDMETHODCALLTYPE list_clear_depth_stencil_view(CommandList* self, SIZE_T handle, D3D12_CLEAR_FLAGS flags,
+                                                     FLOAT depth, UINT8 stencil, UINT rect_count,
+                                                     const D3D12_RECT* rects) {
+  const D3D12_CPU_DESCRIPTOR_HANDLE host = host_cpu_handle(handle);
+  if (!host.ptr) return;
+  self->host->ClearDepthStencilView(host, flags, depth, stencil, rect_count, rects);
+}
+
+void STDMETHODCALLTYPE list_set_viewports(CommandList* self, UINT count, const D3D12_VIEWPORT* viewports) {
+  self->host->RSSetViewports(count, viewports);
+}
+void STDMETHODCALLTYPE list_set_scissors(CommandList* self, UINT count, const D3D12_RECT* rects) {
+  self->host->RSSetScissorRects(count, rects);
+}
+void STDMETHODCALLTYPE list_set_blend_factor(CommandList* self, const FLOAT* factor) {
+  self->host->OMSetBlendFactor(factor);
+}
+void STDMETHODCALLTYPE list_set_stencil_ref(CommandList* self, UINT reference) {
+  self->host->OMSetStencilRef(reference);
+}
+void STDMETHODCALLTYPE list_set_depth_bounds(CommandList* self, FLOAT min, FLOAT max) {
+  ID3D12GraphicsCommandList1* list1 = nullptr;
+  if (SUCCEEDED(self->host->QueryInterface(IID_PPV_ARGS(&list1)))) {
+    list1->OMSetDepthBounds(min, max);
+    list1->Release();
+  }
+}
+
+// Observed: slot 142 is called with all ones before draws, a 64-bit mask.
+// Assumed: the sample mask. The host's is part of the pipeline; masks other
+// than all samples report themselves.
+void STDMETHODCALLTYPE list_set_sample_mask(CommandList*, uint64_t mask) {
+  if (mask == UINT64_MAX || (mask & 0xFFFFFFFFu) == 0xFFFFFFFFu) return;
+  LIB_LOG(lib::kError, "d3d12", "sample mask 0x%llx", static_cast<unsigned long long>(mask));
+  HolyUnimplementedFrom(kLibrary, "a dynamic sample mask (command list slot 142)", _ReturnAddress());
+}
+
+// Observed: slot 75 takes one byte, which titles derive from bit 6 of a
+// pipeline property byte and set only when it changes. Its meaning is not
+// established; the call is recorded and not applied.
+void STDMETHODCALLTYPE list_set_unknown_75(CommandList*, uint32_t value) {
+  static std::atomic<int> logged{0};
+  if ((value & 0xFF) && logged.fetch_add(1) < 4) {
+    LIB_LOG(lib::kWarn, "d3d12", "command list slot 75 with %u (not applied: meaning not established)", value & 0xFF);
+  }
+}
+
+void report_unbound(const char* what) {
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 8) LIB_LOG(lib::kError, "d3d12", "%s with a translated pipeline could not be bound", what);
+}
+
+void STDMETHODCALLTYPE list_draw_instanced(CommandList* self, UINT vertices, UINT instances, UINT first_vertex,
+                                           UINT first_instance) {
+  if (!self->pipeline) return;  // no host pipeline (reported when it was set)
+  if (self->translated) {
+    // The host's vertex index already includes the first vertex.
+    if (!bind_translated_graphics(self, 0, first_instance)) return report_unbound("a draw");
+  } else {
+    bind_title_root(self, false);
+  }
+  self->host->DrawInstanced(vertices, instances, first_vertex, first_instance);
+}
+
+void STDMETHODCALLTYPE list_draw_indexed_instanced(CommandList* self, UINT indices, UINT instances, UINT first_index,
+                                                   INT base_vertex, UINT first_instance) {
+  if (!self->pipeline) return;  // no host pipeline (reported when it was set)
+  if (self->translated) {
+    // The host's vertex index is the index; native code adds the base vertex.
+    if (!bind_translated_graphics(self, static_cast<uint32_t>(base_vertex), first_instance)) {
+      return report_unbound("an indexed draw");
+    }
+    self->host->DrawIndexedInstanced(indices, instances, first_index, 0, first_instance);
+    return;
+  }
+  bind_title_root(self, false);
+  self->host->DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+}
+
+void STDMETHODCALLTYPE list_dispatch(CommandList* self, UINT x, UINT y, UINT z) {
+  if (!self->pipeline) return;  // no host pipeline (reported when it was set)
+  if (self->translated) {
+    if (!bind_translated_compute(self)) return report_unbound("a dispatch");
+  } else {
+    bind_title_root(self, true);
+  }
+  self->host->Dispatch(x, y, z);
+}
+
 const auto kListVtable = [] {
   auto table = lib::make_reporting_vtable<kCommandListSlots>();
   table[0] = reinterpret_cast<void*>(&list_query_interface);
   table[1] = reinterpret_cast<void*>(&list_add_ref);
   table[2] = reinterpret_cast<void*>(&list_release);
   table[9] = reinterpret_cast<void*>(&list_close);
+  table[12] = reinterpret_cast<void*>(&list_draw_instanced);
+  table[13] = reinterpret_cast<void*>(&list_draw_indexed_instanced);
+  table[14] = reinterpret_cast<void*>(&list_dispatch);
   table[20] = reinterpret_cast<void*>(&list_set_primitive_topology);
+  table[21] = reinterpret_cast<void*>(&list_set_viewports);
+  table[22] = reinterpret_cast<void*>(&list_set_scissors);
+  table[23] = reinterpret_cast<void*>(&list_set_blend_factor);
+  table[24] = reinterpret_cast<void*>(&list_set_stencil_ref);
+  table[25] = reinterpret_cast<void*>(&list_set_pipeline_state);
+  table[33] = reinterpret_cast<void*>(&list_set_compute_root_signature);
+  table[34] = reinterpret_cast<void*>(&list_set_graphics_root_signature);
+  table[35] = reinterpret_cast<void*>(&list_set_compute_root_table);
+  table[36] = reinterpret_cast<void*>(&list_set_graphics_root_table);
+  table[37] = reinterpret_cast<void*>(&list_set_compute_root_constant);
+  table[38] = reinterpret_cast<void*>(&list_set_graphics_root_constant);
+  table[39] = reinterpret_cast<void*>(&list_set_compute_root_constants);
+  table[40] = reinterpret_cast<void*>(&list_set_graphics_root_constants);
+  table[41] = reinterpret_cast<void*>(&list_set_compute_root_cbv);
+  table[42] = reinterpret_cast<void*>(&list_set_graphics_root_cbv);
+  table[43] = reinterpret_cast<void*>(&list_set_compute_root_srv);
+  table[44] = reinterpret_cast<void*>(&list_set_graphics_root_srv);
+  table[45] = reinterpret_cast<void*>(&list_set_compute_root_uav);
+  table[46] = reinterpret_cast<void*>(&list_set_graphics_root_uav);
+  table[47] = reinterpret_cast<void*>(&list_set_index_buffer);
+  table[48] = reinterpret_cast<void*>(&list_set_vertex_buffers);
+  table[50] = reinterpret_cast<void*>(&list_set_render_targets);
+  table[51] = reinterpret_cast<void*>(&list_clear_depth_stencil_view);
+  table[70] = reinterpret_cast<void*>(&list_set_depth_bounds);
+  table[75] = reinterpret_cast<void*>(&list_set_unknown_75);
+  table[142] = reinterpret_cast<void*>(&list_set_sample_mask);
   table[32] = reinterpret_cast<void*>(&list_set_descriptor_heaps);
   table[52] = reinterpret_cast<void*>(&list_clear_render_target_view);
   table[71] = reinterpret_cast<void*>(&list_write_value_x);

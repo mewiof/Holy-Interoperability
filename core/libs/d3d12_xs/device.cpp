@@ -255,7 +255,7 @@ UINT STDMETHODCALLTYPE get_descriptor_handle_increment_size(Device*, D3D12_DESCR
   if (static_cast<uint32_t>(type) >= D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES) {
     LIB_LOG(lib::kDebug, "d3d12", "descriptor increment for heap type %u", static_cast<unsigned>(type));
   }
-  return kTitleDescriptorBytes;
+  return title_descriptor_bytes(type);
 }
 
 HRESULT STDMETHODCALLTYPE create_placed_resource(Device* self, D3D12_GPU_VIRTUAL_ADDRESS address,
@@ -401,10 +401,12 @@ HRESULT STDMETHODCALLTYPE create_root_signature(Device* self, UINT, const void* 
     report_device_removal(self);
     return hr;
   }
+  Wrapper* wrapper = wrap(host, &kRootSignatureInfo, kRootSignatureVtable.data());
   ID3D12VersionedRootSignatureDeserializer* reader = nullptr;
   if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&reader)))) {
     const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
     if (SUCCEEDED(reader->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc) {
+      register_root_layout(wrapper, desc->Desc_1_1);
       std::string text;
       for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
         const D3D12_ROOT_PARAMETER1& p = desc->Desc_1_1.pParameters[i];
@@ -429,7 +431,7 @@ HRESULT STDMETHODCALLTYPE create_root_signature(Device* self, UINT, const void* 
     }
     reader->Release();
   }
-  *signature = wrap(host, &kRootSignatureInfo, kRootSignatureVtable.data());
+  *signature = wrapper;
   return S_OK;
 }
 
@@ -582,9 +584,37 @@ HRESULT STDMETHODCALLTYPE create_command_signature(Device* self, const D3D12_COM
 
 const lib::VtableInfo kPipelineInfo{kLibrary, "ID3D12PipelineStateX"};
 
+// Pipelines keep the desktop ID3D12PipelineState order; their methods wait
+// for the host object, which is compiled in the background (pipeline_stream.h).
+HRESULT STDMETHODCALLTYPE pipeline_get_private_data(Wrapper* self, REFGUID guid, UINT* size, void* data) {
+  ID3D12PipelineState* host = pipeline_host(self);
+  return host ? host->GetPrivateData(guid, size, data) : E_FAIL;
+}
+HRESULT STDMETHODCALLTYPE pipeline_set_private_data(Wrapper* self, REFGUID guid, UINT size, const void* data) {
+  ID3D12PipelineState* host = pipeline_host(self);
+  return host ? host->SetPrivateData(guid, size, data) : E_FAIL;
+}
+HRESULT STDMETHODCALLTYPE pipeline_set_private_data_interface(Wrapper* self, REFGUID guid, const IUnknown* data) {
+  ID3D12PipelineState* host = pipeline_host(self);
+  return host ? host->SetPrivateDataInterface(guid, data) : E_FAIL;
+}
+HRESULT STDMETHODCALLTYPE pipeline_set_name(Wrapper* self, LPCWSTR name) {
+  ID3D12PipelineState* host = pipeline_host(self);
+  return host ? host->SetName(name) : E_FAIL;
+}
+HRESULT STDMETHODCALLTYPE pipeline_get_cached_blob(Wrapper* self, ID3DBlob** blob) {
+  ID3D12PipelineState* host = pipeline_host(self);
+  return host ? host->GetCachedBlob(blob) : E_FAIL;
+}
+
 const auto kPipelineVtable = [] {
-  auto table = make_forwarding_vtable(9);
+  auto table = make_forwarding_vtable(3);
+  table[3] = reinterpret_cast<void*>(&pipeline_get_private_data);
+  table[4] = reinterpret_cast<void*>(&pipeline_set_private_data);
+  table[5] = reinterpret_cast<void*>(&pipeline_set_private_data_interface);
+  table[6] = reinterpret_cast<void*>(&pipeline_set_name);
   table[7] = reinterpret_cast<void*>(&get_device_of_child);
+  table[8] = reinterpret_cast<void*>(&pipeline_get_cached_blob);
   return table;
 }();
 

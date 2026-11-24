@@ -1,0 +1,49 @@
+// Root arguments, and how translated pipelines receive them (bindings.cpp).
+#pragma once
+
+#include <d3d12.h>
+
+#include <cstdint>
+#include <vector>
+
+namespace holy::d3d12 {
+
+struct CommandList;
+
+// A title root signature's parameters as the console passes them to native
+// code: packed in parameter order, a descriptor table as one dword (its
+// 32-bit GPU address), constants as their values, a root view as two dwords
+// (its 64-bit address).
+struct RootParameterLayout {
+  D3D12_ROOT_PARAMETER_TYPE type;
+  uint32_t offset;       // in the packed dwords
+  uint32_t dwords;
+  uint32_t descriptors;  // tables: descriptors in its ranges (unbounded ones counted as 64)
+};
+struct RootLayout {
+  std::vector<RootParameterLayout> parameters;
+  uint32_t dwords = 0;
+};
+
+void register_root_layout(const void* signature, const D3D12_ROOT_SIGNATURE_DESC1& desc);
+const RootLayout* root_layout(const void* signature);
+
+// Per list and pipeline kind (graphics, compute): the title's root signature
+// and the arguments set for it.
+struct RootBinding {
+  const void* signature = nullptr;  // title wrapper
+  uint32_t packed[64] = {};
+  uint64_t values[64] = {};  // per parameter: table GPU handle or view address (title)
+  bool host_is_title = false;  // the host list has the title's root signature bound
+};
+
+// Binds what a translated pipeline reads (user SGPRs, region table, images
+// and samplers) for the next draw or dispatch. False (logged) if it cannot.
+bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t start_instance);
+bool bind_translated_compute(CommandList* list);
+
+// Re-binds the title's root signature and arguments on the host list after a
+// translated pipeline replaced them.
+void bind_title_root(CommandList* list, bool compute);
+
+}  // namespace holy::d3d12

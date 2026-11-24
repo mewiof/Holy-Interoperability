@@ -48,7 +48,7 @@ ULONG STDMETHODCALLTYPE wrapper_add_ref(Wrapper* self) {
 ULONG STDMETHODCALLTYPE wrapper_release(Wrapper* self) {
   const long left = self->refs.fetch_sub(1) - 1;
   if (left == 0) {
-    self->host->Release();
+    if (self->host) self->host->Release();
     delete self;
   }
   return static_cast<ULONG>(left);

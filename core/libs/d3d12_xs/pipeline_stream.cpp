@@ -134,6 +134,23 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
       if (bytecode.pShaderBytecode && bytecode.BytecodeLength) {
         std::vector<uint8_t> rebuilt;
         const ShaderFormat format = rebuild_desktop_container(bytecode.pShaderBytecode, bytecode.BytecodeLength, rebuilt);
+        LIB_LOG(lib::kDebug, "d3d12", "stream shader subobject %u at %p: %016llx (%llu bytes), %s", type,
+                bytecode.pShaderBytecode,
+                static_cast<unsigned long long>(shader_hash(bytecode.pShaderBytecode, bytecode.BytecodeLength)),
+                static_cast<unsigned long long>(bytecode.BytecodeLength),
+                format == ShaderFormat::NativeOnly ? "native only"
+                : format == ShaderFormat::Unknown  ? "unknown"
+                                                   : "desktop program");
+        if (format == ShaderFormat::Unknown) {
+          dump_shader(bytecode.pShaderBytecode, bytecode.BytecodeLength, "stream");
+          const auto* b = static_cast<const uint8_t*>(bytecode.pShaderBytecode);
+          LIB_LOG(lib::kDebug, "d3d12",
+                  "unknown shader at %p (%llu bytes): %02x%02x%02x%02x %02x%02x%02x%02x; 16 bytes before: %02x%02x%02x%02x "
+                  "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+                  bytecode.pShaderBytecode, static_cast<unsigned long long>(bytecode.BytecodeLength), b[0], b[1], b[2],
+                  b[3], b[4], b[5], b[6], b[7], b[-16], b[-15], b[-14], b[-13], b[-12], b[-11], b[-10], b[-9], b[-8],
+                  b[-7], b[-6], b[-5], b[-4], b[-3], b[-2], b[-1]);
+        }
         if (format == ShaderFormat::NativeOnly || format == ShaderFormat::Unknown) {
           native.emplace_back(type, inner);
           at = align_up(inner + layout.size, sizeof(void*));
@@ -165,6 +182,25 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
       NativeProgram program;
       std::string error;
       const bool vertex = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
+      // A shader whose code is not of its subobject's stage, or a shader
+      // subobject that holds no shader container, is refused as the desktop
+      // runtime refuses invalid shader bytecode. Observed: titles create such
+      // pipelines and handle the failure.
+      if (!native_program(bytecode.pShaderBytecode, bytecode.BytecodeLength, &program)) {
+        LIB_LOG(lib::kError, "d3d12", "pipeline stream: subobject %u holds no shader (%016llx, %llu bytes)", type,
+                static_cast<unsigned long long>(shader_hash(bytecode.pShaderBytecode, bytecode.BytecodeLength)),
+                static_cast<unsigned long long>(bytecode.BytecodeLength));
+        return E_INVALIDARG;
+      }
+      GraphicsStage by_code = GraphicsStage::Vertex;
+      if (native_graphics_stage(program.block.data() + program.code_offset, program.block.size() - program.code_offset,
+                                &by_code) &&
+          (by_code == GraphicsStage::Vertex) != vertex) {
+        LIB_LOG(lib::kError, "d3d12", "pipeline stream: the %s subobject holds a %s program (%016llx)",
+                vertex ? "vertex" : "pixel", by_code == GraphicsStage::Vertex ? "vertex" : "pixel",
+                static_cast<unsigned long long>(shader_hash(bytecode.pShaderBytecode, bytecode.BytecodeLength)));
+        return E_INVALIDARG;
+      }
       std::vector<uint8_t>& out = vertex ? vs : ps;
       if (!native_program(bytecode.pShaderBytecode, bytecode.BytecodeLength, &program) ||
           !translate_graphics(program.block.data() + program.code_offset, program.block.size() - program.code_offset,
@@ -282,24 +318,66 @@ bool own_pointers(Recipe* recipe) {
   return ok;
 }
 
+// --- host compilation in the background ---------------------------------------------
+//
+// The host object behind a pipeline is set by its compile job; uses of the
+// pipeline go through pipeline_host, which waits for the job. Jobs run when
+// the pipeline is created. A compile the host refuses is reported; the
+// pipeline then has no host object and its draws are dropped and reported.
+
+struct Compile {
+  Device* device;
+  std::shared_ptr<Recipe> recipe;
+  Wrapper* wrapper;
+  HANDLE done;
+};
+
+std::mutex g_compile_lock;
+std::map<const Wrapper*, HANDLE>& compiles() {
+  static auto* map = new std::map<const Wrapper*, HANDLE>();
+  return *map;
+}
+
+void CALLBACK compile_pipeline(PTP_CALLBACK_INSTANCE, void* context) {
+  auto* job = static_cast<Compile*>(context);
+  ID3D12Device2* device2 = nullptr;
+  ID3D12PipelineState* state = nullptr;
+  HRESULT hr = job->device->host->QueryInterface(IID_PPV_ARGS(&device2));
+  if (SUCCEEDED(hr)) {
+    const D3D12_PIPELINE_STATE_STREAM_DESC host_desc{job->recipe->stream.size(), job->recipe->stream.data()};
+    hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
+    device2->Release();
+  }
+  if (FAILED(hr) || !state) {
+    discard_host_caches_after_run();
+    LIB_LOG(lib::kError, "d3d12", "the host refused pipeline %p (0x%08lX)", static_cast<void*>(job->wrapper),
+            static_cast<unsigned long>(hr));
+  }
+  InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&job->wrapper->host), state);
+  SetEvent(job->done);
+  // The job's reference.
+  reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(Wrapper*)>(job->wrapper->vtable[2])(job->wrapper);
+  delete job;
+}
+
 HRESULT create_from_recipe(Device* device, std::shared_ptr<Recipe> recipe, const lib::VtableInfo* info,
                            void* const* vtable, void** pipeline) {
-  ID3D12Device2* device2 = nullptr;
-  if (FAILED(device->host->QueryInterface(IID_PPV_ARGS(&device2)))) return E_NOINTERFACE;
-  const D3D12_PIPELINE_STATE_STREAM_DESC host_desc{recipe->stream.size(), recipe->stream.data()};
-  ID3D12PipelineState* state = nullptr;
-  const HRESULT hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
-  device2->Release();
-  if (FAILED(hr)) {
-    discard_host_caches_after_run();
-    return hr;
-  }
-  Wrapper* wrapper = wrap(state, info, vtable);
+  Wrapper* wrapper = wrap(nullptr, info, vtable);
   if (recipe->translated) wrapper->flags = kTranslatedPipeline;
+  wrapper->refs.fetch_add(1);  // held by the compile job
+  const HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  {
+    std::lock_guard<std::mutex> guard(g_compile_lock);
+    compiles()[wrapper] = done;
+  }
+  auto* job = new Compile{device, recipe, wrapper, done};
   {
     std::lock_guard<std::mutex> guard(g_recipe_lock);
     recipes()[wrapper] = std::move(recipe);
   }
+  // Compiled here: in the background the compiles competed with the title's
+  // own start-up work for the processor and made start-up slower.
+  compile_pipeline(nullptr, job);
   *pipeline = wrapper;
   return S_OK;
 }
@@ -403,6 +481,25 @@ HRESULT create_derived_pipeline(Device* device, const void* base, uint32_t count
   LIB_LOG(FAILED(hr) ? lib::kError : lib::kDebug, "d3d12", "derived pipeline from %p with %u entries -> 0x%08lX",
           base, count, static_cast<unsigned long>(hr));
   return hr;
+}
+
+ID3D12PipelineState* pipeline_host(const void* pipeline) {
+  if (!pipeline) return nullptr;
+  auto* wrapper = static_cast<const Wrapper*>(pipeline);
+  void* host = InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(const_cast<IUnknown**>(&wrapper->host)),
+                                                 nullptr, nullptr);
+  if (host) return static_cast<ID3D12PipelineState*>(host);
+  HANDLE done = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(g_compile_lock);
+    auto found = compiles().find(wrapper);
+    if (found != compiles().end()) done = found->second;
+  }
+  if (!done) return nullptr;
+  WaitForSingleObject(done, INFINITE);
+  return static_cast<ID3D12PipelineState*>(
+      InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(const_cast<IUnknown**>(&wrapper->host)),
+                                        nullptr, nullptr));
 }
 
 }  // namespace holy::d3d12

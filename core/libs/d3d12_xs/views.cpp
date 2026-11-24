@@ -307,8 +307,8 @@ void STDMETHODCALLTYPE copy_descriptors(Device* self, UINT dest_ranges, const SI
       s_at = 0;
       continue;
     }
-    copy_descriptor_memory(dest_starts[d] + static_cast<uint64_t>(d_at) * kTitleDescriptorBytes,
-                           source_starts[s] + static_cast<uint64_t>(s_at) * kTitleDescriptorBytes, 1);
+    const uint64_t stride = title_descriptor_bytes(type);
+    copy_descriptor_memory(dest_starts[d] + d_at * stride, source_starts[s] + s_at * stride, 1);
     ++d_at;
     ++s_at;
   }

@@ -17,10 +17,10 @@
 // CPU handles are addresses in it, 32 bytes per descriptor whatever the
 // host's increment; each heap is backed by a host heap of the same type and
 // size, and every API call taking a handle translates it to the host heap by
-// index. A shader-visible heap's GPU start, as titles see it, is the same
-// address (console GPU addresses are CPU addresses): GPU handles translate
-// back to the host heap, and translated native code reads the descriptors
-// the view functions write into that memory (descriptor_memory.h).
+// index. A shader-visible heap's GPU start, as titles see it, is an address
+// below 4 GiB (kHeapGpuBase): GPU handles translate back to the host heap,
+// and translated native code reads the descriptors the view functions write
+// into the heap's memory (descriptor_memory.h) at those addresses.
 #include "core/libs/d3d12_xs/descriptors.h"
 
 #include <map>
@@ -49,6 +49,11 @@ std::map<uint64_t, DescriptorHeap*>& heaps_by_end() {
   static auto* storage = new std::map<uint64_t, DescriptorHeap*>();
   return *storage;
 }
+std::map<uint64_t, DescriptorHeap*>& heaps_by_gpu_end() {
+  static auto* storage = new std::map<uint64_t, DescriptorHeap*>();
+  return *storage;
+}
+uint64_t g_next_gpu = kHeapGpuBase;
 
 HRESULT STDMETHODCALLTYPE heap_query_interface(DescriptorHeap* self, REFIID, void** out) {
   if (!out) return E_POINTER;
@@ -65,6 +70,7 @@ ULONG STDMETHODCALLTYPE heap_release(DescriptorHeap* self) {
     {
       std::lock_guard<std::mutex> lock(g_lock);
       heaps_by_end().erase(self->title_cpu + self->title_bytes);
+      if (self->title_gpu) heaps_by_gpu_end().erase(self->title_gpu + self->title_bytes);
     }
     self->host->Release();
     XMemFree(reinterpret_cast<void*>(self->title_cpu), kDescriptorHeapAttributes);
@@ -84,7 +90,7 @@ uint64_t STDMETHODCALLTYPE heap_get_cpu_start(DescriptorHeap* self) {
   return self->title_cpu;
 }
 uint64_t STDMETHODCALLTYPE heap_get_gpu_start(DescriptorHeap* self) {
-  return self->host_gpu ? self->title_cpu : 0;
+  return self->title_gpu;
 }
 
 const auto kHeapVtable = [] {
@@ -119,7 +125,8 @@ HRESULT create_descriptor_heap(Device* device, const D3D12_DESCRIPTOR_HEAP_DESC*
   if (FAILED(hr)) return hr;
 
   const UINT increment = device->host->GetDescriptorHandleIncrementSize(desc->Type);
-  const uint64_t bytes = static_cast<uint64_t>(desc->NumDescriptors) * kTitleDescriptorBytes;
+  const UINT stride = title_descriptor_bytes(desc->Type);
+  const uint64_t bytes = static_cast<uint64_t>(desc->NumDescriptors) * stride;
   void* memory = XMemAlloc(static_cast<SIZE_T>(bytes), kDescriptorHeapAttributes);
   if (!memory) {
     host->Release();
@@ -131,6 +138,7 @@ HRESULT create_descriptor_heap(Device* device, const D3D12_DESCRIPTOR_HEAP_DESC*
   heap->host = host;
   heap->desc = *desc;
   heap->increment = increment;
+  heap->stride = stride;
   heap->host_count = host_desc.NumDescriptors;
   heap->title_cpu = reinterpret_cast<uint64_t>(memory);
   heap->title_bytes = bytes;
@@ -141,6 +149,16 @@ HRESULT create_descriptor_heap(Device* device, const D3D12_DESCRIPTOR_HEAP_DESC*
   {
     std::lock_guard<std::mutex> lock(g_lock);
     heaps_by_end()[heap->title_cpu + bytes] = heap;
+    if (heap->host_gpu) {
+      // Not reused when heaps go away: the range below 4 GiB is large enough
+      // for the few shader-visible heaps titles create.
+      heap->title_gpu = g_next_gpu;
+      g_next_gpu = (g_next_gpu + bytes + 0xFFFF) & ~0xFFFFull;
+      if (g_next_gpu > 0xFFFFFFFFull) {
+        LIB_LOG(lib::kError, "d3d12", "shader-visible heaps past 4 GiB of GPU addresses");
+      }
+      heaps_by_gpu_end()[heap->title_gpu + bytes] = heap;
+    }
   }
   *out = heap;
   return S_OK;
@@ -151,16 +169,42 @@ bool find_descriptor(uint64_t title_handle, DescriptorLocation* out) {
   auto it = heaps_by_end().upper_bound(title_handle);
   if (it == heaps_by_end().end() || title_handle < it->second->title_cpu) return false;
   DescriptorHeap* heap = it->second;
-  const uint64_t index = (title_handle - heap->title_cpu) / kTitleDescriptorBytes;
+  const uint64_t index = (title_handle - heap->title_cpu) / heap->stride;
   if (index >= heap->host_count) {
     LIB_LOG(lib::kError, "d3d12", "descriptor %llu is past the host heap's %u descriptors",
             static_cast<unsigned long long>(index), heap->host_count);
     return false;
   }
+  if (heap->host_gpu && heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+      index >= heap->host_count - kReservedHostViews) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      LIB_LOG(lib::kError, "d3d12", "descriptor %llu lies in the views reserved for translated calls",
+              static_cast<unsigned long long>(index));
+    }
+  }
   out->heap = heap;
   out->index = static_cast<uint32_t>(index);
-  out->title = heap->title_cpu + index * kTitleDescriptorBytes;
+  out->title = heap->title_cpu + index * heap->stride;
   return true;
+}
+
+bool find_gpu_descriptor(uint64_t title_gpu, DescriptorLocation* out) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  auto it = heaps_by_gpu_end().upper_bound(title_gpu);
+  if (it == heaps_by_gpu_end().end() || title_gpu < it->second->title_gpu) return false;
+  DescriptorHeap* heap = it->second;
+  const uint64_t index = (title_gpu - heap->title_gpu) / heap->stride;
+  if (index >= heap->host_count) return false;
+  out->heap = heap;
+  out->index = static_cast<uint32_t>(index);
+  out->title = heap->title_cpu + index * heap->stride;
+  return true;
+}
+
+UINT title_descriptor_bytes(D3D12_DESCRIPTOR_HEAP_TYPE type) {
+  return type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? kTitleSamplerBytes : kTitleDescriptorBytes;
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE host_cpu_handle(uint64_t title_handle) {
@@ -171,7 +215,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE host_cpu_handle(uint64_t title_handle) {
 
 D3D12_GPU_DESCRIPTOR_HANDLE host_gpu_handle(uint64_t title_handle) {
   DescriptorLocation where;
-  if (!find_descriptor(title_handle, &where) || !where.heap->host_gpu) return {0};
+  if (!find_gpu_descriptor(title_handle, &where) || !where.heap->host_gpu) return {0};
   return {where.heap->host_gpu + static_cast<uint64_t>(where.index) * where.heap->increment};
 }
 

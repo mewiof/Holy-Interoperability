@@ -25,6 +25,11 @@ struct Backing {
   uint64_t contiguous = 0;   // bytes from the title address on in the same heap
   uint64_t host_gpu_va = 0;  // host GPU address of the title address
   ID3D12Resource* whole = nullptr;  // a buffer spanning the heap from offset 0
+  // The title address of heap offset 0 when the heap covers one stretch of
+  // title addresses (committed memory); 0 for physical pages, whose heap
+  // offsets follow the pages, not the addresses.
+  uint64_t title_base = 0;
+  uint64_t heap_size = 0;
 };
 
 // Finds (creating heaps on first use) what backs `title_va`.

@@ -93,7 +93,8 @@ bool locate(Device* device, uint64_t title_va, Backing* out) {
       if (!finish_record(device, heap, &record)) return false;
       found = section_heaps().emplace(section, record).first;
     }
-    *out = Backing{found->second.heap, offset, run, found->second.host_gpu_va + offset, found->second.whole};
+    *out = Backing{found->second.heap, offset, run, found->second.host_gpu_va + offset, found->second.whole, 0,
+                   found->second.size};
     return true;
   }
 
@@ -102,7 +103,7 @@ bool locate(Device* device, uint64_t title_va, Backing* out) {
   if (region != region_heaps().end() && title_va >= region->second.first) {
     const uint64_t at = title_va - region->second.first;
     *out = Backing{region->second.second.heap, at, region->first - title_va, region->second.second.host_gpu_va + at,
-                   region->second.second.whole};
+                   region->second.second.whole, region->second.first, region->second.second.size};
     return true;
   }
   MEMORY_BASIC_INFORMATION info;
@@ -127,7 +128,7 @@ bool locate(Device* device, uint64_t title_va, Backing* out) {
   if (!finish_record(device, heap, &record)) return false;
   region_heaps().emplace(base + record.size, std::make_pair(base, record));
   const uint64_t at = title_va - base;
-  *out = Backing{heap, at, record.size - at, record.host_gpu_va + at, record.whole};
+  *out = Backing{heap, at, record.size - at, record.host_gpu_va + at, record.whole, base, record.size};
   return true;
 }
 

@@ -23,6 +23,10 @@ HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream,
                                  std::vector<std::vector<uint8_t>> blobs, bool translated,
                                  const lib::VtableInfo* info, void* const* vtable, void** pipeline);
 
+// The host pipeline behind a pipeline wrapper, waiting for its compile.
+// Null if the host refused it.
+ID3D12PipelineState* pipeline_host(const void* pipeline);
+
 // Device slot 55: `base` with some of its state replaced (pipeline_stream.cpp).
 HRESULT create_derived_pipeline(Device* device, const void* base, uint32_t count, const uint8_t* entries,
                                 const lib::VtableInfo* info, void* const* vtable, void** pipeline,

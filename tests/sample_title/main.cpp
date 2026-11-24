@@ -105,6 +105,13 @@ void test_cpu_compatibility() {
   for (int i = 0; i < 64; ++i) kept = kept && line[i] == 0xAB && line[128 + i] == 0xAB;
   check(zeroed, "CLZERO zeroes the cache line around its address");
   check(kept, "CLZERO leaves the neighbouring lines alone");
+  // mov rax, rcx; xor ecx, ecx; xor edx, edx; monitorx; xor ebx, ebx;
+  // mwaitx; mov eax, 7; ret: the wait returns.
+  static const unsigned char kWait[] = {0x48, 0x89, 0xC8, 0x31, 0xC9, 0x31, 0xD2, 0x0F, 0x01, 0xFA, 0x53,
+                                        0x31, 0xDB, 0x0F, 0x01, 0xFB, 0x5B, 0xB8, 0x07, 0x00, 0x00, 0x00, 0xC3};
+  std::memcpy(page, kWait, sizeof(kWait));
+  FlushInstructionCache(GetCurrentProcess(), page, sizeof(kWait));
+  check(reinterpret_cast<int (*)(void*)>(page)(line) == 7, "MONITORX and MWAITX return to the caller");
   VirtualFree(page, 0, MEM_RELEASE);
 }
 

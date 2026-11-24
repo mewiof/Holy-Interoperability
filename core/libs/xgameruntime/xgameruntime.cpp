@@ -116,6 +116,7 @@ void register_services() {
   register_local_storage();
   register_networking();
   register_package();
+  register_speech();
   register_system();
   register_user();
 }

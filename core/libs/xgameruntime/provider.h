@@ -2,10 +2,10 @@
 //
 // Observed contract: every runtime function a title calls is a thunk in the
 // title's statically linked client library. The thunk asks the runtime for an
-// interface with QueryApiImpl(&provider_id, &interface_id, &object) (both ids
-// have been the same GUID in every thunk observed), calls one method through
-// the object's vtable, then calls Release (vtable slot 2). Slots 0..2 are the
-// IUnknown methods; the runtime's functions start at slot 3.
+// interface with QueryApiImpl(&provider_id, &interface_id, &object) (the ids
+// differ for some services; interfaces are found by interface id), calls one
+// method through the object's vtable, then calls Release (vtable slot 2).
+// Slots 0..2 are the IUnknown methods; the runtime's functions start at slot 3.
 //
 // The runtime's services are process-wide singletons, so objects here are
 // static and their reference counts are not tracked.

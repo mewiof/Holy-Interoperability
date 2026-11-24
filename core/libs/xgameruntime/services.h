@@ -8,6 +8,7 @@ void register_display();
 void register_local_storage();
 void register_networking();
 void register_package();
+void register_speech();
 void register_system();
 void register_user();
 

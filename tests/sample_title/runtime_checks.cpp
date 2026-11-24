@@ -7,8 +7,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "tests/sample_title/checks.h"
 
@@ -52,6 +54,8 @@ constexpr GUID kStorageProvider = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47
 constexpr GUID kStorage = {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
 constexpr GUID kDisplayProvider = {0x03f0fe74, 0xfdd9, 0x4e5c, {0xb6, 0x30, 0xf9, 0x33, 0x9c, 0x47, 0xac, 0xc5}};
 constexpr GUID kDisplay = {0x35f07670, 0x706e, 0x4bfb, {0x94, 0x76, 0x09, 0x07, 0x98, 0xc5, 0xeb, 0xf3}};
+constexpr GUID kSpeechProvider = {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
+constexpr GUID kSpeech = {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}};
 
 // Core interface slots.
 enum CoreSlot {
@@ -321,6 +325,64 @@ void test_display() {
   release(display);
 }
 
+// Documented public layout.
+struct VoiceInformation {
+  const char* description;
+  const char* display_name;
+  uint32_t gender;
+  const char* voice_id;
+  const char* language;
+};
+
+bool record_voice(const VoiceInformation* information, void* context) {
+  auto* first = static_cast<std::string*>(context);
+  if (first->empty() && information && information->voice_id) *first = information->voice_id;
+  return true;
+}
+
+void test_speech() {
+  void* speech = query(kSpeechProvider, kSpeech);
+  std::string voice;
+  check(speech && call<HRESULT>(speech, 8, static_cast<void*>(&voice), &record_voice) == S_OK,
+        "the speech synthesizer enumerates the host's voices");
+  void* synthesizer = nullptr;
+  check(speech && call<HRESULT>(speech, 9, &synthesizer) == S_OK && synthesizer, "a speech synthesizer is created");
+  if (!speech || !synthesizer) {
+    release(speech);
+    return;
+  }
+  check(call<HRESULT>(speech, 12, synthesizer, "no such voice") == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+        "an unknown voice id is refused as not found");
+  void* stream = nullptr;
+  check(call<HRESULT>(speech, 15, stream, static_cast<size_t*>(nullptr)) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+        "an invalid stream handle is refused as not found");
+  if (voice.empty()) {
+    std::printf("      (the host has no voices: synthesis not checked)\n");
+  } else {
+    check(call<HRESULT>(speech, 12, synthesizer, voice.c_str()) == S_OK, "an enumerated voice can be chosen");
+    const HRESULT made = call<HRESULT>(speech, 13, synthesizer, "Hello.", &stream);
+    if (FAILED(made)) {
+      // The host's engine refuses synthesis at low integrity (the sandbox):
+      // its error comes back, with no stream.
+      std::printf("      (the host engine refused synthesis: 0x%08lx)\n", static_cast<unsigned long>(made));
+      check(stream == nullptr, "a refused synthesis returns the host's error and no stream");
+    } else {
+      size_t size = 0;
+      check(stream && call<HRESULT>(speech, 15, stream, &size) == S_OK && size > 44,
+            "plain text is synthesized into a stream");
+      std::vector<uint8_t> wave(size);
+      size_t used = 0;
+      check(stream && call<HRESULT>(speech, 16, stream, size, static_cast<void*>(wave.data()), &used) == S_OK &&
+                used == size && size > 44 && std::memcmp(wave.data(), "RIFF", 4) == 0 &&
+                std::memcmp(wave.data() + 8, "WAVE", 4) == 0,
+            "the stream holds a WAVE container");
+      if (stream) call<void>(speech, 14, stream);
+    }
+  }
+  call<void>(speech, 10, synthesizer);
+  release(speech);
+}
+
 }  // namespace
 
 void test_game_runtime() {
@@ -348,4 +410,5 @@ void test_game_runtime() {
   test_package();
   test_local_storage();
   test_display();
+  test_speech();
 }

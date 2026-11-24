@@ -11,9 +11,10 @@ holy_add_system_library(holy_lib_xgameruntime
     provider.cpp
     provider.h
     services.h
+    speech.cpp
     system.cpp
     task_queue.cpp
     task_queue.h
     user.cpp
     xgameruntime.cpp
-  LIBS holy_package bcrypt advapi32)
+  LIBS holy_package bcrypt advapi32 ole32 sapi)

@@ -122,7 +122,7 @@ bool make_presenter(Device* device, ID3D12CommandQueue* queue, Presenter* out) {
   }
   return SUCCEEDED(device->host->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, out->allocators[0], nullptr,
                                                    IID_PPV_ARGS(&out->list))) &&
-         SUCCEEDED(out->list->Close()) &&
+         SUCCEEDED(out->list->SetName(L"holy present copy")) && SUCCEEDED(out->list->Close()) &&
          SUCCEEDED(device->host->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&out->fence))) &&
          SUCCEEDED(device->host->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_presented_fence))) &&
          (out->event = CreateEventW(nullptr, FALSE, FALSE, nullptr)) != nullptr;
@@ -374,6 +374,9 @@ HRESULT present_x(CommandQueue* queue, uint32_t plane_count, const PresentPlane*
   ++p->presents;
   const uint64_t token = planes[0].token;
   if (ensure_swap_chain(p, format, width, height)) {
+    LIB_LOG(lib::kDebug, "d3d12", "present %llu: window %p%s%s", static_cast<unsigned long long>(p->presents),
+            static_cast<void*>(p->window), IsHungAppWindow(p->window) ? " (not responding)" : "",
+            IsIconic(p->window) ? " (minimised)" : "");
     ID3D12Resource* back = nullptr;
     p->swap_chain->GetBuffer(p->swap_chain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&back));
     ID3D12CommandAllocator* allocator = p->allocators[p->next_allocator];
@@ -395,9 +398,13 @@ HRESULT present_x(CommandQueue* queue, uint32_t plane_count, const PresentPlane*
     p->list->Close();
     ID3D12CommandList* lists[] = {p->list};
     p->queue->ExecuteCommandLists(1, lists);
-    const HRESULT hr = p->swap_chain->Present(1, 0);
+    // Sync interval 0: titles pace their frames with frame events (device
+    // slot 80), so presenting does not wait for the display's refresh as
+    // well. A windowed flip-model swap chain does not tear either way.
+    const HRESULT hr = p->swap_chain->Present(0, 0);
     if (FAILED(hr)) {
       LIB_LOG(lib::kError, "d3d12", "host present failed: 0x%08lX", static_cast<unsigned long>(hr));
+      report_device_removal(queue->device);
     }
     p->queue->Signal(p->fence, ++p->fence_value);
     p->allocator_values[p->next_allocator] = p->fence_value;

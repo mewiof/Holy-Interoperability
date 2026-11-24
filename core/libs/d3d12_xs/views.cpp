@@ -24,6 +24,7 @@
 
 #include <intrin.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 
@@ -152,7 +153,20 @@ void STDMETHODCALLTYPE create_constant_buffer_view(Device* self, const D3D12_CON
               reinterpret_cast<void*>(desc->BufferLocation));
     }
   }
-  self->host->CreateConstantBufferView(desc ? &host : nullptr, host_cpu_handle(dest));
+  // Observed: titles also place constant buffer views at addresses that are
+  // not 256-byte aligned, which the desktop does not allow. The host
+  // descriptor becomes a null view; translated native code reads the buffer
+  // through the title's descriptor memory, which keeps the exact address.
+  const bool host_viewable = !desc || (host.BufferLocation & 255) == 0;
+  if (!host_viewable) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+      LIB_LOG(lib::kWarn, "d3d12",
+              "constant buffer view at %p (host %p) is not 256-byte aligned: the host view is a null view",
+              reinterpret_cast<void*>(desc->BufferLocation), reinterpret_cast<void*>(host.BufferLocation));
+    }
+  }
+  self->host->CreateConstantBufferView(host_viewable && desc ? &host : nullptr, host_cpu_handle(dest));
   if (desc) write_buffer_descriptor(dest, desc->BufferLocation, 0, desc->SizeInBytes);
 }
 

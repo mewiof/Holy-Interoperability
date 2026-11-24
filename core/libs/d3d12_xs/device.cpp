@@ -129,7 +129,11 @@ DWORD WINAPI watch_fence(void* context) {
   for (;;) {
     const uint64_t seen = cell->fence->GetCompletedValue();
     cell->value = seen;
-    if (seen == UINT64_MAX) break;  // device removed
+    if (seen == UINT64_MAX) {  // device removed
+      static std::atomic<bool> reported{false};
+      if (g_device && !reported.exchange(true)) report_device_removal(g_device);
+      break;
+    }
     if (FAILED(cell->fence->SetEventOnCompletion(seen + 1, event))) break;
     WaitForSingleObject(event, INFINITE);
   }
@@ -351,11 +355,13 @@ const auto kRootSignatureVtable = [] {
   return table;
 }();
 
-// Logs why the host device was removed, with the device-removed extended
-// data when it was enabled.
+}  // namespace
+
 void report_device_removal(Device* device) {
   const HRESULT reason = device->host->GetDeviceRemovedReason();
   if (reason == S_OK) return;
+  static std::atomic<bool> reported{false};
+  if (reported.exchange(true)) return;  // once a process
   LIB_LOG(lib::kError, "d3d12", "the host device was removed (reason 0x%08lX)", static_cast<unsigned long>(reason));
   ID3D12InfoQueue* queue = nullptr;
   if (SUCCEEDED(device->host->QueryInterface(IID_PPV_ARGS(&queue)))) {
@@ -378,16 +384,40 @@ void report_device_removal(Device* device) {
     LIB_LOG(lib::kError, "d3d12", "  page fault at GPU address 0x%llx",
             static_cast<unsigned long long>(fault.PageFaultVA));
   }
-  D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs{};
-  if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
-    for (const D3D12_AUTO_BREADCRUMB_NODE* node = breadcrumbs.pHeadAutoBreadcrumbNode; node; node = node->pNext) {
+  ID3D12DeviceRemovedExtendedData1* dred1 = nullptr;
+  D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbs{};
+  if (SUCCEEDED(dred->QueryInterface(IID_PPV_ARGS(&dred1))) && SUCCEEDED(dred1->GetAutoBreadcrumbsOutput1(&breadcrumbs))) {
+    for (const D3D12_AUTO_BREADCRUMB_NODE1* node = breadcrumbs.pHeadAutoBreadcrumbNode; node; node = node->pNext) {
       const UINT done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
-      LIB_LOG(lib::kError, "d3d12", "  command list %p: %u of %u operations completed", node->pCommandList, done,
-              node->BreadcrumbCount);
+      LIB_LOG(lib::kError, "d3d12", "  list %p (%ls) on %ls: %u of %u", node->pCommandList,
+              node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"title list",
+              node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"?", done, node->BreadcrumbCount);
+      if (done >= node->BreadcrumbCount) continue;  // finished lists say nothing more
+      const int op = node->pCommandHistory ? static_cast<int>(node->pCommandHistory[done]) : -1;
+      // The marker before the operation that did not finish names its programs.
+      const wchar_t* context = nullptr;
+      for (UINT i = 0; i < node->BreadcrumbContextsCount; ++i) {
+        if (node->pBreadcrumbContexts[i].BreadcrumbIndex <= done) context = node->pBreadcrumbContexts[i].pContextString;
+      }
+      LIB_LOG(lib::kError, "d3d12", "  command list %p: %u of %u operations completed; next operation %d, after %ls",
+              node->pCommandList, done, node->BreadcrumbCount, op, context ? context : L"(no marker)");
+      std::string history;
+      for (UINT i = 0; node->pCommandHistory && i < node->BreadcrumbCount && i < 64; ++i) {
+        history += (i == done ? " [" : " ") + std::to_string(static_cast<int>(node->pCommandHistory[i])) +
+                   (i == done ? "]" : "");
+      }
+      LIB_LOG(lib::kError, "d3d12", "    operations (D3D12_AUTO_BREADCRUMB_OP):%s", history.c_str());
+      for (UINT i = 0; i < node->BreadcrumbContextsCount && i < 16; ++i) {
+        LIB_LOG(lib::kError, "d3d12", "    marker at operation %u: %ls", node->pBreadcrumbContexts[i].BreadcrumbIndex,
+                node->pBreadcrumbContexts[i].pContextString);
+      }
     }
   }
+  if (dred1) dred1->Release();
   dred->Release();
 }
+
+namespace {
 
 HRESULT STDMETHODCALLTYPE create_root_signature(Device* self, UINT, const void* blob, SIZE_T size, REFIID,
                                                 void** signature) {
@@ -699,6 +729,12 @@ HRESULT create_compute_pipeline_from_code(Device* self, const uint8_t* code, siz
   }
   Wrapper* wrapper = wrap(state, &kPipelineInfo, kPipelineVtable.data());
   wrapper->flags = kTranslatedPipeline;
+  if (HolyLogEnabled(lib::kDebug)) {
+    LIB_LOG(lib::kDebug, "d3d12", "native compute program %016llx -> host %016llx",
+            static_cast<unsigned long long>(shader_hash(dump, dump_size)),
+            static_cast<unsigned long long>(shader_hash(bytecode.data(), bytecode.size())));
+    label_pipeline(wrapper, {bytecode});
+  }
   *pipeline = wrapper;
   return S_OK;
 }
@@ -847,9 +883,26 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   NativeGraphicsDescription native;
   std::string error;
   if (HolyLogEnabled(lib::kDebug)) {
+    // The description and its blocks, for studying their layouts.
+    auto words = [](const void* at, size_t bytes) {
+      std::string text;
+      const auto* w = static_cast<const uint32_t*>(at);
+      for (size_t i = 0; w && i < bytes / 4; ++i) {
+        char h[12];
+        std::snprintf(h, sizeof(h), " %08x", w[i]);
+        text += h;
+      }
+      return text;
+    };
+    LIB_LOG(lib::kDebug, "d3d12", "native pipeline description:%s", words(desc, 17 * 8).c_str());
+    LIB_LOG(lib::kDebug, "d3d12", "native pipeline state block:%s",
+            words(reinterpret_cast<const void*>(desc[1]), std::min<uint64_t>(desc[2], 0x400)).c_str());
+    LIB_LOG(lib::kDebug, "d3d12", "native pipeline block:%s",
+            words(reinterpret_cast<const void*>(desc[3]), std::min<uint64_t>(desc[4], 0x400)).c_str());
     // The root signature and each stage's metadata, for studying bindings.
     void* root_host = desc[0] ? static_cast<void*>(host_of<ID3D12RootSignature>(reinterpret_cast<void*>(desc[0]))) : nullptr;
-    for (size_t i = 5; i + 3 < 5 + 2 * 6 && desc[i]; i += 4) {
+    for (size_t i = 5; i + 3 < 5 + 2 * 6; i += 4) {
+      if (!desc[i]) continue;
       std::string text;
       const auto* m = reinterpret_cast<const uint32_t*>(desc[i + 2]);
       for (size_t w = 0; m && w < desc[i + 3] / 4; ++w) {
@@ -1031,6 +1084,11 @@ Device* create_device(const void* parameters) {
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
       dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
       dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      ID3D12DeviceRemovedExtendedDataSettings1* contexts = nullptr;
+      if (SUCCEEDED(dred->QueryInterface(IID_PPV_ARGS(&contexts)))) {
+        contexts->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);  // marker strings
+        contexts->Release();
+      }
       dred->Release();
     }
   }

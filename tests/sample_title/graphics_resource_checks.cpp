@@ -20,6 +20,7 @@ __declspec(dllimport) void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD a
 __declspec(dllimport) BOOL XMemAllocatePhysicalPages(unsigned long long attributes, ULONG_PTR* count,
                                                      ULONG_PTR* pages);
 __declspec(dllimport) void* XMemMapPhysicalPages(void* address, ULONG_PTR count, ULONG_PTR* pages);
+__declspec(dllimport) BOOL XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* pages);
 }
 
 extern std::atomic<int> g_hook_allocations;
@@ -468,7 +469,54 @@ void test_display_and_pacing(void* device) {
 
 }  // namespace
 
+namespace {
+
+// Queue slot 31: page mapping updates in queue order.
+void test_page_mapping_update(void* device) {
+  const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 1};
+  void* queue = nullptr;
+  call<HRESULT>(device, 8, &queue_desc, __uuidof(ID3D12CommandQueue), &queue);
+  ULONG_PTR pages[2] = {};
+  ULONG_PTR count = 2;
+  auto* pool = static_cast<unsigned char*>(XMemVirtualAlloc(nullptr, 0x20000, 0x20402000, 0x23, PAGE_READWRITE));
+  auto* range = static_cast<unsigned char*>(XMemVirtualAlloc(nullptr, 0x20000, 0x20402000, 0x23, PAGE_READWRITE));
+  const bool ready = queue && pool && range && XMemAllocatePhysicalPages(0x280, &count, pages) &&
+                     XMemMapPhysicalPages(pool, 2, pages) == pool;
+  check(ready, "a page pool and a streaming range exist");
+  if (!ready) return;
+  pool[0x10] = 0xAB;
+  pool[0x10000 + 0x10] = 0xCD;
+  struct Run {
+    uint32_t kind, page, count;
+  };
+  struct Mapping {
+    uint64_t address;
+    uint32_t runs, reserved;
+    const Run* run;
+  };
+  // Pool page 1 into the second page of the range, then page 0 into the first.
+  const Run second_page{1, 1, 1}, first_page{1, 0, 1};
+  const Mapping both[2] = {{reinterpret_cast<uint64_t>(range) + 0x10000, 1, 0, &second_page},
+                           {reinterpret_cast<uint64_t>(range), 1, 0, &first_page}};
+  call<HRESULT>(queue, 31, 2u, both, reinterpret_cast<uint64_t>(pool), 2u, 0u);
+  check(range[0x10] == 0xAB && range[0x10000 + 0x10] == 0xCD, "queue page mapping updates map pool pages");
+  range[0x20] = 0x5A;
+  check(pool[0x20] == 0x5A, "a mapped pool page is the same memory as the pool");
+  const Run unmap{2, 0, 2};
+  const Mapping release{reinterpret_cast<uint64_t>(range), 1, 0, &unmap};
+  call<HRESULT>(queue, 31, 1u, &release, reinterpret_cast<uint64_t>(pool), 2u, 0u);
+  MEMORY_BASIC_INFORMATION info{};
+  VirtualQuery(range, &info, sizeof(info));
+  check(info.State != MEM_COMMIT && pool[0x10] == 0xAB, "queue page mapping updates unmap pages");
+  XMemMapPhysicalPages(pool, 2, nullptr);
+  XMemFreePhysicalPages(2, pages);
+  call<ULONG>(queue, 2);
+}
+
+}  // namespace
+
 void test_graphics_resources(void* device) {
+  test_page_mapping_update(device);
   test_allocation_hooks();
   test_placeholders();
   test_descriptor_heap(device);

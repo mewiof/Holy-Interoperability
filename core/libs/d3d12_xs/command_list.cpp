@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,8 @@ void write_immediate(CommandList* self, uint64_t address, const uint32_t* values
     LIB_LOG(lib::kError, "d3d12", "immediate write to %p: no GPU memory there", reinterpret_cast<void*>(address));
     return;
   }
+  LIB_LOG(lib::kTrace, "d3d12", "immediate write of %u words to %p (host %p)", count, reinterpret_cast<void*>(address),
+          reinterpret_cast<void*>(host));
   D3D12_WRITEBUFFERIMMEDIATE_PARAMETER parameters[2];
   D3D12_WRITEBUFFERIMMEDIATE_MODE modes[2];
   for (UINT i = 0; i < count; ++i) {
@@ -516,9 +519,24 @@ void report_unbound(const char* what) {
   if (logged.fetch_add(1) < 8) LIB_LOG(lib::kError, "d3d12", "%s with a translated pipeline could not be bound", what);
 }
 
+// With debug logging: a host marker naming the pipeline's programs, which
+// device-removed data reports for work that did not finish.
+void mark_work(CommandList* self) {
+  if (!HolyLogEnabled(lib::kDebug)) return;
+  const std::wstring label = pipeline_label(self->pipeline);
+  if (label.empty()) {
+    LIB_LOG(lib::kDebug, "d3d12", "work on title list %u: pipeline %p (not translated)", self->number, self->pipeline);
+    return;
+  }
+  self->host->SetMarker(0, label.c_str(), static_cast<UINT>((label.size() + 1) * sizeof(wchar_t)));
+  // Drivers need not keep marker strings; the log ties work to its list.
+  LIB_LOG(lib::kDebug, "d3d12", "work on title list %u: %ls", self->number, label.c_str());
+}
+
 void STDMETHODCALLTYPE list_draw_instanced(CommandList* self, UINT vertices, UINT instances, UINT first_vertex,
                                            UINT first_instance) {
   if (!self->pipeline) return;  // no host pipeline (reported when it was set)
+  mark_work(self);
   if (self->translated) {
     // The host's vertex index already includes the first vertex.
     if (!bind_translated_graphics(self, 0, first_instance)) return report_unbound("a draw");
@@ -531,6 +549,7 @@ void STDMETHODCALLTYPE list_draw_instanced(CommandList* self, UINT vertices, UIN
 void STDMETHODCALLTYPE list_draw_indexed_instanced(CommandList* self, UINT indices, UINT instances, UINT first_index,
                                                    INT base_vertex, UINT first_instance) {
   if (!self->pipeline) return;  // no host pipeline (reported when it was set)
+  mark_work(self);
   if (self->translated) {
     // The host's vertex index is the index; native code adds the base vertex.
     if (!bind_translated_graphics(self, static_cast<uint32_t>(base_vertex), first_instance)) {
@@ -545,6 +564,7 @@ void STDMETHODCALLTYPE list_draw_indexed_instanced(CommandList* self, UINT indic
 
 void STDMETHODCALLTYPE list_dispatch(CommandList* self, UINT x, UINT y, UINT z) {
   if (!self->pipeline) return;  // no host pipeline (reported when it was set)
+  mark_work(self);
   if (self->translated) {
     if (!bind_translated_compute(self)) return report_unbound("a dispatch");
   } else {
@@ -620,7 +640,13 @@ HRESULT create_command_list(Device* device, const uint32_t* desc, void* allocato
   LIB_LOG(lib::kDebug, "d3d12", "command list {%u, %u, %u, %u} -> 0x%08lX", desc[0], desc[1], desc[2], desc[3],
           static_cast<unsigned long>(hr));
   if (FAILED(hr)) return hr;
+  static std::atomic<uint32_t> lists{0};
+  const uint32_t number = lists.fetch_add(1) + 1;
+  wchar_t name[32];
+  std::swprintf(name, 32, L"title list %u", number);
+  host->SetName(name);  // device-removed data reports lists by name
   auto* list = new CommandList();
+  list->number = number;
   list->vtable = kListVtable.data();
   list->info = &kListInfo;
   list->device = device;

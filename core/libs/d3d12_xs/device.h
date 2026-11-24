@@ -59,6 +59,7 @@ struct CommandList {
   RootBinding graphics, compute;
   const void* pipeline = nullptr;  // the title's current pipeline (a Wrapper)
   bool translated = false;         // it runs translated native code
+  uint32_t number = 0;             // in the host list's name ("title list N")
   D3D12_VERTEX_BUFFER_VIEW vertex_buffers[16] = {};  // title addresses
 };
 
@@ -74,6 +75,10 @@ struct Resource {
 };
 
 Device* create_device(const void* parameters);
+
+// Logs why the host device was removed, with the device-removed extended
+// data when it was enabled (debug logging). Nothing when it was not removed.
+void report_device_removal(Device* device);
 
 // The root signature of pipelines translated from native code (every stage
 // sees all of it), by parameter:

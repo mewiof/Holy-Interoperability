@@ -35,7 +35,7 @@ std::map<Key, ID3D12Resource*>& textures() {
 bool make_uploader(Device* device, Uploader* out) {
   D3D12_COMMAND_QUEUE_DESC queue{};
   queue.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-  return SUCCEEDED(device->host->CreateCommandQueue(&queue, IID_PPV_ARGS(&out->queue))) &&
+  const bool made = SUCCEEDED(device->host->CreateCommandQueue(&queue, IID_PPV_ARGS(&out->queue))) &&
          SUCCEEDED(device->host->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                          IID_PPV_ARGS(&out->allocator))) &&
          SUCCEEDED(device->host->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, out->allocator, nullptr,
@@ -43,6 +43,11 @@ bool make_uploader(Device* device, Uploader* out) {
          SUCCEEDED(out->list->Close()) &&
          SUCCEEDED(device->host->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&out->fence))) &&
          (out->event = CreateEventW(nullptr, FALSE, FALSE, nullptr)) != nullptr;
+  if (made) {
+    out->queue->SetName(L"holy texture upload queue");
+    out->list->SetName(L"holy texture upload");
+  }
+  return made;
 }
 
 Uploader* uploader(Device* device) {

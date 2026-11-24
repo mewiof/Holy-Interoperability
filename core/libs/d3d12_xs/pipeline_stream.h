@@ -31,6 +31,13 @@ HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream,
 bool translate_graphics_cached(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,
                                ShaderInterface* link, std::string* error);
 
+// With debug logging: a label naming a pipeline's host programs by hash
+// (translations log which native program each host program comes from), set
+// as a host marker before its draws and dispatches so that device-removed
+// data can name the work the GPU was doing. Empty when none was recorded.
+void label_pipeline(const void* pipeline, const std::vector<std::vector<uint8_t>>& host_programs);
+std::wstring pipeline_label(const void* pipeline);
+
 // The host pipeline behind a pipeline wrapper, waiting for its compile.
 // Null if the host refused it.
 ID3D12PipelineState* pipeline_host(const void* pipeline);

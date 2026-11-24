@@ -7,7 +7,9 @@
 // ({2, 0, 1, 0}); its flags field does not carry the desktop meaning and is
 // not passed on. Queue methods are established from the title's calls.
 #include <d3d12.h>
+#include <intrin.h>
 
+#include <string>
 #include <vector>
 
 #include "core/libs/d3d12_xs/device.h"
@@ -62,6 +64,14 @@ void STDMETHODCALLTYPE queue_execute_command_lists_x(CommandQueue* self, UINT co
   }
   LIB_LOG(lib::kTrace, "d3d12", "execute %u lists (token %llu, flags 0x%x)", count,
           static_cast<unsigned long long>(token), flags);
+  if (HolyLogEnabled(lib::kDebug)) {
+    std::string numbers;
+    for (UINT i = 0; i < count; ++i) {
+      const auto* list = static_cast<const CommandList*>(lists[i]);
+      if (list) numbers += " " + std::to_string(list->number);
+    }
+    LIB_LOG(lib::kDebug, "d3d12", "queue type %d executes title lists%s", self->type, numbers.c_str());
+  }
   if (!host.empty()) self->host->ExecuteCommandLists(static_cast<UINT>(host.size()), host.data());
 }
 
@@ -71,6 +81,84 @@ HRESULT STDMETHODCALLTYPE queue_present_x(CommandQueue* self, UINT count, const 
   return present_x(self, count, planes, parameters);
 }
 
+// Observed: slot 31 takes (count, mappings, pool address, pool page count,
+// 0) and its result is not checked: an update of the title's page mappings
+// in queue order. Each mapping is {64 KiB-aligned address, run count, runs},
+// each run {kind, pool page, page count}: kind 1 maps `count` pages of the
+// pool (pool address + page * 64 KiB: memory the title reserved for physical
+// pages and mapped) at the next pages from the mapping's address on, kind 2
+// unmaps `count` pages there. Titles use it to move texture pool pages into
+// and out of their streaming address range.
+//
+// Host: the pages are remapped when the call is made, through the memory
+// library. GPU addresses are resolved when commands are recorded, so work
+// recorded before the call keeps the old pages (also work submitted after
+// it, which on the console would see the new ones: not handled).
+struct PageRun {
+  uint32_t kind;
+  uint32_t page;
+  uint32_t count;
+};
+struct PageMapping {
+  uint64_t address;
+  uint32_t runs;
+  uint32_t reserved;
+  const PageRun* run;
+};
+static_assert(sizeof(PageRun) == 12 && sizeof(PageMapping) == 24);
+constexpr uint64_t kPoolPage = 0x10000;
+
+HRESULT STDMETHODCALLTYPE queue_update_page_mappings_x(CommandQueue*, uint32_t count, const PageMapping* mappings,
+                                                       uint64_t pool, uint32_t pool_pages, uint32_t flags) {
+  using PageAtFn = ULONG_PTR (*)(const void*);
+  using MapFn = void* (*)(void*, ULONG_PTR, ULONG_PTR*);
+  static const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+  static const auto page_at = reinterpret_cast<PageAtFn>(GetProcAddress(xmem, "HolyXMemPhysicalPageAt"));
+  static const auto map = reinterpret_cast<MapFn>(GetProcAddress(xmem, "XMemMapPhysicalPages"));
+  if (!page_at || !map) return E_FAIL;
+  if (count && !mappings) return E_INVALIDARG;
+  if (flags) LIB_LOG(lib::kWarn, "d3d12", "page mapping update with flags 0x%x (not understood)", flags);
+  HRESULT result = S_OK;
+  for (uint32_t i = 0; i < count; ++i) {
+    const PageMapping& mapping = mappings[i];
+    uint64_t at = mapping.address;
+    for (uint32_t r = 0; r < mapping.runs && mapping.run; ++r) {
+      const PageRun& run = mapping.run[r];
+      if (run.kind == 1) {
+        if (static_cast<uint64_t>(run.page) + run.count > pool_pages) {
+          LIB_LOG(lib::kError, "d3d12", "page mapping run past the pool (%u + %u of %u pages)", run.page, run.count,
+                  pool_pages);
+          result = E_INVALIDARG;
+        } else {
+          std::vector<ULONG_PTR> pages(run.count);
+          bool all = true;
+          for (uint32_t p = 0; p < run.count; ++p) {
+            pages[p] = page_at(reinterpret_cast<const void*>(pool + (static_cast<uint64_t>(run.page) + p) * kPoolPage));
+            all = all && pages[p] != 0;
+          }
+          if (!all || !map(reinterpret_cast<void*>(at), run.count, pages.data())) {
+            LIB_LOG(lib::kError, "d3d12", "page mapping of %u pool pages from %u at %p failed", run.count, run.page,
+                    reinterpret_cast<void*>(at));
+            result = E_FAIL;
+          }
+        }
+      } else if (run.kind == 2) {
+        if (!map(reinterpret_cast<void*>(at), run.count, nullptr)) {
+          LIB_LOG(lib::kError, "d3d12", "page unmapping of %u pages at %p failed", run.count,
+                  reinterpret_cast<void*>(at));
+          result = E_FAIL;
+        }
+      } else {
+        HolyUnimplementedFrom(kLibrary, "ID3D12CommandQueueX#31(page run kind)", _ReturnAddress());
+        return E_NOTIMPL;
+      }
+      at += static_cast<uint64_t>(run.count) * kPoolPage;
+    }
+  }
+  LIB_LOG(lib::kTrace, "d3d12", "page mapping update of %u ranges -> 0x%08lx", count, static_cast<unsigned long>(result));
+  return result;
+}
+
 const auto kQueueVtable = [] {
   auto table = lib::make_reporting_vtable<kQueueSlots>();
   table[0] = reinterpret_cast<void*>(&queue_query_interface);
@@ -78,6 +166,7 @@ const auto kQueueVtable = [] {
   table[2] = reinterpret_cast<void*>(&queue_release);
   table[16] = reinterpret_cast<void*>(&queue_signal);
   table[18] = reinterpret_cast<void*>(&queue_get_timestamp_frequency);
+  table[31] = reinterpret_cast<void*>(&queue_update_page_mappings_x);
   table[32] = reinterpret_cast<void*>(&queue_present_x);
   table[35] = reinterpret_cast<void*>(&queue_execute_command_lists_x);
   return table;
@@ -98,6 +187,9 @@ HRESULT create_command_queue(Device* device, const D3D12_COMMAND_QUEUE_DESC* des
   LIB_LOG(lib::kDebug, "d3d12", "command queue type %d flags 0x%x -> 0x%08lX", desc->Type, desc->Flags,
           static_cast<unsigned long>(hr));
   if (FAILED(hr)) return hr;
+  host->SetName(desc->Type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? L"title compute queue"
+                : desc->Type == D3D12_COMMAND_LIST_TYPE_COPY  ? L"title copy queue"
+                                                              : L"title direct queue");
   auto* queue = new CommandQueue();
   queue->vtable = kQueueVtable.data();
   queue->info = &kQueueInfo;

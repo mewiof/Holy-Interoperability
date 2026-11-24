@@ -14,10 +14,12 @@
 #include <intrin.h>
 
 #include <cstring>
+#include <cwchar>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "core/libs/d3d12_xs/forward.h"
@@ -393,6 +395,14 @@ HRESULT create_from_recipe(Device* device, std::shared_ptr<Recipe> recipe, const
     return env;
   }();
   if (!environment || !TrySubmitThreadpoolCallback(&compile_pipeline, job, environment)) compile_pipeline(nullptr, job);
+  if (HolyLogEnabled(lib::kDebug)) {
+    std::shared_ptr<Recipe> kept;
+    {
+      std::lock_guard<std::mutex> guard(g_recipe_lock);
+      kept = recipes()[wrapper];
+    }
+    if (kept && kept->blobs) label_pipeline(wrapper, *kept->blobs);
+  }
   *pipeline = wrapper;
   return S_OK;
 }
@@ -428,6 +438,7 @@ HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream,
     if (FAILED(hr)) return hr;
     Wrapper* wrapper = wrap(state, info, vtable);
     if (translated) wrapper->flags = kTranslatedPipeline;
+    if (HolyLogEnabled(lib::kDebug)) label_pipeline(wrapper, *recipe->blobs);
     *pipeline = wrapper;
     return S_OK;
   }
@@ -536,9 +547,38 @@ bool translate_graphics_cached(const uint8_t* code, size_t size, GraphicsStage s
     }
   }
   if (!translate_graphics(code, size, stage, dxbc, link, error)) return false;
+  if (HolyLogEnabled(lib::kDebug)) dump_shader(code, size, stage == GraphicsStage::Vertex ? "vertex" : "pixel");
+  LIB_LOG(lib::kDebug, "d3d12", "native %s program %016llx -> host %016llx",
+          stage == GraphicsStage::Vertex ? "vertex" : "pixel", static_cast<unsigned long long>(key.first),
+          static_cast<unsigned long long>(shader_hash(dxbc->data(), dxbc->size())));
   std::lock_guard<std::mutex> guard(lock);
   (*cache)[key] = Entry{*dxbc, *link};
   return true;
+}
+
+namespace {
+std::mutex g_label_lock;
+std::unordered_map<const void*, std::wstring>& labels() {
+  static auto* map = new std::unordered_map<const void*, std::wstring>();
+  return *map;
+}
+}  // namespace
+
+void label_pipeline(const void* pipeline, const std::vector<std::vector<uint8_t>>& host_programs) {
+  std::wstring label = L"host";
+  for (const auto& program : host_programs) {
+    wchar_t text[24];
+    std::swprintf(text, 24, L" %016llx", static_cast<unsigned long long>(shader_hash(program.data(), program.size())));
+    label += text;
+  }
+  std::lock_guard<std::mutex> guard(g_label_lock);
+  labels()[pipeline] = std::move(label);
+}
+
+std::wstring pipeline_label(const void* pipeline) {
+  std::lock_guard<std::mutex> guard(g_label_lock);
+  auto found = labels().find(pipeline);
+  return found == labels().end() ? std::wstring() : found->second;
 }
 
 }  // namespace holy::d3d12

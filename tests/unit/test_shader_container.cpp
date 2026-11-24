@@ -175,3 +175,37 @@ TEST(header_first_console_containers) {
   const std::vector<uint8_t> desktop = header_first_container(true);
   EXPECT(rebuild_desktop_container(desktop.data(), desktop.size(), out) == ShaderFormat::Desktop);
 }
+
+TEST(native_graphics_description_with_sparse_stage_slots) {
+  // exp pos0 v0..v3 done; s_endpgm: a vertex program.
+  const uint32_t vs_code[] = {0xF80008CFu, 0x03020100u, 0xBF810000u};
+  uint32_t meta[12] = {};
+  uint32_t state[0x17C / 4] = {};
+  state[0x1E] = 0xF;
+  uint32_t pipeline[0xBC / 4] = {};
+  pipeline[3] = 1;   // one target ...
+  pipeline[4] = 0;   // ... of format 0: not written
+  pipeline[7] = 0xFFFFFFFFu;
+  pipeline[9] = 0x00130100u;  // triangles, with the flag in bit 4 of byte 2
+  uint64_t desc[17] = {};
+  desc[1] = reinterpret_cast<uint64_t>(state);
+  desc[2] = sizeof(state);
+  desc[3] = reinterpret_cast<uint64_t>(pipeline);
+  desc[4] = sizeof(pipeline);
+  // Slot 0 empty, the program in slot 1.
+  desc[9] = reinterpret_cast<uint64_t>(vs_code);
+  desc[10] = sizeof(vs_code);
+  desc[11] = reinterpret_cast<uint64_t>(meta);
+  desc[12] = sizeof(meta);
+  NativeGraphicsDescription out;
+  std::string error;
+  EXPECT(native_graphics_description(desc, &out, &error));
+  EXPECT(out.vertex_code == reinterpret_cast<const uint8_t*>(vs_code));
+  EXPECT(out.pixel_code == nullptr);
+  EXPECT(out.render_targets == 0);
+  EXPECT(out.target_mask == 0xF);
+  EXPECT(out.topology_type == 3);
+  // A state block shorter than the dwords read is refused.
+  desc[2] = 0xEC;
+  EXPECT(!native_graphics_description(desc, &out, &error));
+}

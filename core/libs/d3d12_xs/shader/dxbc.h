@@ -33,7 +33,7 @@ enum Opcode : uint32_t {
   kIbfe = 139, kBfi = 140, kBfrev = 141, kLdRaw = 165, kStoreRaw = 166, kAtomicAnd = 169, kAtomicOr = 170,
   kImmAtomicIadd = 180, kImmAtomicAnd = 181, kImmAtomicOr = 182, kImmAtomicXor = 183, kImmAtomicExch = 184,
   kImmAtomicCmpExch = 185, kImmAtomicImax = 186, kImmAtomicImin = 187, kImmAtomicUmax = 188,
-  kImmAtomicUmin = 189, kSync = 190,
+  kImmAtomicUmin = 189, kSync = 190, kDerivRtxFine = 123, kDerivRtyFine = 125,
 };
 
 // Instruction controls (bits 11-23 of the opcode token).
@@ -135,6 +135,7 @@ class Program {
   void dcl_thread_group(uint32_t x, uint32_t y, uint32_t z);
   void dcl_input_sgv(uint32_t reg, uint32_t mask, SystemValue name);
   void dcl_input_ps(uint32_t reg, uint32_t mask, Interpolation mode);
+  void dcl_input_ps_siv(uint32_t reg, uint32_t mask, Interpolation mode, SystemValue name);
   void dcl_output(uint32_t reg, uint32_t mask);
   void dcl_output_siv(uint32_t reg, uint32_t mask, SystemValue name);
   void dcl_output_depth();

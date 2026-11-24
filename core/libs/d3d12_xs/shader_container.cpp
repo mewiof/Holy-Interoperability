@@ -339,10 +339,15 @@ bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription
   const auto* state = reinterpret_cast<const uint32_t*>(desc[1]);
   const auto* pipeline = reinterpret_cast<const uint32_t*>(desc[3]);
   if (!state || desc[2] < kNativeRenderStateBytes || !pipeline || desc[4] < kNativePipelineBlockBytes) {
-    *error = "unexpected description blocks";
+    char text[160];
+    std::snprintf(text, sizeof(text), "unexpected description blocks (state %p, 0x%llx bytes; pipeline %p, 0x%llx bytes)",
+                  static_cast<const void*>(state), static_cast<unsigned long long>(desc[2]),
+                  static_cast<const void*>(pipeline), static_cast<unsigned long long>(desc[4]));
+    *error = text;
     return false;
   }
-  for (size_t i = 5; i + 3 < 5 + 2 * 6 && desc[i]; i += 4) {
+  for (size_t i = 5; i + 3 < 5 + 2 * 6; i += 4) {
+    if (!desc[i]) continue;  // the stage slots can be sparse
     const auto* code = reinterpret_cast<const uint8_t*>(desc[i]);
     const auto* meta = reinterpret_cast<const uint32_t*>(desc[i + 2]);
     if (!desc[i + 1] || !meta || desc[i + 3] < 16) {
@@ -378,6 +383,9 @@ bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription
   // the bytes past the target count).
   const auto* format_bytes = reinterpret_cast<const uint8_t*>(pipeline + 4);
   for (uint32_t i = 0; i < out->render_targets; ++i) out->formats[i] = format_bytes[i];
+  // Observed: a pipeline without a pixel program counts one target whose
+  // format is 0 (DXGI_FORMAT_UNKNOWN); such targets are not written.
+  while (out->render_targets && !out->formats[out->render_targets - 1]) --out->render_targets;
   if (pipeline[6]) {
     char text[64];
     std::snprintf(text, sizeof(text), "a depth format (assumed in dword 6: 0x%x)", pipeline[6]);
@@ -385,7 +393,9 @@ bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription
     return false;
   }
   out->sample_mask = pipeline[7];
-  out->topology_type = (pipeline[9] >> 16) & 0xFF;
+  // Byte 2 of dword 9: the topology type in bits 0-3; bit 4 is set in a few
+  // pipelines and not understood (not translated).
+  out->topology_type = (pipeline[9] >> 16) & 0xF;
   out->sample_count = pipeline[10] ? pipeline[10] : 1;
   out->target_mask = state[0x1E];
   out->mode_control = state[0x28];

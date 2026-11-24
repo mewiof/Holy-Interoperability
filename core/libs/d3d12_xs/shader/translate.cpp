@@ -42,6 +42,8 @@ constexpr uint32_t kEndBlock = 0xFFFFFFFFu;  // "next block" once the program ha
 // Operand code standing for the value another lane exchanged (cross-lane
 // operations); outside the 9-bit operand range.
 constexpr uint16_t kExchangeOperand = 0x200;
+// Operand code standing for a DPP instruction's source 1 with its modifiers.
+constexpr uint16_t kModifiedOperand = 0x201;
 constexpr uint32_t kNoView = 0xFFFFFFFFu;
 
 Operand R(uint32_t r) { return dxbc::temp(r); }
@@ -171,6 +173,7 @@ class Translator {
   // 32-bit source.
   Operand src(const Instruction& inst, uint16_t code) {
     if (code == kExchangeOperand) return R(exchange_reg_);
+    if (code == kModifiedOperand) return R(modified_reg_);
     if (code <= 105) return R(code);
     if (code >= rdna::kVgpr0) return R(vreg(code - rdna::kVgpr0));
     switch (code) {
@@ -316,9 +319,12 @@ class Translator {
     put(offset, I(0));
     put(i, I(0));
     const Operand alo = in_temp(lo), ahi = in_temp(hi);
+    // The table has kRegionTableSize entries whatever the count says.
+    const uint32_t count = fresh();
+    emit(dx::kUmin, {D(count), dxbc::cb(0, kSystemCountsVector, 0), I(kRegionTableSize)});
     emit(dx::kLoop, {});
     const uint32_t t = fresh(), d = fresh(), dh = fresh(), u = fresh();
-    emit(dx::kUge, {D(t), R(i), dxbc::cb(0, kSystemCountsVector, 0)});
+    emit(dx::kUge, {D(t), R(i), R(count)});
     emit(dx::kBreakc, {R(t)}, dxbc::kTestNonZero);
     emit(dx::kIadd, {D(d), alo, dxbc::neg(dxbc::cb_indexed(0, i, kSystemRegionVector, 0))});
     emit(dx::kUlt, {D(t), alo, dxbc::cb_indexed(0, i, kSystemRegionVector, 0)});  // borrow mask
@@ -433,6 +439,8 @@ class Translator {
   bool emit_flat(const Instruction& inst);
   bool emit_mubuf(const Instruction& inst);
   bool typed_load(uint32_t fmt, uint32_t components, uint32_t view, uint32_t at, uint32_t data);
+  bool decode_format(uint32_t fmt, uint32_t components, uint32_t view, uint32_t at, const uint32_t* out);
+  void format_load(uint32_t descriptor, uint32_t components, uint32_t view, uint32_t at, uint32_t data);
   bool emit_ds(const Instruction& inst);
   bool emit_export(const Instruction& inst);
   bool emit_image(const Instruction& inst);
@@ -444,6 +452,9 @@ class Translator {
   static bool read_first_lane(const Instruction& inst);
   void exchange_write(const Instruction& inst);
   bool exchange_read(const Instruction& inst);
+  bool quad_read(const Instruction& inst);
+  bool finish_exchange(const Instruction& inst, uint32_t value, Operand valid, Operand write, bool fetch_inactive,
+                       bool bound_zero, const Operand& source_active);
   bool emit_interp(const Instruction& inst);
   // Ends the program: the dispatcher leaves its loop (a single structured
   // exit; host drivers have refused programs that return from inside it).
@@ -481,7 +492,9 @@ class Translator {
   ShaderInterface iface_;
   uint8_t written_[kOutputRegisters] = {};  // components exported per output register
   uint32_t exchange_reg_ = 0;    // temp holding the exchanged value while an instruction is emitted
+  uint32_t modified_reg_ = 0;    // temp holding a DPP instruction's modified source 1
   bool exchange_ = false;        // the exchange area is used
+  bool quad_ = false;            // a pixel program exchanges values within its quad (reads its position)
   uint32_t exchange_parity_ = 0; // which of the two exchange buffers the next exchange uses
   uint32_t textures_used_ = 0;  // ImageSlot bits
   uint32_t uavs_used_ = 0;
@@ -591,6 +604,15 @@ bool Translator::emit_sop2(const Instruction& inst) {
       return true;
     }
     case 36: set_s(d, shl(add(shl(I(1), a), I(0xFFFFFFFFu)), b)); return true;
+    case 37: {
+      // s_bfm_b64: ((1 << S0[5:0]) - 1) << S1[5:0], 64 bits wide.
+      const Operand width = band(a, I(63));
+      const Operand big = op2(dx::kUge, width, I(32));
+      const Operand low = add(shl(I(1), width), I(0xFFFFFFFFu));  // ishl masks the count to 5 bits
+      auto [r0, r1] = shift64(0, select(big, I(0xFFFFFFFFu), low), select(big, low, I(0)), b);
+      set_s64(d, r0, r1);
+      return true;
+    }
     case 38: set_s(d, mul_lo(a, b)); return true;
     case 39: { const Operand r = ubfe(band(shr(b, I(16)), I(127)), band(b, I(31)), a); scc_nonzero(r); set_s(d, r); return true; }
     case 40: { const Operand r = ibfe(band(shr(b, I(16)), I(127)), band(b, I(31)), a); scc_nonzero(r); set_s(d, r); return true; }
@@ -959,6 +981,102 @@ bool buffer_format(uint32_t fmt, BufferFormat* layout, Numeric* numeric) {
 }  // namespace
 
 bool Translator::typed_load(uint32_t fmt, uint32_t components, uint32_t view, uint32_t at, uint32_t data) {
+  uint32_t out[4];
+  for (uint32_t c = 0; c < components; ++c) out[c] = vreg(data + c);
+  return decode_format(fmt, components, view, at, out);
+}
+
+// Loads with the format in the buffer descriptor (buffer_load_format_*):
+// word 3 holds the destination selects (bits 0-11, three bits a component:
+// 0 zero, 1 one, 4-7 the loaded x-w) and the format (bits 12-18), as in the
+// public RDNA 2 buffer descriptor layout. The format is known only when the
+// program runs: a switch over the format table picks the component widths
+// and numeric type, then one decoder handles every format (a decoder per
+// format made programs too large for the host's shader compiler). Format 0
+// (invalid) and formats the table lacks read as zero.
+void Translator::format_load(uint32_t descriptor, uint32_t components, uint32_t view, uint32_t at, uint32_t data) {
+  constexpr uint32_t kInvalid = 7;
+  uint32_t loaded[4], words[4];
+  for (uint32_t c = 0; c < 4; ++c) loaded[c] = fresh();
+  for (uint32_t c = 0; c < 4; ++c) words[c] = fresh();
+  const uint32_t fmt = fresh(), widths = fresh(), numeric = fresh(), offset = fresh(), one = fresh();
+  put(fmt, ubfe(I(7), I(12), R(descriptor)));
+  put(widths, I(0));
+  put(numeric, I(kInvalid));
+  emit(dx::kSwitch, {R(fmt)});
+  for (uint32_t f = 1; f < 128; ++f) {
+    BufferFormat layout;
+    Numeric type;
+    if (!buffer_format(f, &layout, &type)) continue;
+    emit(dx::kCase, {I(f)});
+    put(widths, I(layout.bits[0] | (layout.bits[1] << 8) | (layout.bits[2] << 16) | (layout.bits[3] << 24)));
+    put(numeric, I(static_cast<uint32_t>(type)));
+    emit(dx::kBreak, {});
+  }
+  emit(dx::kDefault, {});
+  emit(dx::kBreak, {});
+  emit(dx::kEndswitch, {});
+  for (uint32_t w = 0; w < 4; ++w) {
+    const uint32_t mark = scratch_;
+    put(words[w], read(view, add(R(at), I(4 * w))));
+    scratch_ = mark;
+  }
+  {
+    const uint32_t mark = scratch_;
+    const Operand integer = bor(eq(R(numeric), I(static_cast<uint32_t>(Numeric::Uint))),
+                                eq(R(numeric), I(static_cast<uint32_t>(Numeric::Sint))));
+    put(one, select(eq(R(numeric), I(kInvalid)), I(0), select(integer, I(1), dxbc::immf(1.0f))));
+    scratch_ = mark;
+  }
+  put(offset, I(0));
+  for (uint32_t c = 0; c < 4; ++c) {
+    const uint32_t mark = scratch_;
+    const Operand width = in_temp(ubfe(I(8), I(8 * c), R(widths)));
+    const Operand index = in_temp(shr(R(offset), I(5)));
+    const Operand shift = in_temp(band(R(offset), I(31)));
+    const Operand word = in_temp(select(band(index, I(2)), select(band(index, I(1)), R(words[3]), R(words[2])),
+                                        select(band(index, I(1)), R(words[1]), R(words[0]))));
+    const Operand full = in_temp(eq(width, I(32)));
+    const Operand u = in_temp(select(full, word, ubfe(width, shift, word)));
+    const Operand sv = in_temp(select(full, word, ibfe(width, shift, word)));
+    const Operand top = in_temp(select(full, I(0xFFFFFFFFu), add(shl(I(1), width), I(0xFFFFFFFFu))));
+    const Operand unorm = op2(dx::kDiv, op1(dx::kUtof, u), op1(dx::kUtof, top));
+    const Operand snorm =
+        op2(dx::kMax, op2(dx::kDiv, op1(dx::kItof, sv), op1(dx::kUtof, shr(top, I(1)))), dxbc::immf(-1.0f));
+    // Floats: 32-bit as they are; 16-bit halves; 11- and 10-bit unsigned
+    // small floats (the half layout without sign, fewer mantissa bits).
+    const Operand small = select(eq(width, I(16)), op1(dx::kF16tof32, u),
+                                 select(eq(width, I(11)), op1(dx::kF16tof32, shl(u, I(4))),
+                                        op1(dx::kF16tof32, shl(u, I(5)))));
+    const Operand real = select(full, u, small);
+    auto is = [&](Numeric type) { return eq(R(numeric), I(static_cast<uint32_t>(type))); };
+    Operand value = select(is(Numeric::Float), real, I(0));
+    value = select(is(Numeric::Sint), sv, value);
+    value = select(is(Numeric::Uint), u, value);
+    value = select(is(Numeric::Sscaled), op1(dx::kItof, sv), value);
+    value = select(is(Numeric::Uscaled), op1(dx::kUtof, u), value);
+    value = select(is(Numeric::Snorm), snorm, value);
+    value = select(is(Numeric::Unorm), unorm, value);
+    // Absent components read as 0, and w as one.
+    put(loaded[c], select(eq(width, I(0)), c == 3 ? R(one) : I(0), value));
+    put(offset, add(R(offset), width));
+    scratch_ = mark;
+  }
+  for (uint32_t c = 0; c < components; ++c) {
+    const uint32_t mark = scratch_;
+    const Operand select_bits = ubfe(I(3), I(3 * c), R(descriptor));
+    const Operand from_xy = select(band(select_bits, I(1)), R(loaded[1]), R(loaded[0]));
+    const Operand from_zw = select(band(select_bits, I(1)), R(loaded[3]), R(loaded[2]));
+    const Operand component = select(band(select_bits, I(2)), from_zw, from_xy);
+    const Operand constant = select(eq(select_bits, I(1)), R(one), I(0));
+    put(vreg(data + c), select(band(select_bits, I(4)), component, constant));
+    scratch_ = mark;
+  }
+}
+
+// Decodes `components` components of format `fmt` at (view, at) into the
+// temps `out`.
+bool Translator::decode_format(uint32_t fmt, uint32_t components, uint32_t view, uint32_t at, const uint32_t* out) {
   BufferFormat layout;
   Numeric numeric;
   if (!buffer_format(fmt, &layout, &numeric)) return fail(format("typed buffer format %u", fmt));
@@ -966,7 +1084,7 @@ bool Translator::typed_load(uint32_t fmt, uint32_t components, uint32_t view, ui
   uint32_t bit = 0;
   for (uint32_t c = 0; c < components; ++c) {
     const uint32_t width = layout.bits[c];
-    const uint32_t dest = vreg(data + c);
+    const uint32_t dest = out[c];
     const uint32_t mark = scratch_;
     if (width == 0) {
       // Absent components read as 0, and w as one.
@@ -1059,6 +1177,10 @@ bool Translator::emit_mubuf(const Instruction& inst) {
     return ok;
   }
   switch (inst.op) {
+    case 0: case 1: case 2: case 3:
+      use_vgpr(inst.src[1], static_cast<int>(inst.op) + 1);
+      format_load(r + 3, inst.op + 1, view, at, data);
+      break;
     case 8: put(vreg(data), band(read(view, R(at)), I(0xFF))); break;
     case 10: put(vreg(data), band(read(view, R(at)), I(0xFFFF))); break;
     case 12: load(1); break;
@@ -1870,7 +1992,6 @@ bool Translator::exchange_read(const Instruction& inst) {
     const uint32_t control = (inst.ext >> 8) & 0x1FF;
     fetch_inactive = (inst.ext >> 18) & 1;
     bound_zero = (inst.ext >> 19) & 1;
-    if ((inst.ext >> 22) & 3) return fail("DPP source 1 modifiers");
     const Operand row = band(lane, I(~15u)), in_row = band(lane, I(15));
     const uint32_t n = control & 15;
     if (control < 0x100) {
@@ -1906,7 +2027,16 @@ bool Translator::exchange_read(const Instruction& inst) {
   const uint32_t value = fresh(), source_active = fresh();
   emit(dx::kLdRaw, {D(value), address, dxbc::group_shared(1, dxbc::Access::Load)});
   emit(dx::kLdRaw, {D(source_active), add(address, I(4)), dxbc::group_shared(1, dxbc::Access::Load)});
-  if (!fetch_inactive) valid = band(valid, nonzero(R(source_active)));
+  return finish_exchange(inst, value, valid, write, fetch_inactive, bound_zero, R(source_active));
+}
+
+// The operation of a cross-lane instruction once the source lane's value is
+// in `value`: source validity, DPP modifiers, and the operation itself in
+// the lanes that write.
+bool Translator::finish_exchange(const Instruction& inst, uint32_t value, Operand valid, Operand write,
+                                 bool fetch_inactive, bool bound_zero, const Operand& source_active) {
+  const bool first_lane = read_first_lane(inst);
+  if (!fetch_inactive) valid = band(valid, nonzero(source_active));
   if (bound_zero) {
     put(value, select(valid, R(value), I(0)));
   } else {
@@ -1916,16 +2046,24 @@ bool Translator::exchange_read(const Instruction& inst) {
     set_s(inst.dst, R(value));
     return true;
   }
+  Instruction work = inst;
   if (inst.encoding != Encoding::VOP3 && inst.src[0] == rdna::kDpp16) {
     if ((inst.ext >> 21) & 1) put(value, band(R(value), I(0x7FFFFFFFu)));  // |src0|
     if ((inst.ext >> 20) & 1) put(value, bxor(R(value), I(0x80000000u)));  // -src0
+    if ((inst.ext >> 22) & 3) {
+      if (inst.encoding == Encoding::VOP1) return fail("DPP source 1 modifiers without a source 1");
+      modified_reg_ = fresh();
+      put(modified_reg_, src(inst, inst.src[1]));
+      if ((inst.ext >> 23) & 1) put(modified_reg_, band(R(modified_reg_), I(0x7FFFFFFFu)));  // |src1|
+      if ((inst.ext >> 22) & 1) put(modified_reg_, bxor(R(modified_reg_), I(0x80000000u)));  // -src1
+      work.src[1] = kModifiedOperand;
+    }
   }
   // The operation itself, with src0 the exchanged value, in lanes that write.
   const uint32_t saved = fresh();
   put(saved, R(kExecLoR));
   put(kExecLoR, band(R(kExecLoR), bit01(write)));
   exchange_reg_ = value;
-  Instruction work = inst;
   bool ok;
   if (inst.encoding == Encoding::VOP3) {
     // v_permlane: vdst = the exchanged value.
@@ -1938,6 +2076,50 @@ bool Translator::exchange_read(const Instruction& inst) {
   }
   put(kExecLoR, R(saved));
   return ok;
+}
+
+// Pixel programs: DPP quad permutes (the console compiler's derivatives).
+// There is no exchange memory in a host pixel shader, but fine derivatives
+// carry a quad neighbour's value as a difference: with x the value, the
+// horizontal neighbour's is x + ddx_fine(x) in the left column and
+// x - ddx_fine(x) in the right one, likewise vertically, and the diagonal
+// one is the vertical neighbour of the horizontal one. Values are exchanged
+// as two floats holding 16 and 17 bits (the low half and the source lane's
+// EXEC bit), so every step is exact. The quad position (console lane order:
+// lane 0 top left, 1 top right, 2 bottom left, 3 bottom right) comes from
+// the pixel position. Like implicit-derivative sampling, this requires the
+// four lanes of a quad to reach the instruction together.
+bool Translator::quad_read(const Instruction& inst) {
+  if (inst.src[0] != rdna::kDpp16) return fail("DPP8 in a pixel program");
+  const uint32_t control = (inst.ext >> 8) & 0x1FF;
+  if (control >= 0x100) return fail(format("DPP control 0x%x in a pixel program", control));
+  if (((inst.ext >> 24) & 0xFF) != 0xFF) return fail("DPP row or bank mask in a pixel program");
+  const bool fetch_inactive = (inst.ext >> 18) & 1, bound_zero = (inst.ext >> 19) & 1;
+  quad_ = true;
+  const Operand x = band(op1(dx::kFtou, dxbc::input_register(0, 0)), I(1));
+  const Operand y = band(op1(dx::kFtou, dxbc::input_register(0, 1)), I(1));
+  const Operand x_sign = select(x, I(0xBF800000u), I(0x3F800000u));  // -1 in the right column
+  const Operand y_sign = select(y, I(0xBF800000u), I(0x3F800000u));  // -1 in the bottom row
+  const Operand me = bor(x, shl(y, I(1)));
+  // The quad lane this lane reads, relative to it (0 itself, 1 horizontal,
+  // 2 vertical, 3 diagonal neighbour).
+  const Operand relative = bxor(band(shr(I(control), shl(me, I(1))), I(3)), me);
+  const Operand v = in_temp(src(inst, exchanged_vgpr(inst)));
+  const Operand halves[2] = {op1(dx::kUtof, bor(band(v, I(0xFFFF)), shl(active(), I(16)))),
+                             op1(dx::kUtof, shr(v, I(16)))};
+  Operand picked[2];
+  for (int i = 0; i < 2; ++i) {
+    const Operand f = in_temp(halves[i]);
+    const Operand h = op3(dx::kMad, x_sign, op1(dx::kDerivRtxFine, f), f);
+    const Operand c = op3(dx::kMad, y_sign, op1(dx::kDerivRtyFine, f), f);
+    const Operand d = op3(dx::kMad, y_sign, op1(dx::kDerivRtyFine, h), h);
+    picked[i] = op1(dx::kFtou, select(band(relative, I(2)), select(band(relative, I(1)), d, c),
+                                      select(band(relative, I(1)), h, f)));
+  }
+  const uint32_t value = fresh();
+  put(value, bor(band(picked[0], I(0xFFFF)), shl(picked[1], I(16))));
+  return finish_exchange(inst, value, I(0xFFFFFFFFu), I(0xFFFFFFFFu), fetch_inactive, bound_zero,
+                         band(shr(picked[0], I(16)), I(1)));
 }
 
 bool Translator::emit_interp(const Instruction& inst) {
@@ -2059,6 +2241,13 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       }
     }
     if (cross_lane(inst) || (stage_ == Stage::Compute && read_first_lane(inst))) {
+      if (stage_ == Stage::Pixel && cross_lane(inst) && inst.encoding != Encoding::VOP3) {
+        if (!quad_read(inst) || !error_.empty()) {
+          *error = format("at 0x%x: %s", inst.pc, error_.c_str());
+          return false;
+        }
+        continue;
+      }
       if (stage_ != Stage::Compute) {
         *error = format("at 0x%x: cross-lane operation outside a compute program", inst.pc);
         return false;
@@ -2146,6 +2335,11 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       outputs.push_back({"TEXCOORD", n, dxbc::kUndefined, dxbc::kFloat32, n + 1, 0xF, 0});
     }
   } else {
+    if (quad_) {
+      // The pixel position, in the register the vertex stage writes it to.
+      program.dcl_input_ps_siv(0, 0x3, dxbc::kLinearNoPerspective, dxbc::kPosition);
+      inputs.push_back({"SV_Position", 0, dxbc::kPosition, dxbc::kFloat32, 0, 0xF, 0x3});
+    }
     for (uint32_t n = 0; n < 32; ++n) {
       if (!(iface_.params & (1u << n))) continue;
       const bool flat = (iface_.flat_params & (1u << n)) != 0;

@@ -45,11 +45,11 @@ inline constexpr size_t kNativeComputeRegisterBytes = 28;
 bool native_compute_registers(const uint32_t* registers, size_t size, ComputeShaderInfo* info, std::string* error);
 
 // A graphics pipeline created from native code (device slot 57). Observed
-// description: the root signature, then (pointer, size) pairs until a null
-// pointer: a block of render state registers, a pipeline block, and a
-// (code, metadata) quadruple (code, code size, metadata, metadata size) per
-// stage, in no fixed stage order. The stage is told by the code
-// (native_graphics_stage). Metadata: dword 1 its size less 12, dword 3 high
+// description: the root signature, (pointer, size) of a block of render
+// state registers and of a pipeline block, then three stage slots, each a
+// (code, code size, metadata, metadata size) quadruple or zero. Slots can be
+// empty before a used one, and stages come in no fixed slot order; the stage
+// is told by the code (native_graphics_stage). Metadata: dword 1 its size less 12, dword 3 high
 // half the number of 32-byte records of kind 0x41 that follow.
 //
 // Render state block (dword offsets), whose values follow the public RDNA
@@ -57,7 +57,8 @@ bool native_compute_registers(const uint32_t* registers, size_t size, ComputeSha
 // CB_BLEND0-7_CONTROL. Pipeline block: dword 3 the render target count,
 // bytes 16-23 one DXGI format per render target, dword 6 zero in every
 // pipeline seen (assumed: the depth format), 7 the sample mask, 9 byte 2 the
-// primitive topology type, 10 the sample count.
+// primitive topology type in bits 0-3 (bit 4 is set in a few pipelines and
+// not understood), 10 the sample count.
 struct NativeGraphicsDescription {
   const uint8_t* vertex_code = nullptr;
   size_t vertex_size = 0;
@@ -72,7 +73,9 @@ struct NativeGraphicsDescription {
   uint32_t mode_control = 0;
   uint32_t blend[8] = {};
 };
-inline constexpr size_t kNativeRenderStateBytes = 0x18C;
+// The render state block has been seen at 0x17C, 0x184 and 0x18C bytes with
+// the same dwords up to the blend controls; only those are required.
+inline constexpr size_t kNativeRenderStateBytes = 0xF0;
 inline constexpr size_t kNativePipelineBlockBytes = 0x30;
 bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription* out, std::string* error);
 

@@ -217,15 +217,19 @@ TEST(translated_graphics_stages_link) {
 }
 
 TEST(untranslatable_code_is_reported) {
-  // v_mov_b32 with a DPP16 operand (needs other lanes), then s_endpgm: a
-  // pixel shader has no group shared memory to exchange through.
-  const std::vector<uint8_t> code = words({0x7E0202FAu, 0xFF001B00u, 0xBF810000u});
+  // v_mov_b32 with a DPP16 row_shr:1 operand (reads outside the quad), then
+  // s_endpgm: a pixel shader has no group shared memory to exchange through.
+  const std::vector<uint8_t> code = words({0x7E0202FAu, 0xFF011100u, 0xBF810000u});
   std::vector<uint8_t> bytecode;
   ShaderInterface link;
   std::string error;
   EXPECT(!translate_graphics(code.data(), code.size(), GraphicsStage::Pixel, &bytecode, &link, &error));
-  EXPECT(error.find("cross-lane") != std::string::npos);
+  EXPECT(error.find("DPP control 0x111 in a pixel program") != std::string::npos);
   EXPECT(error.find("0x0") != std::string::npos);
+  // A vertex program has no quads.
+  const std::vector<uint8_t> quad = words({0x7E0202FAu, 0xFF001B00u, 0xBF810000u});
+  EXPECT(!translate_graphics(quad.data(), quad.size(), GraphicsStage::Vertex, &bytecode, &link, &error));
+  EXPECT(error.find("cross-lane") != std::string::npos);
   // A DPP control the hardware generation lacks (row_bcast:15) is reported.
   const std::vector<uint8_t> broadcast = words({0x7E0202FAu, 0xFF014200u, 0xBF810000u});
   EXPECT(!translate_compute(broadcast.data(), broadcast.size(), ComputeShaderInfo{}, &bytecode, &error));
@@ -298,4 +302,31 @@ TEST(typed_loads_gathers_and_half_class_tests_translate) {
   const std::vector<uint8_t> bad = words({0xEBC32000u, 0x80000004u, 0xBF810000u});
   EXPECT(!translate_compute(bad.data(), bad.size(), info, &bytecode, &error));
   EXPECT(error.find("typed buffer format 120") != std::string::npos);
+}
+
+TEST(scalar_64_bit_field_mask_translates) {
+  // s_bfm_b64 s[0:1], s2, s3; s_endpgm.
+  const std::vector<uint8_t> code = words({0x92800302u, 0xBF810000u});
+  ComputeShaderInfo info;
+  info.threads[0] = 64;
+  std::vector<uint8_t> bytecode;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &bytecode, &error));
+  EXPECT(error.empty());
+}
+
+TEST(pixel_quad_permutes_use_fine_derivatives) {
+  // v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2]; exp mrt0 v1, v1, v1, v1 done;
+  // s_endpgm.
+  const std::vector<uint8_t> code = words({0x7E0202FAu, 0xFF00B100u, 0xF800080Fu, 0x01010101u, 0xBF810000u});
+  std::vector<uint8_t> bytecode;
+  ShaderInterface link;
+  std::string error;
+  EXPECT(translate_graphics(code.data(), code.size(), GraphicsStage::Pixel, &bytecode, &link, &error));
+  EXPECT(error.empty());
+  const std::string text = disassemble(bytecode);
+  EXPECT(text.find("dcl_input_ps_siv linear noperspective v0.xy, position") != std::string::npos);
+  EXPECT(text.find("deriv_rtx_fine") != std::string::npos);
+  EXPECT(text.find("deriv_rty_fine") != std::string::npos);
+  EXPECT(text.find("SV_Position") != std::string::npos);
 }

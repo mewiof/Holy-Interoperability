@@ -197,6 +197,12 @@ void Program::dcl_input_ps(uint32_t reg, uint32_t mask, Interpolation mode) {
                                  kFourComponents | kMaskMode | (mask << 4) | type_bits(kInput) | dimension(1), reg});
 }
 
+void Program::dcl_input_ps_siv(uint32_t reg, uint32_t mask, Interpolation mode, SystemValue name) {
+  tokens_.insert(tokens_.end(), {kDclInputPsSiv | (static_cast<uint32_t>(mode) << 11) | (4u << 24),
+                                 kFourComponents | kMaskMode | (mask << 4) | type_bits(kInput) | dimension(1), reg,
+                                 static_cast<uint32_t>(name)});
+}
+
 void Program::dcl_output(uint32_t reg, uint32_t mask) {
   tokens_.insert(tokens_.end(), {kDclOutput | (3u << 24), output_register(reg, mask)[0], reg});
 }

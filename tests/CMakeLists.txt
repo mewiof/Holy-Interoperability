@@ -6,6 +6,7 @@ add_executable(holy_unit_tests
   unit/test_pe.cpp
   unit/test_provider.cpp
   unit/test_shader_container.cpp
+  unit/test_shader_execute.cpp
   unit/test_shader_translate.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader_container.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader/dxbc.cpp
@@ -16,7 +17,7 @@ add_executable(holy_unit_tests
   unit/test_vfs.cpp
   unit/test_xml.cpp)
 holy_target_defaults(holy_unit_tests)
-target_link_libraries(holy_unit_tests PRIVATE holy_common holy_pe holy_package holy_analysis)
+target_link_libraries(holy_unit_tests PRIVATE holy_common holy_pe holy_package holy_analysis d3d12 dxgi)
 add_test(NAME unit COMMAND holy_unit_tests)
 
 # --- sample title ---------------------------------------------------------------

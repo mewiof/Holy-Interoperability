@@ -32,6 +32,13 @@ __declspec(dllimport) void* XMemMapPhysicalPages(void* address, ULONG_PTR count,
 __declspec(dllimport) HRESULT WINAPI DStorageGetFactory(REFIID riid, void** factory);
 __declspec(dllimport) int SamplePackageResolve(const char* host);
 __declspec(dllimport) int SamplePackageLoadsConsoleRuntime();
+__declspec(dllimport) HRESULT ApuCreateHeap(uint32_t cached_bytes, uint32_t non_cached_bytes);
+__declspec(dllimport) HRESULT ApuAlloc(void** address, uint32_t* apu_address, uint32_t bytes, uint32_t alignment,
+                                       uint32_t flags);
+__declspec(dllimport) HRESULT ApuFree(void* address);
+__declspec(dllimport) bool ApuIsVirtualAddressValid(const void* address, uint32_t bytes);
+__declspec(dllimport) uint32_t ApuMapVirtualAddress(const void* address);
+__declspec(dllimport) void* ApuMapApuAddress(uint32_t apu_address);
 }
 
 namespace {
@@ -437,6 +444,37 @@ void test_physical_pages() {
 }
 
 // Fast storage: files open through the title's paths.
+// The audio processor heap.
+void test_audio_heap() {
+  check(ApuCreateHeap(0x400000, 0x40000) == S_OK, "the audio processor heap is created");
+  check(FAILED(ApuCreateHeap(0x400000, 0x40000)), "the audio processor heap is created only once");
+  void* cached = nullptr;
+  uint32_t apu = 0;
+  check(ApuAlloc(&cached, &apu, 0x1000, 0x800, 1) == S_OK && cached &&
+            (reinterpret_cast<uintptr_t>(cached) & 0x7FF) == 0 && apu != 0,
+        "audio processor memory is allocated with its alignment and an audio address");
+  if (!cached) return;
+  static_cast<unsigned char*>(cached)[0xFFF] = 0x5A;
+  check(ApuMapVirtualAddress(cached) == apu && ApuMapApuAddress(apu) == cached &&
+            ApuMapVirtualAddress(static_cast<char*>(cached) + 0x10) == apu + 0x10,
+        "audio addresses and virtual addresses map both ways");
+  check(ApuIsVirtualAddressValid(cached, 0x1000) && !ApuIsVirtualAddressValid(cached, 0x1001),
+        "audio memory is valid within its allocation only");
+  void* non_cached = nullptr;
+  check(ApuAlloc(&non_cached, nullptr, 0x30000, 0x800, 2) == S_OK && non_cached,
+        "non-cached audio memory is allocated");
+  void* too_much = nullptr;
+  check(ApuAlloc(&too_much, nullptr, 0x20000, 0x800, 2) == E_OUTOFMEMORY && !too_much,
+        "an exhausted audio heap refuses allocations");
+  check(ApuAlloc(&too_much, nullptr, 0x100, 0x800, 3) == E_INVALIDARG, "unknown audio heap flags are refused");
+  check(ApuFree(cached) == S_OK && !ApuIsVirtualAddressValid(cached, 1) && ApuFree(cached) == E_INVALIDARG,
+        "audio memory is freed once");
+  void* again = nullptr;
+  check(ApuAlloc(&again, nullptr, 0x1000, 0x800, 1) == S_OK && again == cached, "freed audio memory is reused");
+  ApuFree(again);
+  ApuFree(non_cached);
+}
+
 void test_fast_storage() {
   constexpr GUID kFactory = {0x62959d11, 0xd45f, 0x4884, {0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae}};
   void* factory = nullptr;
@@ -571,6 +609,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR command_line, int) {
   test_physical_pages();
   test_deferred_commit();
   test_fast_storage();
+  test_audio_heap();
   test_texture_layout();
   test_graphics();
   if (!(command_line && std::strstr(command_line, "--expect-online"))) test_offline();

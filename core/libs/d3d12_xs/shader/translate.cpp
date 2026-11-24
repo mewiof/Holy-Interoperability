@@ -948,7 +948,7 @@ bool buffer_format(uint32_t fmt, BufferFormat* layout, Numeric* numeric) {
       {72, 3, {32, 32, 32, 0}, kWide},      {75, 3, {32, 32, 32, 32}, kWide},
   };
   for (const Group& g : kGroups) {
-    if (fmt >= g.first && fmt < g.first + g.count) {
+    if (fmt >= g.first && fmt < static_cast<uint32_t>(g.first + g.count)) {
       for (int i = 0; i < 4; ++i) layout->bits[i] = g.bits[i];
       *numeric = g.types[fmt - g.first];
       return true;

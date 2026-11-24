@@ -103,6 +103,8 @@ Notes describe the platform, never a title.
   library), when a buffer in it is handed to the kernel (the runtime's commit-before-I/O path calls the memory
   library first), or when the graphics library asks for the memory behind an address. Fresh storage reads as
   zero. Commit charge is taken per section (up to 1 GiB) when its first page is used, not at mapping time.
+  Storage a freed page leaves behind is cleared before another page takes it, so freshly allocated pages read
+  as zero (*assumed*, as the system's own pages do).
   Code holding the page-table lock never touches title memory (title arrays are copied in and out around
   it), since a fault there would re-enter the backing handler.
 - Implementation: commits of 64 MiB or more are always reserved and committed on first touch, not only when

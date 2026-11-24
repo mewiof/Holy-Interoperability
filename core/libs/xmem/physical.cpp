@@ -44,6 +44,7 @@
 #include <atomic>
 #include <unordered_map>
 #include <unordered_set>
+#include <cstring>
 #include <vector>
 
 #include "core/libs/support.h"
@@ -57,6 +58,7 @@ struct Section {
   HANDLE handle = nullptr;
   bool committed = false;
   std::vector<uint32_t> owner;  // page id owning each 64 KiB slot, 0 if free
+  std::vector<bool> used;       // the slot has held a page (its contents are not zero)
 };
 
 struct Page {
@@ -161,8 +163,29 @@ int32_t create_section(uint64_t bytes) {
     return -1;
   }
   section.owner.assign(static_cast<size_t>(bytes / kPage), 0);
+  section.used.assign(static_cast<size_t>(bytes / kPage), false);
   sections().push_back(std::move(section));
   return static_cast<int32_t>(sections().size() - 1);
+}
+
+// Clears a slot that held another page, through a view of the section's own
+// (never title memory, so it is safe with g_lock held): fresh physical pages
+// read as zero, as the system's pages do. Observed: titles' streaming heaps
+// keep data in physical pages and depend on that.
+void clear_slot(Section& section, uint32_t slot) {
+  if (!section.used[slot]) {
+    section.used[slot] = true;
+    return;
+  }
+  const uint64_t offset = static_cast<uint64_t>(slot) * kPage;
+  void* view = MapViewOfFile(section.handle, FILE_MAP_WRITE, static_cast<DWORD>(offset >> 32),
+                             static_cast<DWORD>(offset), kPage);
+  if (!view) {
+    LIB_LOG(holy::lib::kError, "xmem", "cannot clear recycled physical storage (error %lu)", GetLastError());
+    return;
+  }
+  if (section.committed || VirtualAlloc(view, kPage, MEM_COMMIT, PAGE_READWRITE)) std::memset(view, 0, kPage);
+  UnmapViewOfFile(view);
 }
 
 // Gives a page its storage, preferably the slot matching `granule` in the
@@ -181,6 +204,7 @@ bool materialize(ULONG_PTR id, uintptr_t granule) {
       Section& section = sections()[region->chunks[chunk]];
       const auto slot = static_cast<uint32_t>((offset % kChunk) / kPage);
       if (slot < section.owner.size() && section.owner[slot] == 0) {
+        clear_slot(section, slot);
         section.owner[slot] = static_cast<uint32_t>(id);
         page.section = region->chunks[chunk];
         page.index = slot;
@@ -194,6 +218,7 @@ bool materialize(ULONG_PTR id, uintptr_t granule) {
   const int32_t own = create_section(kPage);
   if (own < 0) return false;
   sections()[own].owner[0] = static_cast<uint32_t>(id);
+  sections()[own].used[0] = true;
   page.section = own;
   page.index = 0;
   page.committed = sections()[own].committed;

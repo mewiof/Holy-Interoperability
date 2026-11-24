@@ -390,6 +390,17 @@ void test_physical_pages() {
   check(XMemMapPhysicalPages(first, 2, nullptr) == first, "physical pages can be unmapped");
   XMemMapPhysicalPages(second + 0x10000, 2, nullptr);
   check(XMemFreePhysicalPages(2, pages) != FALSE, "physical pages can be freed");
+  // Pages allocated after others were freed read as zero where the freed
+  // ones held data.
+  ULONG_PTR recycled[2] = {};
+  count = 2;
+  if (XMemAllocatePhysicalPages(0x280, &count, recycled) && XMemMapPhysicalPages(first, 2, recycled) == first) {
+    check(first[0x10] == 0 && first[0x10000 + 0x10] == 0, "recycled physical pages read as zero");
+    XMemMapPhysicalPages(first, 2, nullptr);
+    XMemFreePhysicalPages(2, recycled);
+  } else {
+    check(false, "physical pages are allocated again after a free");
+  }
 
   // Fresh pages read as zero, and the kernel can write into pages nobody has
   // touched yet (file reads straight into mapped physical memory).

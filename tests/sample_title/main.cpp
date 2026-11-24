@@ -328,6 +328,19 @@ void test_deferred_commit() {
     XMemMapPhysicalPages(region, 1, nullptr);
     XMemFreePhysicalPages(1, &page);
   }
+  // Page numbers count 4 KiB frames: titles store them shifted right by 4
+  // and rebuild them shifted left.
+  ULONG_PTR numbers[3] = {};
+  count = 3;
+  const bool numbered = XMemAllocatePhysicalPages(0x280, &count, numbers) != FALSE;
+  check(numbered && numbers[0] % 16 == 0 && numbers[1] % 16 == 0 && numbers[2] % 16 == 0 &&
+            numbers[0] != numbers[1] && numbers[1] != numbers[2],
+        "physical page numbers are distinct multiples of 16");
+  ULONG_PTR odd = numbers[0] + 1;
+  auto* other = static_cast<unsigned char*>(XMemVirtualAlloc(nullptr, 0x10000, 0x20402000, 0x23, PAGE_READWRITE));
+  check(numbered && other && XMemMapPhysicalPages(other, 1, &odd) == nullptr,
+        "a page number that was not handed out is refused");
+  if (numbered) XMemFreePhysicalPages(3, numbers);
 }
 
 // The texture layout library: swizzle mode suggestion, and copies into the

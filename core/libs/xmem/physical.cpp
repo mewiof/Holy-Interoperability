@@ -66,6 +66,7 @@ struct Page {
   uint32_t index = 0;
   bool live = false;
   bool committed = false;
+  uint32_t maps = 0;  // granules it is mapped at (recorded or backed)
 };
 
 struct Region {
@@ -289,9 +290,23 @@ void split_placeholder(uintptr_t granule) {
   VirtualFree(reinterpret_cast<void*>(granule), kPage, MEM_RELEASE | kMemPreservePlaceholder);
 }
 
+// A freed page keeps its storage while any mapping of it remains: a new page
+// given the same storage would show through the old mapping. Called with
+// g_lock held.
+void release_if_unused(Page& page) {
+  if (page.live || page.maps != 0 || page.section < 0) return;
+  sections()[page.section].owner[page.index] = 0;
+  page.section = -1;
+}
+
 void unmap_granule(uintptr_t granule) {
   auto found = mapped().find(granule);
   if (found == mapped().end()) return;
+  if (found->second && found->second <= pages().size()) {
+    Page& page = pages()[found->second - 1];
+    if (page.maps) --page.maps;
+    release_if_unused(page);
+  }
   if (pending().erase(granule)) {
     mapped().erase(found);
     return;
@@ -314,6 +329,7 @@ bool map_granule(uintptr_t granule, ULONG_PTR id) {
   unmap_granule(granule);
   if (id == 0) return true;
   if (id > pages().size() || !pages()[id - 1].live) return false;
+  ++pages()[id - 1].maps;
   if (pages()[id - 1].section < 0) {
     // No storage yet: backed on first use.
     mapped()[granule] = id;
@@ -438,6 +454,29 @@ void* replace_placeholder(void* address, SIZE_T size, DWORD type, DWORD protect)
   return result;
 }
 
+// Observed: titles keep page numbers packed as `number >> 4` in 21-bit fields
+// and rebuild them as `value << 4`: page numbers are frame numbers in 4 KiB
+// units, so every 64 KiB page's number is a multiple of 16 (as the desktop's
+// user physical page frame numbers count 4 KiB frames). Internally pages are
+// numbered from 1; titles see that number times 16.
+namespace {
+
+ULONG_PTR to_frame(ULONG_PTR id) {
+  return id << 4;
+}
+ULONG_PTR to_id(ULONG_PTR frame) {
+  if (frame == 0) return 0;
+  if (frame & 15) return ~ULONG_PTR{0};  // not a page this library handed out
+  return frame >> 4;
+}
+std::vector<ULONG_PTR> ids_of(const ULONG_PTR* frames, ULONG_PTR count) {
+  std::vector<ULONG_PTR> ids(count, 0);
+  for (ULONG_PTR i = 0; frames && i < count; ++i) ids[i] = to_id(frames[i]);
+  return ids;
+}
+
+}  // namespace
+
 HOLY_EXPORT BOOL XMemAllocatePhysicalPages(uint64_t attributes, ULONG_PTR* count, ULONG_PTR* page_array) {
   if (!count || !page_array || *count == 0) {
     SetLastError(ERROR_INVALID_PARAMETER);
@@ -448,7 +487,7 @@ HOLY_EXPORT BOOL XMemAllocatePhysicalPages(uint64_t attributes, ULONG_PTR* count
   const ULONG_PTR first = pages().size() + 1;  // ids start at 1
   pages().resize(pages().size() + requested, Page{-1, 0, true, false});
   unlock();
-  for (ULONG_PTR i = 0; i < requested; ++i) page_array[i] = first + i;
+  for (ULONG_PTR i = 0; i < requested; ++i) page_array[i] = to_frame(first + i);
   LIB_LOG(holy::lib::kDebug, "xmem", "allocated %llu physical pages (attributes 0x%llx)",
           static_cast<unsigned long long>(requested), static_cast<unsigned long long>(attributes));
   return TRUE;
@@ -489,18 +528,28 @@ HOLY_EXPORT BOOL HolyXMemQueryPhysical(const void* address, HANDLE* section, uin
   return found;
 }
 
+// For the graphics library: the page number (as XMemAllocatePhysicalPages
+// handed it out) of the physical page mapped at `address`, 0 if none is.
+HOLY_EXPORT ULONG_PTR HolyXMemPhysicalPageAt(const void* address) {
+  const uintptr_t granule = reinterpret_cast<uintptr_t>(address) & ~(kPage - 1);
+  lock();
+  auto it = mapped().find(granule);
+  const ULONG_PTR frame = it == mapped().end() ? 0 : to_frame(it->second);
+  unlock();
+  return frame;
+}
+
 HOLY_EXPORT BOOL XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* page_array) {
   if (!page_array) return FALSE;
-  const std::vector<ULONG_PTR> ids(page_array, page_array + count);
+  const std::vector<ULONG_PTR> ids = ids_of(page_array, count);
   lock();
   for (ULONG_PTR i = 0; i < count; ++i) {
     const ULONG_PTR id = ids[i];
     if (id == 0 || id > pages().size() || !pages()[id - 1].live) continue;
     Page& page = pages()[id - 1];
     page.live = false;
-    // The slot becomes free for a fresh page; views still mapped keep their
-    // memory until they are unmapped.
-    if (page.section >= 0) sections()[page.section].owner[page.index] = 0;
+    // The storage becomes free for a fresh page once no mapping shows it.
+    release_if_unused(page);
   }
   unlock();
   return TRUE;
@@ -510,11 +559,11 @@ HOLY_EXPORT void* XMemMapPhysicalPages(void* address, ULONG_PTR count, ULONG_PTR
   if (!address || count == 0 || (reinterpret_cast<uintptr_t>(address) & (kPage - 1))) return nullptr;
   install_lazy_backing();
   const auto base = reinterpret_cast<uintptr_t>(address);
-  const std::vector<ULONG_PTR> ids = page_array ? std::vector<ULONG_PTR>(page_array, page_array + count)
-                                                : std::vector<ULONG_PTR>(count, 0);
-  if (count <= 64 && HolyLogEnabled(holy::lib::kTrace)) {
-    LIB_LOG(holy::lib::kTrace, "xmem", "map %llu pages at %p, first id %llu", static_cast<unsigned long long>(count),
-            address, static_cast<unsigned long long>(ids.empty() ? 0 : ids[0]));
+  const std::vector<ULONG_PTR> ids = ids_of(page_array, count);
+  if (HolyLogEnabled(holy::lib::kTrace)) {
+    std::unordered_set<ULONG_PTR> distinct(ids.begin(), ids.end());
+    LIB_LOG(holy::lib::kTrace, "xmem", "map %llu pages at %p (%llu distinct)", static_cast<unsigned long long>(count),
+            address, static_cast<unsigned long long>(distinct.size()));
   }
   bool ok = true;
   lock();
@@ -531,11 +580,12 @@ HOLY_EXPORT BOOL XMemMapPhysicalPagesScatter(void** addresses, ULONG_PTR count, 
   if (!addresses) return FALSE;
   install_lazy_backing();
   const std::vector<void*> places(addresses, addresses + count);
-  const std::vector<ULONG_PTR> ids = page_array ? std::vector<ULONG_PTR>(page_array, page_array + count)
-                                                : std::vector<ULONG_PTR>(count, 0);
-  if (count <= 64 && HolyLogEnabled(holy::lib::kTrace)) {
-    LIB_LOG(holy::lib::kTrace, "xmem", "scatter-map %llu pages, first at %p id %llu", static_cast<unsigned long long>(count),
-            places.empty() ? nullptr : places[0], static_cast<unsigned long long>(ids.empty() ? 0 : ids[0]));
+  const std::vector<ULONG_PTR> ids = ids_of(page_array, count);
+  if (HolyLogEnabled(holy::lib::kTrace)) {
+    std::unordered_set<ULONG_PTR> distinct(ids.begin(), ids.end());
+    LIB_LOG(holy::lib::kTrace, "xmem", "scatter-map %llu pages (%llu distinct), first at %p",
+            static_cast<unsigned long long>(count), static_cast<unsigned long long>(distinct.size()),
+            places.empty() ? nullptr : places[0]);
   }
   bool ok = true;
   lock();

@@ -100,6 +100,12 @@ The largest piece.
 Hardware audio processing interfaces. Plan: software implementations of the processing the title requests,
 output through the host's audio stack.
 
+- done: the audio processor heap (`ApuCreateHeap`, `ApuAlloc`, `ApuFree`, address mapping and validity).
+- next: shape contexts and the processors' command queues (`AcpHalAllocateShapeContexts`, `AcpHalCreate`,
+  `XApu*`, `XDsp*`), which the reference title calls right after creating the heap. They include decoding the
+  console's compressed audio format, which needs either an original decoder or a third-party one (a decision
+  for the maintainer).
+
 ## 6. Input (`gameinput`) — partial
 
 The console flavour of the input API, built under an alias because the host has a different DLL of the same

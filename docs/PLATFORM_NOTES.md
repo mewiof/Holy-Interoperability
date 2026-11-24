@@ -584,6 +584,27 @@ Notes describe the platform, never a title.
   apart; core/libs/texture_layout.h); the swizzle mode reported is 0 (*assumed* linear). Other computer slots
   report themselves.
 
+## Audio processor heap (`AcpHal.dll`)
+
+- *observed* (call sites, how results are checked): `HRESULT ApuCreateHeap(uint32_t cached_bytes, uint32_t
+  non_cached_bytes)`, called once at audio start-up (a failure is fatal to titles; a cached size of several hundred
+  MiB and a non-cached one of about 2 MiB seen); `HRESULT ApuAlloc(void** address, uint32_t* apu_address,
+  uint32_t bytes, uint32_t alignment, uint32_t flags)` (`apu_address` may be null; 2 KiB alignment seen; flags 1
+  with large requests, 2 with a request that just fits the non-cached size: *assumed* 1 the cached heap, 2 the
+  non-cached one); `HRESULT ApuFree(void* address)`; `bool ApuIsVirtualAddressValid(const void* address,
+  uint32_t bytes)`; `uint32_t ApuMapVirtualAddress(const void* address)` (the 32-bit address the audio hardware
+  uses) and `void* ApuMapApuAddress(uint32_t)`.
+- Implementation: both heaps in one reservation, committed as handed out; an audio address is the offset in it
+  plus a fixed base (never 0); first-fit allocation per heap; a range is valid within one allocation.
+- *observed*: titles then call `AcpHalAllocateShapeContexts(description)` (a structure of context counts the
+  title fills in first), `AcpHalCreate(IAcpHal** out)` and methods of that object (slot 0 with two 4 KiB sizes,
+  slot 2 with a message mask), and talk to two audio processors through `xapu.dll`
+  (`XApuConnect`/`Disconnect`/`EnqueueCommand`/`DequeueResult`/`GetResultCount`) and `chad.dll`
+  (`XDspActivate`/`ConnectWithMaximumStreamLimit`/`Deactivate`/`Disconnect`/`SubmitCommand`). These do the
+  hardware's audio processing (decoding the console's compressed audio among it) and are not implemented; they
+  report themselves.
+
 ## Libraries not started
 
-Import names seen, contracts open: the audio hardware interfaces (`AcpHal.dll`, `xapu.dll`, `chad.dll`).
+Import names seen, contracts open: the audio processors' command interfaces (`xapu.dll`, `chad.dll`) and
+`AcpHal.dll`'s shape contexts (see above).

@@ -44,7 +44,7 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `gameinput` (input) | Interface present; no input devices surfaced yet |
 | Offline switch, interposers for DLLs the package ships | Working, tested end to end |
 | `xg_xs` (texture layout) | Swizzle mode suggestion, texture copies into a desktop-compatible layout |
-| Audio console libraries | Not started: the reference title stops at its first call into them (`ApuCreateHeap`) when its graphics device survives that far |
+| Audio console libraries | Audio processor heap only; shape contexts and the processors' command queues not started (the reference title stops at `AcpHalAllocateShapeContexts` when its graphics device survives that far) |
 
 What this means in practice: a retail title image loads, runs its static initialisation, initialises the
 game runtime, creates its window, graphics device and pipelines (shaders translated from native GPU code),

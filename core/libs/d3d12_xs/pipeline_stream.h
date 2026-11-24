@@ -4,7 +4,10 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
+
+#include "core/libs/d3d12_xs/shader/translate.h"
 
 #include "core/libs/d3d12_xs/device.h"
 
@@ -22,6 +25,11 @@ void stream_append(std::vector<uint8_t>* stream, uint32_t type, const void* data
 HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream,
                                  std::vector<std::vector<uint8_t>> blobs, bool translated,
                                  const lib::VtableInfo* info, void* const* vtable, void** pipeline);
+
+// translate_graphics with results kept by code hash: titles create many
+// pipelines from the same programs.
+bool translate_graphics_cached(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,
+                               ShaderInterface* link, std::string* error);
 
 // The host pipeline behind a pipeline wrapper, waiting for its compile.
 // Null if the host refused it.

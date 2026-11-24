@@ -875,7 +875,7 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   ShaderInterface vs_link, ps_link;
   auto translate = [&](const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* bytecode,
                        ShaderInterface* link) {
-    if (translate_graphics(code, size, stage, bytecode, link, &error)) return true;
+    if (translate_graphics_cached(code, size, stage, bytecode, link, &error)) return true;
     dump_shader(code, size, "native graphics");
     LIB_LOG(lib::kError, "d3d12", "native %s shader not translatable: %s",
             stage == GraphicsStage::Vertex ? "vertex" : "pixel", error.c_str());

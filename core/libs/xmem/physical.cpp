@@ -487,6 +487,10 @@ HOLY_EXPORT void* XMemMapPhysicalPages(void* address, ULONG_PTR count, ULONG_PTR
   const auto base = reinterpret_cast<uintptr_t>(address);
   const std::vector<ULONG_PTR> ids = page_array ? std::vector<ULONG_PTR>(page_array, page_array + count)
                                                 : std::vector<ULONG_PTR>(count, 0);
+  if (count <= 64 && HolyLogEnabled(holy::lib::kTrace)) {
+    LIB_LOG(holy::lib::kTrace, "xmem", "map %llu pages at %p, first id %llu", static_cast<unsigned long long>(count),
+            address, static_cast<unsigned long long>(ids.empty() ? 0 : ids[0]));
+  }
   bool ok = true;
   lock();
   if (!make_placeholder_region(base)) {
@@ -504,6 +508,10 @@ HOLY_EXPORT BOOL XMemMapPhysicalPagesScatter(void** addresses, ULONG_PTR count, 
   const std::vector<void*> places(addresses, addresses + count);
   const std::vector<ULONG_PTR> ids = page_array ? std::vector<ULONG_PTR>(page_array, page_array + count)
                                                 : std::vector<ULONG_PTR>(count, 0);
+  if (count <= 64 && HolyLogEnabled(holy::lib::kTrace)) {
+    LIB_LOG(holy::lib::kTrace, "xmem", "scatter-map %llu pages, first at %p id %llu", static_cast<unsigned long long>(count),
+            places.empty() ? nullptr : places[0], static_cast<unsigned long long>(ids.empty() ? 0 : ids[0]));
+  }
   bool ok = true;
   lock();
   for (ULONG_PTR i = 0; i < count && ok; ++i) {

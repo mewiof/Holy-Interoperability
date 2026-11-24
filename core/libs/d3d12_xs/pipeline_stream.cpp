@@ -203,7 +203,7 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
       }
       std::vector<uint8_t>& out = vertex ? vs : ps;
       if (!native_program(bytecode.pShaderBytecode, bytecode.BytecodeLength, &program) ||
-          !translate_graphics(program.block.data() + program.code_offset, program.block.size() - program.code_offset,
+          !translate_graphics_cached(program.block.data() + program.code_offset, program.block.size() - program.code_offset,
                               vertex ? GraphicsStage::Vertex : GraphicsStage::Pixel, &out,
                               vertex ? &vs_link : &ps_link, &error)) {
         dump_shader(bytecode.pShaderBytecode, bytecode.BytecodeLength, "pipeline");
@@ -320,10 +320,15 @@ bool own_pointers(Recipe* recipe) {
 
 // --- host compilation in the background ---------------------------------------------
 //
-// The host object behind a pipeline is set by its compile job; uses of the
-// pipeline go through pipeline_host, which waits for the job. Jobs run when
-// the pipeline is created. A compile the host refuses is reported; the
-// pipeline then has no host object and its draws are dropped and reported.
+// Observed: titles create hundreds of pipelines on worker threads during
+// start-up from program data that stays valid only for a while, relying on
+// creation being as quick as on the console; created slowly, later pipelines
+// are built from data that has already been replaced. So creation returns
+// once its inputs are copied and translated (translations are kept by code
+// hash), and the host compile runs on a small thread pool; uses of the
+// pipeline go through pipeline_host, which waits for it. A compile the host
+// refuses is reported when it happens; the pipeline then has no host object
+// and its draws are dropped and reported.
 
 struct Compile {
   Device* device;
@@ -375,9 +380,19 @@ HRESULT create_from_recipe(Device* device, std::shared_ptr<Recipe> recipe, const
     std::lock_guard<std::mutex> guard(g_recipe_lock);
     recipes()[wrapper] = std::move(recipe);
   }
-  // Compiled here: in the background the compiles competed with the title's
-  // own start-up work for the processor and made start-up slower.
-  compile_pipeline(nullptr, job);
+  static PTP_CALLBACK_ENVIRON environment = [] {
+    // A small pool: compiles must not take the processor from the title's
+    // own start-up work.
+    auto* env = new TP_CALLBACK_ENVIRON();
+    InitializeThreadpoolEnvironment(env);
+    PTP_POOL pool = CreateThreadpool(nullptr);
+    if (!pool) return static_cast<PTP_CALLBACK_ENVIRON>(nullptr);
+    SetThreadpoolThreadMaximum(pool, 3);
+    SetThreadpoolThreadMinimum(pool, 1);
+    SetThreadpoolCallbackPool(env, pool);
+    return env;
+  }();
+  if (!environment || !TrySubmitThreadpoolCallback(&compile_pipeline, job, environment)) compile_pipeline(nullptr, job);
   *pipeline = wrapper;
   return S_OK;
 }
@@ -500,6 +515,30 @@ ID3D12PipelineState* pipeline_host(const void* pipeline) {
   return static_cast<ID3D12PipelineState*>(
       InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(const_cast<IUnknown**>(&wrapper->host)),
                                         nullptr, nullptr));
+}
+
+bool translate_graphics_cached(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,
+                               ShaderInterface* link, std::string* error) {
+  struct Entry {
+    std::vector<uint8_t> dxbc;
+    ShaderInterface link;
+  };
+  static std::mutex lock;
+  static auto* cache = new std::map<std::pair<uint64_t, int>, Entry>();
+  const auto key = std::make_pair(shader_hash(code, size), static_cast<int>(stage));
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    auto found = cache->find(key);
+    if (found != cache->end()) {
+      *dxbc = found->second.dxbc;
+      *link = found->second.link;
+      return true;
+    }
+  }
+  if (!translate_graphics(code, size, stage, dxbc, link, error)) return false;
+  std::lock_guard<std::mutex> guard(lock);
+  (*cache)[key] = Entry{*dxbc, *link};
+  return true;
 }
 
 }  // namespace holy::d3d12

@@ -37,14 +37,14 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Loader: in-memory import takeover, sandbox, job control, timeouts | Working, tested end to end |
 | Runtime: import binder, reporting thunks, call tracing, crash reports | Working, tested end to end |
 | Title environment: package mount, read-only package, scratch storage, console identity, lifecycle registration | Working, tested end to end |
-| `xmem` (title memory) | Heap, virtual and physical-page allocation and mapping; commit on demand; lazily backed physical pages |
-| `d3d12_xs` (graphics) | Device on the host's Direct3D 12, queues, fences, descriptor heaps, views, resources and heaps in title memory, pipelines from DXIL or from native GPU code translated to host bytecode, command recording (state, root arguments, draws, dispatches, barriers), presentation onto the title's window with captured frames; translated rendering not yet checked against known results |
-| `xgameruntime` (game runtime) | Entry points, task queues and async calls, networking (offline), users (nobody signed in), system identity, package state, persistent local storage, display mode; other services missing |
+| `xmem` (title memory) | Heap, virtual and physical-page allocation and mapping (page numbers as titles expect them); commit on demand; lazily backed physical pages |
+| `d3d12_xs` (graphics) | Device on the host's Direct3D 12, queues, fences, descriptor heaps, views, resources and heaps in title memory, pipelines from DXIL or from native GPU code translated to host bytecode, command recording (state, root arguments, draws, dispatches, barriers), queue-ordered page mapping updates, presentation onto the title's window with captured frames; quad permutes and format loads of translated code checked on the host GPU, the rest of translated rendering not yet checked against known results; the host device is sometimes removed as hung during the reference title's first frames (cause open) |
+| `xgameruntime` (game runtime) | Entry points, task queues and async calls, networking (offline), users (nobody signed in), system identity, package state, persistent local storage, display mode, speech synthesis (refused by the host engine inside the sandbox); other services missing |
 | `xcrdapi` (fast storage) | Factory, file opening, status arrays, queues, file and memory requests including zlib (processed synchronously) |
 | `gameinput` (input) | Interface present; no input devices surfaced yet |
 | Offline switch, interposers for DLLs the package ships | Working, tested end to end |
 | `xg_xs` (texture layout) | Swizzle mode suggestion, texture copies into a desktop-compatible layout |
-| Audio console libraries | Not started |
+| Audio console libraries | Not started: the reference title stops at its first call into them (`ApuCreateHeap`) when its graphics device survives that far |
 
 What this means in practice: a retail title image loads, runs its static initialisation, initialises the
 game runtime, creates its window, graphics device and pipelines (shaders translated from native GPU code),

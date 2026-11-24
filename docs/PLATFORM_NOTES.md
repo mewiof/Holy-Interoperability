@@ -86,7 +86,11 @@ Notes describe the platform, never a title.
   flags.
 - *observed*: `XMemTransferMemory(uint32_t, size_t bytes)` is called with sizes rounded to 2 MiB and capped at
   16 MiB; the result is not acted on (*assumed* `HRESULT`).
-- Implementation: page ids are opaque. A page gets its storage when first mapped: a 64 KiB slice of a
+- *observed*: titles keep page numbers packed as `number >> 4` in 21-bit fields and rebuild them as
+  `value << 4` before mapping them: page numbers are frame numbers in 4 KiB units, so every 64 KiB page's number
+  is a multiple of 16 (as the desktop's user physical page frame numbers count 4 KiB frames). Numbers that are
+  not are refused. Handing out consecutive numbers made such titles map 16 different pages as one.
+- Implementation: a page gets its storage when first mapped: a 64 KiB slice of a
   committed pagefile-backed section laid out like the region it is mapped into (one section per chunk of up to
   1 GiB), at the offset of the granule. Pages a title maps side by side are therefore contiguous in one section,
   which lets the graphics library open one GPU heap over them. Mapping replaces 64 KiB placeholders with views
@@ -104,7 +108,8 @@ Notes describe the platform, never a title.
   library first), or when the graphics library asks for the memory behind an address. Fresh storage reads as
   zero. Commit charge is taken per section (up to 1 GiB) when its first page is used, not at mapping time.
   Storage a freed page leaves behind is cleared before another page takes it, so freshly allocated pages read
-  as zero (*assumed*, as the system's own pages do).
+  as zero (*assumed*, as the system's own pages do). A freed page that is still mapped somewhere keeps its
+  storage until its last mapping goes, so a new page never shows through an old mapping.
   Code holding the page-table lock never touches title memory (title arrays are copied in and out around
   it), since a fault there would re-enter the backing handler.
 - Implementation: commits of 64 MiB or more are always reserved and committed on first touch, not only when
@@ -164,6 +169,10 @@ Notes describe the platform, never a title.
   pipelines from native code given directly; they are translated.
 - *observed*: titles create constant buffer views of 128 bytes; the desktop requires multiples of 256 and removes
   the device otherwise. Views are widened to the next multiple of 256.
+- *observed*: titles also create constant buffer views at addresses that are not 256-byte aligned (32 bytes
+  past a multiple seen), which the desktop does not allow. The host descriptor is made a null view; translated
+  native code reads constant buffers through the title's descriptor memory and keeps the exact address.
+  Partial: rebuilt desktop programs reading such a view read zeros (logged once).
 - *observed*: titles ask for the descriptor increment of heap type 4, which the desktop does not have; what the
   type is has not been established (it is answered like resource views, 32 bytes).
 - *observed*: slot 70 makes a shader-resource view from a `D3D12_RESOURCE_DESC` and a
@@ -248,6 +257,21 @@ Notes describe the platform, never a title.
 - *observed*: queue slot 16 `Signal(fence, value)`, 18 `GetTimestampFrequency` (both two slots later than on the
   desktop), 32 `PresentX(plane count, planes, parameters)`, 35 `ExecuteCommandListsX(count, lists, frame token,
   flags)` (up to 256 lists).
+- *observed*: queue slot 31 takes `(count, mappings, pool address, pool page count, 0)`; the result is not
+  checked. Each mapping is `{64 KiB-aligned address, run count, runs}` (24 bytes), each run
+  `{kind, pool page, page count}` (12 bytes): kind 1 maps `count` pages of the pool (pool address + page × 64 KiB,
+  a physical-page reservation the title made a heap of with device slot 74) at the next pages from the mapping's
+  address on; kind 2 unmaps `count` pages there (titles then return the pool pages to their free list). Titles use
+  it to move texture pool pages into and out of a streaming address range; the page numbers are pool page
+  indices, not physical page numbers. *assumed*: it takes effect in queue order. Implementation: the pages are
+  remapped when the call is made, through the memory library (`XMemMapPhysicalPages` with the physical pages
+  behind the pool pages). GPU addresses are resolved when commands are recorded, so recorded work keeps the old
+  pages; partial: work recorded before the call but submitted after it would see the new ones on the console.
+- *observed* host behaviour, open: during the first frames of a title the host device is at times removed as
+  hung (`DXGI_ERROR_DEVICE_HUNG`, with a matching display driver error event) about a second after the title
+  first submits work; device-removed data shows the next title command list stopped right after its start. It
+  happened with presents, immediate writes, timestamp queries, barriers or draws each left out, and not with
+  the debug layer's GPU-based validation on (which serialises GPU work). Not established.
 - *observed*: fence slot 12 (past the desktop `ID3D12Fence1`) returns the address of the fence's current value;
   titles poll it, reading all ones as a removed device. Implementation: a cell per fence kept at the host value by
   a thread that waits for each completion.
@@ -262,7 +286,8 @@ Notes describe the platform, never a title.
 - *observed*: planes have the public `D3D12XBOX_PRESENT_PLANE_PARAMETERS` layout (token, resource count, resources,
   source rectangles, destination placement, colour space). Implementation: a flip-model swap chain on the
   title's window (the largest visible top-level window of the process); the first plane's display buffer is
-  copied into it and presented. Presents 1, 30, 300 and every 1800th are also written to
+  copied into it and presented with sync interval 0 (titles pace their frames with frame events, so the
+  present does not also wait for the display). Presents 1, 30, 300 and every 1800th are also written to
   `<data>/frames/present-<n>.bmp`. Partial: one plane; colour space and placement not applied.
 
 ### Resources
@@ -283,8 +308,16 @@ Notes describe the platform, never a title.
   desktop `D3D12_DEPTH_STENCIL_DESC` (0), `D3D12_RASTERIZER_DESC` (1) or `D3D12_BLEND_DESC` (2). Type 5 (written
   next to depth-stencil entries with zero depth fields) is not established and not applied. Implementation:
   every graphics pipeline keeps its desktop pipeline stream ("recipe"), which derived pipelines copy and patch.
-- *observed*: graphics pipelines from native code (slot 57) list their stages in no fixed order; the stage is told
-  by the code (position exports: vertex; colour/depth/null exports or interpolation: pixel). Stage metadata
+- *observed*: graphics pipelines from native code (slot 57) take a description of a root signature, (pointer,
+  size) of a render-state block and of a pipeline block, then three stage slots of (code, code size, metadata,
+  metadata size), each possibly zero: a slot can be empty before a used one (a pipeline with only a vertex program
+  in the second slot seen). Stages come in no fixed order; the stage is told
+  by the code (position exports: vertex; colour/depth/null exports or interpolation: pixel). The render-state
+  block has been seen at 0x17C, 0x184 and 0x18C bytes with the same dwords up to the blend controls (dword 0x1E
+  `CB_TARGET_MASK`, 0x28 `PA_SU_SC_MODE_CNTL`, 0x34-0x3B `CB_BLEND0-7_CONTROL`, public RDNA register layouts).
+  Pipeline block dword 9 byte 2 holds the primitive topology type in bits 0-3; bit 4 is set in a few pipelines
+  and not understood (not translated). A pipeline without a pixel program counts one render target of format 0
+  (`DXGI_FORMAT_UNKNOWN`), which is not written. Stage metadata
   dword 3's high half is the number of 32-byte records of kind 0x41 that follow: one per resource binding the
   stage reads (dword 2 its offset in dwords in the descriptor table, dword 3 the register, dword 4 the view
   dimension). The pipeline block holds one byte-sized DXGI format per render target (bytes 16-23).
@@ -350,6 +383,23 @@ Notes describe the platform, never a title.
 | `0b9d556e-ab70-43f4-baa0-9999ac4cb040` (`af406016-e850-4aa8-a88d-2f3dcb9dac7e`) package | 3 `XPackageGetCurrentProcessPackageIdentifier` (33-byte buffer), 4 `XPackageIsPackagedProcess`, 5 `XPackageCreateInstallationMonitor`, 6 `XPackageCloseInstallationMonitorHandle`, 7 `XPackageGetInstallationProgress`, 9 `XPackageRegisterInstallationProgressChanged`, 39 `XPackageEnumeratePackages` |
 | `41a4e10c-5a7e-41d9-8c37-37bde62a07d6` (`f4faf4d4-2d04-4fce-b3e0-474a713a3e84`) persistent local storage | 4 `XPersistentLocalStorageGetPath`, 5 `XPersistentLocalStorageGetSpaceInfo` |
 | `35f07670-706e-4bfb-9476-090798c5ebf3` (`03f0fe74-fdd9-4e5c-b630-f9339c47acc5`) display | 4 `XDisplayTryEnableHdrMode` |
+
+### Speech synthesis
+
+- *observed*: interface `{d722b373-8c4d-4692-9e51-d6ad9b37aa7d}` (queried through provider
+  `{3e241977-6237-41e9-8559-102c2d9983f1}`: the two ids differ) is the documented `XSpeechSynthesizer` API, by
+  the client library's thunks (slot, argument count): 8 `EnumerateInstalledVoices(context, callback)`,
+  9 `Create(handle*)`, 10 `CloseHandle`, 11 `SetDefaultVoice`, 12 `SetCustomVoice(handle, voice id)`,
+  13 `CreateStreamFromText(handle, text, stream*)`, 14 `CloseStreamHandle`, 15 `GetStreamDataSize(stream, size*)`,
+  16 `GetStreamData(stream, size, buffer, used*)`, 21 `CreateStreamFromSsml(handle, ssml, stream*)`.
+  *documented*: voice information `{description, display name, gender (0 female, 1 male), voice id, language
+  (BCP-47)}`; the callback returns whether to continue; stream data is a WAVE container; an invalid stream
+  handle gives `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`.
+- Implementation: the host's speech engine (SAPI 5, part of Windows) enumerates voices and synthesizes
+  16-bit mono PCM at 22.05 kHz into a WAVE container when a stream is created. Unknown voice ids and invalid
+  synthesizer handles also give `ERROR_NOT_FOUND` (*assumed*). *observed* host behaviour: at low integrity (the
+  sandbox) the host engine refuses to speak (`0x80045040`); synthesis then returns that error and no stream.
+  Voice enumeration and synthesizers work in the sandbox.
 
 ### Behaviour
 
@@ -485,6 +535,21 @@ Notes describe the platform, never a title.
   (through the console-format descriptors in title memory: the host heap index in dword 0), cross-lane
   operations through group shared memory, f16 class tests and i16 compares are translated. Anything else
   reports itself.
+- *documented* (public RDNA 2 buffer descriptor layout): word 3 holds the destination selects (bits 0-11, three
+  bits a component: 0 zero, 1 one, 4-7 the loaded x-w) and the data format (bits 12-18).
+  `buffer_load_format_*` take their format from there: titles' vertex programs fetch vertex data that way.
+  Implementation: a switch over the format table picks component widths and numeric type, and one decoder
+  handles every format (a decoder per format made programs too large for the host's shader compiler, which ran
+  out of memory); format 0 and formats outside the table read as zero.
+- *observed*: pixel programs use DPP `quad_perm` operands (the console compiler's derivatives: a value minus the
+  quad's first lane's, then read from lanes 1 and 2, with `|x|` modifiers on both sources for widths).
+  Implementation: a host pixel shader has no exchange memory, but fine derivatives carry a quad neighbour's value
+  as a difference. Each value is exchanged as two floats holding 16 and 17 bits (the low half and the source
+  lane's `EXEC` bit) so every step is exact (checked on the host GPU by a unit test that renders four quads);
+  the quad position (console lane order: 0 top left, 1 top right, 2 bottom left, 3 bottom right) comes from
+  `SV_Position`. Like implicit-derivative sampling this requires the four lanes of a quad to reach the
+  instruction together. Other DPP controls in pixel programs (reading outside the quad) report themselves.
+  DPP source-1 negate/absolute modifiers are applied in every stage; `s_bfm_b64` is translated.
 - Implementation, native graphics programs (vertex and pixel): the same translation, with the 16 user SGPRs
   from the system constants. Parameter exports (`PARAMn`) become `TEXCOORDn` outputs in register n + 1 and the
   first position export `SV_Position`; a pixel shader's attribute n is the input `TEXCOORDn`, interpolated by

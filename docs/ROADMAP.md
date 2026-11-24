@@ -38,6 +38,8 @@ Legend: **done** — implemented and tested; **partial** — some of it works; *
 - done: honouring a title's exported allocation hooks.
 - done: lazy storage for mapped physical pages (commit follows use; texture pools of several GiB map on hosts
   with less spare commit).
+- done: page numbers are 4 KiB frame numbers (multiples of 16), as titles that store them shifted right by four
+  require; freed pages keep their storage while still mapped.
 
 ## 3. Game runtime (`xgameruntime`) — partial
 
@@ -50,7 +52,8 @@ provider interfaces obtained from `QueryApiImpl`.
 - done: task queues, async blocks, the time-sensitive thread assertion.
 - done (the functions titles have been seen to call): connectivity hint, user add (nobody signed in) and
   change events, system analytics info and device identity, title id, package identity and installation
-  state, persistent local storage, HDR mode.
+  state, persistent local storage, HDR mode, speech synthesis (the host's speech engine; it refuses to speak in
+  the low-integrity sandbox, so synthesis there returns the host's error).
 - open: the rest of the user service, game saves, store queries.
 - Policy for services with no local equivalent: the runtime does not sign users in to anything, does not
   emulate online services, and never reports ownership of add-on content.
@@ -79,9 +82,14 @@ The largest piece.
   timestamps; translated pipelines get their root arguments as native code expects them, with a region table per
   call. Not yet checked against known results; memory reached only through pointers in memory is not covered.
 - partial: presentation: frame tokens, `PresentX` onto a swap chain on the title's window, captured frames.
-- next: a start-up race in the reference title: its movie player's pipelines are created from pipeline streams
-  whose shader subobjects do not hold the programs of their stage (refused as invalid), and its main thread uses
-  that effect's programs before they exist. The cause is not established yet.
+- done: queue-ordered page mapping updates (queue slot 31) for texture pools, applied when called.
+- done: native pipeline descriptions with sparse stage slots, `buffer_load_format_*` with the descriptor's format
+  and selects, pixel-program quad permutes through fine derivatives (bit-exact, checked on the host GPU),
+  DPP source-1 modifiers, `s_bfm_b64`; constant buffer views at unaligned addresses (null on the host).
+- next: the host device is removed as hung (`DXGI_ERROR_DEVICE_HUNG`) at times, a second into the reference
+  title's first frames, with its next command list stopped near its start. Not established yet: the debug layer
+  reports nothing, GPU-based validation makes it go away, and it persists without presents, immediate writes,
+  timestamps, barriers or draws. The host was short of memory at the time (another process held 37 GB).
 - open: textures the GPU writes in title memory as seen by the CPU.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.

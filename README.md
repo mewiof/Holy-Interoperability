@@ -38,7 +38,7 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Runtime: import binder, reporting thunks, call tracing, crash reports | Working, tested end to end |
 | Title environment: package mount, read-only package, scratch storage, console identity, lifecycle registration | Working, tested end to end |
 | `xmem` (title memory) | Heap, virtual and physical-page allocation and mapping; commit on demand; lazily backed physical pages |
-| `d3d12_xs` (graphics) | Device on the host's Direct3D 12, queues, fences, descriptor heaps, views, samplers, query heaps, command signatures, resources and heaps in title memory, compute and graphics pipelines from DXIL or from native GPU code translated to host bytecode (not yet run); no command recording or rendering yet |
+| `d3d12_xs` (graphics) | Device on the host's Direct3D 12, queues, fences, descriptor heaps, views, resources and heaps in title memory, pipelines from DXIL or from native GPU code translated to host bytecode, command recording (state, root arguments, draws, dispatches, barriers), presentation onto the title's window with captured frames; translated rendering not yet checked against known results |
 | `xgameruntime` (game runtime) | Entry points, task queues and async calls, networking (offline), users (nobody signed in), system identity, package state, persistent local storage, display mode; other services missing |
 | `xcrdapi` (fast storage) | Factory, file opening, status arrays, queues, file and memory requests including zlib (processed synchronously) |
 | `gameinput` (input) | Interface present; no input devices surfaced yet |
@@ -47,14 +47,12 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Audio console libraries | Not started |
 
 What this means in practice: a retail title image loads, runs its static initialisation, initialises the
-game runtime, creates its task queues, queries networking, user and system services and the input API, and
-creates its window, its graphics device, queues, descriptor heaps, display buffers, the compute pipelines of
-a packaged library (one of them translated from native GPU code because the host refuses its DXIL), query
-heaps, command signatures, its texture pool, its first graphics pipelines (shaders translated from native
-GPU code) and textures, streams its start-up data through fast storage for about half a minute, and stops at a
-compute pipeline given as raw native code that uses image and cross-lane instructions the translation does not
-support yet. Nothing is rendered yet and no title is playable: command
-recording, graphics shader translation and presentation are open (see [docs/ROADMAP.md](docs/ROADMAP.md)).
+game runtime, creates its window, graphics device and pipelines (shaders translated from native GPU code),
+streams its start-up data through fast storage, records its first command lists, and presents its first
+frame onto a swap chain on its window, about half a minute after start. It then stops in its own start-up
+code: its movie player's pipelines are built from inconsistent shader sets, and the title uses them before
+they exist (see [docs/ROADMAP.md](docs/ROADMAP.md)). Nothing it draws has been seen yet and no title is
+playable.
 
 Progress is measured as *console library coverage*: of the console-only symbols a title imports, how many
 have a real implementation. `holy inspect` prints it for any package. Placeholder exports never count.

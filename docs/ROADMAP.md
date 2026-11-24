@@ -73,11 +73,16 @@ The largest piece.
   partly assumed), heaps over title memory, pipeline state streams (desktop or translated programs).
 - partial: `xg_xs` texture layout: swizzle mode suggestion and the texture computer's copy into the layout it
   reports (desktop copyable footprints); texture views at title addresses through host copies.
-- next: compute pipelines from native code given directly (device slot 67), which need image instructions and
-  cross-lane operations in the translation (DXBC has no wave operations; to be emulated through group shared
-  memory); then command recording (for translated pipelines: root data in user SGPRs, root tables, the region
-  table and console-format descriptors in title memory) and presentation.
-- open: textures the GPU writes in title memory, presentation.
+- done: compute pipelines from native code given directly (slot 67), native graphics pipelines (slot 57), derived
+  pipelines (slot 55), image instructions, gathers, the unified typed buffer formats, cross-lane operations.
+- partial: command recording: state, root arguments, draws and dispatches, barriers, clears, GPU-written values and
+  timestamps; translated pipelines get their root arguments as native code expects them, with a region table per
+  call. Not yet checked against known results; memory reached only through pointers in memory is not covered.
+- partial: presentation: frame tokens, `PresentX` onto a swap chain on the title's window, captured frames.
+- next: a start-up race in the reference title: its movie player's pipelines are created from pipeline streams
+  whose shader subobjects do not hold the programs of their stage (refused as invalid), and its main thread uses
+  that effect's programs before they exist. The cause is not established yet.
+- open: textures the GPU writes in title memory as seen by the CPU.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.
 - open: interaction with graphics helper DLLs that packages ship and that call into the device.
@@ -104,6 +109,9 @@ The console's fast-storage factory. Plan: implement on host file I/O first, the 
 - open: asynchronous processing (requests are carried out one at a time when enqueued), other request kinds.
 
 ## Cross-cutting
+
+- done: console processor instructions the host lacks (`CLZERO`, `MONITORX`, `MWAITX`) carried out by the runtime.
+- done: process exits the title starts are logged with their stack.
 
 - A way to run more than the default executable of a package, and to pass a launch context.
 - Symbol-free minidumps next to the runtime log.

@@ -23,6 +23,15 @@ Notes describe the platform, never a title.
   that lack an extension set get the classic DLL that implements the same functions.
 - *observed*: a title executable may export an allocation-hook table for the memory library to find.
 
+## Processor
+
+- *observed*: titles execute vendor-specific instructions of the console processor that some desktop processors
+  lack: `CLZERO` (zeroing caches lines of fresh buffers) and `MONITORX`/`MWAITX` (waiting on fence values).
+  *documented* (vendor programmer's manual): `CLZERO` zeroes the naturally aligned 64-byte line containing rAX;
+  `MWAITX` may end early for implementation-specific reasons.
+- Implementation: an illegal-instruction handler carries them out (`MONITORX` as nothing, `MWAITX` as yielding
+  the processor) and resumes after the instruction; title code is not modified. Each use costs an exception.
+
 ## Console identity
 
 - *observed*: platform code linked into titles determines the device type by opening
@@ -147,15 +156,14 @@ Notes describe the platform, never a title.
   the same shape is created and filled from that memory with buffer-to-texture copies, once per address and
   shape. Partial: memory written after that is not copied again; textures the GPU writes are not supported.
 - *observed*: device slot 67 takes (description, pipeline interface id, out) and returns an `HRESULT`. The
-  description holds the root signature and (pointer, size) pairs: 28 bytes of what look like register settings
-  (an 8x8 thread group among them), 20 bytes not understood, and native GPU code behind a short header. It
-  creates compute pipelines from native code given directly. Not supported yet: the code seen samples and
-  stores images and reduces values across lanes (DPP, `v_readlane`), which the translation lacks; such calls
-  report themselves.
+  description holds the root signature and (pointer, size) pairs: 28 bytes of compute registers (dword 3 the
+  thread group width and height, 4 its depth, 6 `COMPUTE_PGM_RSRC2` in the public RDNA layout: user SGPRs, group
+  id and group information enables, LDS size), 20 bytes not understood, and native GPU code. It creates compute
+  pipelines from native code given directly; they are translated.
 - *observed*: titles create constant buffer views of 128 bytes; the desktop requires multiples of 256 and removes
   the device otherwise. Views are widened to the next multiple of 256.
 - *observed*: titles ask for the descriptor increment of heap type 4, which the desktop does not have; what the
-  type is has not been established (the host answers 0, logged as an error).
+  type is has not been established (it is answered like resource views, 32 bytes).
 - *observed*: slot 70 makes a shader-resource view from a `D3D12_RESOURCE_DESC` and a
   `D3D12_SHADER_RESOURCE_VIEW_DESC` followed by the resource's GPU address, into a destination descriptor;
   titles flush the destination's cache lines afterwards.
@@ -205,9 +213,94 @@ Notes describe the platform, never a title.
     holds.
   - Root signature flag bits above the desktop's are dropped. Compute pipelines whose shaders keep their DXIL
     run from that program; shaders with only native GPU code, and shaders whose DXIL the host refuses, run
-    translated from their native code (see Graphics shaders). Recording and executing commands for
-    translated pipelines is not implemented yet.
+    translated from their native code (see Graphics shaders); their draws and dispatches receive root
+    arguments as described under "Root arguments of native code".
   - Every other slot, and any interface query other than the device's own and `IDXGIDevice`, reports itself.
+
+### Command recording and submission
+
+- *observed*: the console command list keeps the desktop slot order for slots 0-25 (9 `Close`, 12
+  `DrawInstanced`, 13 `DrawIndexedInstanced`, 14 `Dispatch`, 20 `IASetPrimitiveTopology`, 21 `RSSetViewports`,
+  22 `RSSetScissorRects`, 23 `OMSetBlendFactor`, 24 `OMSetStencilRef`, 25 `SetPipelineState`). From desktop
+  slot 28 to 48 the slots are the desktop's plus four (32 `SetDescriptorHeaps`, 33-46 root signatures, tables,
+  constants and root views, 47 `IASetIndexBuffer`, 48 `IASetVertexBuffers`, 50 `OMSetRenderTargets`, 51
+  `ClearDepthStencilView`, 52 `ClearRenderTargetView`); `OMSetDepthBounds` (desktop 62) is slot 70. Slot 126 is
+  `RSSetShadingRate(rate, combiners[2])`, slot 139 a reset `(allocator, pipeline state, 0)`, slot 146 the enhanced
+  `Barrier(group count, groups)` with desktop `D3D12_BARRIER_GROUP`s.
+- *observed*: barrier sync, access and layout values are the desktop's, except layout 31 (one past the desktop's
+  last), which titles move display buffers to right before presenting them; it is taken as the present layout.
+- *observed*: the list object exposes a command-buffer write cursor at offset 0x18 and its limit at 0x30. While
+  the cursor is below the limit titles write commands into the buffer themselves (advancing the cursor, setting
+  bytes at 0x140/0x141) instead of calling the method. Implementation: both are kept zero, so every command
+  reaches a method; the first 0x400 bytes of the object are a zeroed area titles may treat as theirs.
+- *observed*: slot 71 `(address, 32-bit value, 0, 0)` writes progress markers into title memory, slot 74
+  `(address, 7, value, 1)` a frame counter the CPU polls, slot 72 `(address, 0, 0, 1)` an 8-byte GPU timestamp
+  (*assumed* meanings). Implementation: `WriteBufferImmediate` (marker-out for slot 74) and timestamp queries
+  resolved into title memory.
+- *observed*: slot 142 is called with all ones before draws (*assumed*: the sample mask; other values report
+  themselves); slot 75 takes one byte titles derive from a pipeline property (meaning not established; recorded,
+  not applied).
+- *observed*: command allocator slot 9 registers a title function through which the console allocator obtains
+  command-buffer memory (size as the 4th argument, log2 alignment as the 5th, context as the 7th). Host
+  allocators manage their own memory; the function is recorded and never called.
+- *observed*: queue slot 16 `Signal(fence, value)`, 18 `GetTimestampFrequency` (both two slots later than on the
+  desktop), 32 `PresentX(plane count, planes, parameters)`, 35 `ExecuteCommandListsX(count, lists, frame token,
+  flags)` (up to 256 lists).
+- *observed*: fence slot 12 (past the desktop `ID3D12Fence1`) returns the address of the fence's current value;
+  titles poll it, reading all ones as a removed device. Implementation: a cell per fence kept at the host value by
+  a thread that waits for each completion.
+
+### Frame tokens and presentation
+
+- *observed* (public sample code shape): device slot 80 `WaitFrameEventX(type, timeout_ms, target, flags, token*)`.
+  Titles call it with type 0, a zero timeout and flags 2, require success and keep the token; and with type 2, an
+  infinite timeout and an earlier frame's token. *assumed*: flag bit 1 asks for the current frame's token without
+  waiting; event 2 of a frame is reached once its present has been carried out. Implementation: tokens count up;
+  presents signal a host fence with their token.
+- *observed*: planes have the public `D3D12XBOX_PRESENT_PLANE_PARAMETERS` layout (token, resource count, resources,
+  source rectangles, destination placement, colour space). Implementation: a flip-model swap chain on the
+  title's window (the largest visible top-level window of the process); the first plane's display buffer is
+  copied into it and presented. Presents 1, 30, 300 and every 1800th are also written to
+  `<data>/frames/present-<n>.bmp`. Partial: one plane; colour space and placement not applied.
+
+### Resources
+
+- *observed*: device slot 108 is `GetResourceAllocationInfo1`; titles retry without a small alignment when the
+  alignment returned differs and treat sizes of 4 GiB or more as fatal.
+- *observed*: titles set texture layout 0x105 on 3D textures (a console swizzle mode, *assumed*); console layouts
+  and flag bits above the desktop's are dropped for the host. Depth textures may ask for unordered access, and
+  packed 16-bit formats (`B5G6R5`, `B5G5R5A1`, `B4G4R4A4`) for typed unordered access; the desktop allows neither,
+  so the first are made without unordered access (UAVs of them report themselves) and the second as
+  `R8G8B8A8_UNORM` textures with matching views.
+- *observed*: the initial state titles pass to `CreatePlacedResourceX` for textures and to slot 127 is a barrier
+  layout (3 and 6 seen, then named as the layout before the first barrier). Implementation: host textures are
+  created in that layout (`CreateCommittedResource3`); each placement gets its own host texture.
+- *observed*: slot 70 may be called with a description buffer the title left unwritten (dimension zero in the
+  title's own texture record); a null view of the requested kind is made.
+- *observed*: device slot 55 derives a pipeline from a base pipeline and 0x14C-byte entries: a type dword and a
+  desktop `D3D12_DEPTH_STENCIL_DESC` (0), `D3D12_RASTERIZER_DESC` (1) or `D3D12_BLEND_DESC` (2). Type 5 (written
+  next to depth-stencil entries with zero depth fields) is not established and not applied. Implementation:
+  every graphics pipeline keeps its desktop pipeline stream ("recipe"), which derived pipelines copy and patch.
+- *observed*: graphics pipelines from native code (slot 57) list their stages in no fixed order; the stage is told
+  by the code (position exports: vertex; colour/depth/null exports or interpolation: pixel). Stage metadata
+  dword 3's high half is the number of 32-byte records of kind 0x41 that follow: one per resource binding the
+  stage reads (dword 2 its offset in dwords in the descriptor table, dword 3 the register, dword 4 the view
+  dimension). The pipeline block holds one byte-sized DXGI format per render target (bytes 16-23).
+
+### Root arguments of native code
+
+- *observed*: graphics stages read root arguments from user SGPRs starting at s8, packed in parameter order: a
+  descriptor table as the low half of its GPU address (native code sets the high half to zero, so shader-visible
+  heaps live below 4 GiB), constants as their values; the sampler heap's base follows (code indexes it with
+  sampler indices times 16). Vertex shaders read 16-byte buffer descriptors of the bound vertex buffers from a
+  table at s[0:1] (40-bit address) and add s2 to the vertex index. *assumed*: s3 holds the start instance;
+  compute programs read the same packing from a root table at s[0:1].
+- Implementation: shader-visible heaps get GPU addresses from 0x40000000; descriptor tables are 32 bytes per
+  resource view and 16 per sampler. Per draw or dispatch of a translated pipeline, an upload ring below 2^40 holds
+  the system constants (user SGPRs, region table) and the vertex buffer table; the region table covers the bound
+  heaps, the ring, and every buffer the bound tables, root views and vertex buffers name; region views are
+  written into the top 65536 descriptors of the bound host heap. Partial: memory reached only through pointers
+  held in memory is not in the region table (reads return zero); the ring is not fenced.
 
 ## Game runtime (`xgameruntime.dll`)
 
@@ -368,21 +461,28 @@ Notes describe the platform, never a title.
   `v0`-`v2` hold the thread id in the group; graphics root data starts at `s8`; vertex shaders get the vertex id in
   `v0` and the instance id in `v3`; a program is wave64 when it writes `EXEC` with 64-bit scalar operations
   (wave32 otherwise). Not yet confirmed by running translated code against known results.
-- *documented*: the native code is RDNA 2 (public AMD instruction set reference); decoding follows it.
+- *documented*: the native code is RDNA 2 (public AMD instruction set reference); decoding follows it. Operand
+  124 is M0 and 125 NULL (an earlier version of the decoder had them swapped).
+- *documented*: typed buffer loads use the RDNA 2 unified buffer formats (1-77: 8/16/32-bit, packed 10/11-bit and
+  2-10-10-10 layouts, each as unorm, snorm, uscaled, sscaled, uint, sint and float where defined); absent
+  components read as 0 and w as one.
+- *observed*: compute programs may enable the thread group information SGPR (after the group ids): waves in the
+  group in bits 0-5, the wave's index in bits 6-11 (*documented* layout in open-source drivers for the hardware).
 - *documented*: host bytecode (DXBC, shader model 5.1) follows the desktop runtime's tokenized program format;
   a container needs input and output signature parts besides `SHEX`, and the DXBC checksum.
 - Implementation, desktop programs: containers with bitcode are rebuilt as desktop containers (plain DXIL
   program, desktop parts kept, `RTS0` flags masked, digest recomputed) and run on the host.
-- Implementation, native programs (compute only): the native code is translated straight into DXBC, without a
+- Implementation, native programs: the native code is translated straight into DXBC, without a
   shader compiler. One host thread runs one lane; scalar registers are recomputed per lane; lane masks keep the
   lane's own bit; control flow becomes a loop around a switch over block addresses; workgroup barriers leave
   the loop and synchronise at the top level. Memory is reached through a region table: title GPU addresses
   (which equal CPU addresses) are looked up in a constant buffer of (base, size, view) entries and accessed
   through raw views (u0-u63, space 8). Scalar and vector ALU, scalar loads, buffer loads and stores
   (untyped, and typed for the 8/16/32-bit integer, normalised and float formats seen), global and flat
-  memory, atomics and group shared memory (32 KiB, the host's limit) are translated. Not translated, and
-  reported as such: cross-lane operations (DPP, lane reads with a lane mask), image instructions, and anything
-  else not listed.
+  memory, atomics and group shared memory (32 KiB, the host's limit), image loads, stores, samples and gathers
+  (through the console-format descriptors in title memory: the host heap index in dword 0), cross-lane
+  operations through group shared memory, f16 class tests and i16 compares are translated. Anything else
+  reports itself.
 - Implementation, native graphics programs (vertex and pixel): the same translation, with the 16 user SGPRs
   from the system constants. Parameter exports (`PARAMn`) become `TEXCOORDn` outputs in register n + 1 and the
   first position export `SV_Position`; a pixel shader's attribute n is the input `TEXCOORDn`, interpolated by

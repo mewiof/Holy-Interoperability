@@ -695,9 +695,10 @@ const auto kPipelineVtable = [] {
   return table;
 }();
 
-// The root signature of translated pipelines: the region views (u0-u63,
-// space 8) as a descriptor table, the system constants (b0, space 8) as a
-// root constant buffer view, and the bound shader-visible heaps whole (from
+// The root signature of translated pipelines: the memory slot views
+// (u0-u65535, space 8) as a descriptor table, the page table (t0, space 8) as
+// a root view, the system constants (b0, space 8) as a root constant buffer
+// view, and the bound shader-visible heaps whole (from
 // index 0) as texture and typed UAV arrays of each image dimension (spaces
 // kTextureSpace + slot) and as the sampler array (kTextureSpace).
 }  // namespace
@@ -706,7 +707,7 @@ ID3D12RootSignature* translated_root_signature(Device* device) {
   static std::mutex lock;
   std::lock_guard<std::mutex> guard(lock);
   if (device->translated_root) return device->translated_root;
-  D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, kRegionTableSize, 0, kTranslatedSpace, 0};
+  D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, kMemoryViews, 0, kTranslatedSpace, 0};
   constexpr uint32_t kSlots = kImageSlots;
   D3D12_DESCRIPTOR_RANGE images[3 * kSlots]{};
   for (uint32_t slot = 0; slot < kSlots; ++slot) {
@@ -716,8 +717,10 @@ ID3D12RootSignature* translated_root_signature(Device* device) {
   }
   D3D12_DESCRIPTOR_RANGE samplers{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, kTextureSpace, 0};
   D3D12_ROOT_PARAMETER parameters[kTranslatedRootParameters]{};
-  parameters[kRootRegions].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameters[kRootRegions].DescriptorTable = {1, &range};
+  parameters[kRootMemory].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[kRootMemory].DescriptorTable = {1, &range};
+  parameters[kRootPageTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+  parameters[kRootPageTable].Descriptor = {0, kTranslatedSpace};
   parameters[kRootSystem].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   parameters[kRootSystem].Descriptor = {0, kTranslatedSpace};
   parameters[kRootImages].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;

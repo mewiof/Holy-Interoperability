@@ -18,8 +18,10 @@ UINT title_descriptor_bytes(D3D12_DESCRIPTOR_HEAP_TYPE type);
 // zero), allocated upwards from here.
 inline constexpr uint64_t kHeapGpuBase = 0x40000000;
 
-// The top of every shader-visible CBV/SRV/UAV host heap holds the region
-// views of translated calls (bindings.cpp); title descriptors there clash.
+// Every shader-visible CBV/SRV/UAV host heap has this many descriptors more
+// than the title's, at its top: the memory slot views of translated calls
+// (gpu_memory.h). Where the host's limit leaves no room past the title's
+// descriptors, the block takes the top of the title's (they clash; logged).
 inline constexpr UINT kReservedHostViews = 65536;
 
 struct DescriptorHeap {

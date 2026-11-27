@@ -414,10 +414,18 @@ Notes describe the platform, never a title.
   compute programs read the same packing from a root table at s[0:1].
 - Implementation: shader-visible heaps get GPU addresses from 0x40000000; descriptor tables are 32 bytes per
   resource view and 16 per sampler. Per draw or dispatch of a translated pipeline, an upload ring below 2^40 holds
-  the system constants (user SGPRs, region table) and the vertex buffer table; the region table covers the bound
-  heaps, the ring, and every buffer the bound tables, root views and vertex buffers name; region views are
-  written into the top 65536 descriptors of the bound host heap. Partial: memory reached only through pointers
-  held in memory is not in the region table (reads return zero); the ring is not fenced.
+  the system constants (user SGPRs) and the vertex buffer table. Title memory is reached through one memory map
+  for every call: each host heap over title memory has memory slots (raw views of 512 MiB of its buffer, in a block
+  of 65536 descriptors past the title's own in every shader-visible host heap) and a page table maps each 64 KiB
+  page of title addresses to a slot and offset (`shader/translate.h`). Heaps' pages enter the table when the heaps
+  are opened (committed memory) or located (physical pages); descriptor heaps' GPU ranges when the heaps are
+  made; buffers the bound tables, root views and vertex buffers name are located before the call if their page
+  is not in the table yet. Partial: memory nothing has located (reached only through pointers held in memory)
+  reads as zero; the ring is not fenced.
+- *measured* host behaviour: a buffer placed in a heap takes whole 64 KiB units of it, so title memory of less
+  than 64 KiB cannot be reached by the GPU at all; `XMemAlloc` therefore takes whole 64 KiB units for page
+  allocations (the title sees the size it asked for). Memory a title's own allocation hooks hand out is as the
+  title made it (smaller pieces are logged).
 
 ## Game runtime (`xgameruntime.dll`)
 
@@ -618,9 +626,9 @@ Notes describe the platform, never a title.
 - Implementation, native programs: the native code is translated straight into DXBC, without a
   shader compiler. One host thread runs one lane; scalar registers are recomputed per lane; lane masks keep the
   lane's own bit; control flow becomes a loop around a switch over block addresses; workgroup barriers leave
-  the loop and synchronise at the top level. Memory is reached through a region table: title GPU addresses
-  (which equal CPU addresses) are looked up in a constant buffer of (base, size, view) entries and accessed
-  through raw views (u0-u63, space 8). Scalar and vector ALU, scalar loads, buffer loads and stores
+  the loop and synchronise at the top level. Memory is reached through the memory map: title GPU addresses
+  (which equal CPU addresses) are looked up in a two-level page table (t0, space 8: a 1 GiB window, then the
+  64 KiB page) giving a memory slot and offset, and accessed through the slot's raw view (u0-u65535, space 8). Scalar and vector ALU, scalar loads, buffer loads and stores
   (untyped, and typed for the 8/16/32-bit integer, normalised and float formats seen), global and flat
   memory, atomics and group shared memory (32 KiB, the host's limit), image loads, stores, samples and gathers
   (through the console-format descriptors in title memory: the host heap index in dword 0), cross-lane

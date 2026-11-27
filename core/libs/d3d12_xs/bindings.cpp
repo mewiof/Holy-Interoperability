@@ -13,17 +13,19 @@
 //   the same way.
 //
 // Host model, per draw or dispatch of a translated pipeline: the system
-// constants the translation reads (user SGPRs, region table) and the vertex
-// buffer table are written into an upload ring the GPU reads from; the region
-// table lists the memory the call can reach: the bound descriptor heaps (at
-// their title GPU addresses), the ring, every buffer the bound descriptor
-// tables and root views name, and the vertex buffers. Its views are written
-// into a block reserved at the top of the bound shader-visible host heap.
+// constants the translation reads (user SGPRs) and the vertex buffer table
+// are written into an upload ring the GPU reads from. Title memory is reached
+// through the memory map (gpu_memory.h): the slot views in the reserved block
+// of the bound shader-visible heap and the page table, both the same for
+// every call. Memory the call names (buffers of the bound descriptor tables
+// and root views, vertex buffers) is located first if the page table does not
+// have it yet; descriptor heaps' GPU ranges are entered when the heaps are
+// made, the ring once.
 //
 // Partial: memory reached only through addresses held in memory (pointers
-// in constant data, descriptors outside the bound tables) is not in the
-// region table, and reads of it return zero. The ring is not fenced: it
-// assumes the GPU is fewer than about a thousand draws behind.
+// in constant data, descriptors outside the bound tables) that nothing has
+// located reads as zero. The ring is not fenced: it assumes the GPU is fewer
+// than about a thousand draws behind.
 #include "core/libs/d3d12_xs/bindings.h"
 
 #include <windows.h>
@@ -53,9 +55,6 @@ std::map<const void*, RootLayout>& layouts() {
 // --- upload ring ---------------------------------------------------------------------
 
 constexpr size_t kRingBytes = 64ull << 20;
-// How much of the memory around an address a region opens for the GPU (physical
-// pages: the heaps over their storage cover what is asked for).
-constexpr uint64_t kRegionHint = 64ull << 20;
 
 struct Ring {
   uint8_t* base = nullptr;
@@ -90,63 +89,10 @@ uint8_t* ring_alloc(size_t bytes) {
   }
 }
 
-// --- regions ---------------------------------------------------------------------------
-
-struct Region {
-  uint64_t base = 0;
-  uint64_t size = 0;
-  ID3D12Resource* resource = nullptr;
-  uint64_t first = 0;  // byte offset of `base` in the resource
-};
-
-struct Regions {
-  Region items[kRegionTableSize];
-  uint32_t count = 0;
-  bool overflow = false;
-
-  bool covers(uint64_t address) const {
-    for (uint32_t i = 0; i < count; ++i) {
-      if (address >= items[i].base && address - items[i].base < items[i].size) return true;
-    }
-    return false;
-  }
-  void add(const Region& region) {
-    if (count == kRegionTableSize) {
-      overflow = true;
-      return;
-    }
-    items[count++] = region;
-  }
-  // The memory around a title address, as far as one host heap reaches.
-  void add_address(Device* device, uint64_t address) {
-    if (!address || covers(address)) return;
-    Backing backing;
-    if (!locate(device, address, &backing, kRegionHint) || !backing.whole) return;
-    Region region;
-    region.resource = backing.whole;
-    if (backing.title_base) {
-      region.base = backing.title_base;
-      region.size = backing.heap_size;
-      region.first = 0;
-    } else {
-      region.base = address & ~3ull;
-      region.first = backing.heap_offset & ~3ull;
-      region.size = backing.contiguous + (address & 3);
-    }
-    if (region.size > 0xFFFFFFF0ull) region.size = 0xFFFFFFF0ull;  // the table holds 32-bit sizes
-    add(region);
-  }
-};
-
-void add_heap(Device* device, const DescriptorHeap* heap, Regions* regions) {
-  if (!heap || !heap->title_gpu) return;
-  Backing backing;
-  if (!locate(device, heap->title_cpu, &backing, heap->title_bytes) || !backing.whole) return;
-  regions->add({heap->title_gpu, heap->title_bytes, backing.whole, backing.heap_offset});
-}
+// --- reach --------------------------------------------------------------------------------
 
 // Buffers named by the descriptors of a table (from its title GPU address).
-void add_table(Device* device, uint64_t table, uint32_t descriptors, Regions* regions) {
+void reach_table(Device* device, uint64_t table, uint32_t descriptors) {
   DescriptorLocation where;
   if (!table || !find_gpu_descriptor(table, &where)) return;
   const uint32_t available = where.heap->host_count - where.index;
@@ -155,78 +101,44 @@ void add_table(Device* device, uint64_t table, uint32_t descriptors, Regions* re
     const auto* words = reinterpret_cast<const uint32_t*>(where.title + static_cast<uint64_t>(i) * where.heap->stride);
     if (words[1] == kDescriptorMarker) continue;
     const uint64_t base = words[0] | (static_cast<uint64_t>(words[1] & 0xFFFF) << 32);
-    if (base) regions->add_address(device, base);
+    if (base) reach(device, base);
   }
 }
 
-void add_root(Device* device, const RootBinding& binding, Regions* regions) {
+void reach_root(Device* device, const RootBinding& binding) {
   const RootLayout* layout = root_layout(binding.signature);
   if (!layout) return;
   for (size_t i = 0; i < layout->parameters.size() && i < 64; ++i) {
     const RootParameterLayout& p = layout->parameters[i];
     if (p.type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
-      add_table(device, binding.values[i], p.descriptors, regions);
+      reach_table(device, binding.values[i], p.descriptors);
     } else if (p.type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
-      regions->add_address(device, binding.values[i]);
+      reach(device, binding.values[i]);
     }
   }
 }
 
-// --- region views ------------------------------------------------------------------------
+// The ring in the memory map (once).
+void reach_ring(Device* device) {
+  static std::once_flag once;
+  std::call_once(once, [device] {
+    Ring* r = ring();
+    Backing backing;
+    if (!r->base || !locate(device, reinterpret_cast<uint64_t>(r->base), &backing, kRingBytes) || !backing.slot) {
+      LIB_LOG(lib::kError, "d3d12", "the upload ring is not reachable by translated programs");
+    }
+  });
+}
 
 constexpr UINT kReservedViews = kReservedHostViews;
 
-struct ViewBlocks {
-  std::atomic<uint32_t> next{0};
-};
-
-// The host GPU handle of a fresh block of kRegionTableSize views at the top
-// of `heap`, filled with the regions' views.
-D3D12_GPU_DESCRIPTOR_HANDLE write_region_views(Device* device, const DescriptorHeap* heap, const Regions& regions) {
-  static std::mutex lock;
-  static auto* blocks = new std::map<const DescriptorHeap*, ViewBlocks*>();
-  ViewBlocks* b;
-  {
-    std::lock_guard<std::mutex> guard(lock);
-    auto& slot = (*blocks)[heap];
-    if (!slot) slot = new ViewBlocks();
-    b = slot;
-  }
-  const uint32_t per_heap = kReservedViews / kRegionTableSize;
-  const uint32_t block = b->next.fetch_add(1) % per_heap;
-  const uint32_t first = heap->host_count - kReservedViews + block * kRegionTableSize;
-  for (uint32_t i = 0; i < kRegionTableSize; ++i) {
-    D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
-    desc.Format = DXGI_FORMAT_R32_TYPELESS;
-    desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-    ID3D12Resource* resource = nullptr;
-    if (i < regions.count) {
-      resource = regions.items[i].resource;
-      desc.Buffer.FirstElement = regions.items[i].first / 4;
-      desc.Buffer.NumElements = static_cast<UINT>((regions.items[i].size + 3) / 4);
-    }
-    const D3D12_CPU_DESCRIPTOR_HANDLE cpu{heap->host_cpu + static_cast<SIZE_T>(first + i) * heap->increment};
-    device->host->CreateUnorderedAccessView(resource, nullptr, &desc, cpu);  // a null view past the regions
-  }
-  return {heap->host_gpu + static_cast<uint64_t>(first) * heap->increment};
-}
-
 // The system constants of shader/translate.h, written into the ring.
-uint64_t write_system(Device* device, const Regions& regions, const uint32_t (&user)[16],
-                      const NggPass* ngg = nullptr) {
+uint64_t write_system(Device* device, const uint32_t (&user)[16], const NggPass* ngg = nullptr) {
   uint8_t* block = ring_alloc(kSystemVectors * 16);
   if (!block) return 0;
   auto* v = reinterpret_cast<uint32_t*>(block);
   std::memset(v, 0, kSystemVectors * 16);
-  for (uint32_t i = 0; i < regions.count; ++i) {
-    v[4 * (kSystemRegionVector + i) + 0] = static_cast<uint32_t>(regions.items[i].base);
-    v[4 * (kSystemRegionVector + i) + 1] = static_cast<uint32_t>(regions.items[i].base >> 32);
-    v[4 * (kSystemRegionVector + i) + 2] = static_cast<uint32_t>(regions.items[i].size);
-    v[4 * (kSystemRegionVector + i) + 3] = i;
-  }
   std::memcpy(&v[4 * kSystemUserVector], user, sizeof(user));
-  v[4 * kSystemCountsVector] = regions.count;
   if (ngg) {
     v[4 * kSystemNggVector + 0] = ngg->index_offset;
     v[4 * kSystemNggVector + 1] = ngg->groups;
@@ -234,21 +146,6 @@ uint64_t write_system(Device* device, const Regions& regions, const uint32_t (&u
     v[4 * kSystemNggVector + 3] = ngg->first_instance;
   }
   return translate_gpu_va(device, reinterpret_cast<uint64_t>(block));
-}
-
-void add_ring(Device* device, Regions* regions) {
-  Ring* r = ring();
-  if (!r->base) return;
-  Backing backing;
-  if (!locate(device, reinterpret_cast<uint64_t>(r->base), &backing, kRingBytes) || !backing.whole) return;
-  regions->add({reinterpret_cast<uint64_t>(r->base), kRingBytes, backing.whole, backing.heap_offset});
-}
-
-void report_overflow(const Regions& regions) {
-  static std::atomic<int> logged{0};
-  if (regions.overflow && logged.fetch_add(1) < 4) {
-    LIB_LOG(lib::kError, "d3d12", "a translated call reaches more than %u pieces of memory", kRegionTableSize);
-  }
 }
 
 // User SGPRs from s8: the packed root arguments, then the sampler heap base.
@@ -261,19 +158,22 @@ void pack_root(const CommandList* list, const RootBinding& binding, uint32_t* us
   if (at < limit && list->heaps[1]) user[at] = static_cast<uint32_t>(list->heaps[1]->title_gpu);
 }
 
-void bind_common(CommandList* list, bool compute, D3D12_GPU_DESCRIPTOR_HANDLE views, uint64_t system) {
+void bind_common(CommandList* list, bool compute, uint64_t page_table, uint64_t system) {
   ID3D12GraphicsCommandList* host = list->host;
   ID3D12RootSignature* root = translated_root_signature(list->device);
   RootBinding& binding = compute ? list->compute : list->graphics;
+  const D3D12_GPU_DESCRIPTOR_HANDLE views{memory_views(list->heaps[0])};
   if (compute) {
     host->SetComputeRootSignature(root);
-    host->SetComputeRootDescriptorTable(kRootRegions, views);
+    host->SetComputeRootDescriptorTable(kRootMemory, views);
+    host->SetComputeRootShaderResourceView(kRootPageTable, page_table);
     host->SetComputeRootConstantBufferView(kRootSystem, system);
     if (list->heaps[0]) host->SetComputeRootDescriptorTable(kRootImages, {list->heaps[0]->host_gpu});
     if (list->heaps[1]) host->SetComputeRootDescriptorTable(kRootSamplers, {list->heaps[1]->host_gpu});
   } else {
     host->SetGraphicsRootSignature(root);
-    host->SetGraphicsRootDescriptorTable(kRootRegions, views);
+    host->SetGraphicsRootDescriptorTable(kRootMemory, views);
+    host->SetGraphicsRootShaderResourceView(kRootPageTable, page_table);
     host->SetGraphicsRootConstantBufferView(kRootSystem, system);
     if (list->heaps[0]) host->SetGraphicsRootDescriptorTable(kRootImages, {list->heaps[0]->host_gpu});
     if (list->heaps[1]) host->SetGraphicsRootDescriptorTable(kRootSamplers, {list->heaps[1]->host_gpu});
@@ -323,11 +223,10 @@ bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t 
     LIB_LOG(lib::kError, "d3d12", "a translated draw without a bound shader-visible heap");
     return false;
   }
-  Regions regions;
-  add_heap(device, list->heaps[0], &regions);
-  add_heap(device, list->heaps[1], &regions);
-  add_ring(device, &regions);
-  add_root(device, list->graphics, &regions);
+  const uint64_t page_table = page_table_address(device);
+  if (!page_table) return false;
+  reach_ring(device);
+  reach_root(device, list->graphics);
   // Vertex buffer table: RDNA 2 buffer descriptors (base, stride, records,
   // identity component selection).
   uint8_t* table = ring_alloc(16 * 16);
@@ -341,7 +240,7 @@ bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t 
     vt[4 * i + 1] = static_cast<uint32_t>((v.BufferLocation >> 32) & 0xFFFF) | ((v.StrideInBytes & 0x3FFF) << 16);
     vt[4 * i + 2] = v.StrideInBytes ? v.SizeInBytes / v.StrideInBytes : v.SizeInBytes;
     vt[4 * i + 3] = 4u | (5u << 3) | (6u << 6) | (7u << 9);
-    regions.add_address(device, v.BufferLocation);
+    reach(device, v.BufferLocation);
   }
   uint32_t user[16] = {};
   const uint64_t table_address = reinterpret_cast<uint64_t>(table);
@@ -350,13 +249,11 @@ bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t 
   user[2] = base_vertex;
   user[3] = start_instance;
   pack_root(list, list->graphics, user, 8, 16);
-  report_overflow(regions);
-  const D3D12_GPU_DESCRIPTOR_HANDLE views = write_region_views(device, list->heaps[0], regions);
-  const uint64_t system = write_system(device, regions, user, ngg);
+  const uint64_t system = write_system(device, user, ngg);
   if (!system) return false;
   // An NGG draw's compute pass reads the graphics bindings (it is the
   // console's vertex stage) and writes the draw's records.
-  bind_common(list, ngg != nullptr, views, system);
+  bind_common(list, ngg != nullptr, page_table, system);
   if (ngg) list->host->SetComputeRootUnorderedAccessView(kRootNggOutput, ngg->records);
   return true;
 }
@@ -367,11 +264,10 @@ bool bind_translated_compute(CommandList* list) {
     LIB_LOG(lib::kError, "d3d12", "a translated dispatch without a bound shader-visible heap");
     return false;
   }
-  Regions regions;
-  add_heap(device, list->heaps[0], &regions);
-  add_heap(device, list->heaps[1], &regions);
-  add_ring(device, &regions);
-  add_root(device, list->compute, &regions);
+  const uint64_t page_table = page_table_address(device);
+  if (!page_table) return false;
+  reach_ring(device);
+  reach_root(device, list->compute);
   // The root table: the packed arguments, then the sampler heap base.
   uint8_t* table = ring_alloc(4 * 66);
   if (!table) return false;
@@ -382,11 +278,9 @@ bool bind_translated_compute(CommandList* list) {
   const uint64_t table_address = reinterpret_cast<uint64_t>(table);
   user[0] = static_cast<uint32_t>(table_address);
   user[1] = static_cast<uint32_t>(table_address >> 32);
-  report_overflow(regions);
-  const D3D12_GPU_DESCRIPTOR_HANDLE views = write_region_views(device, list->heaps[0], regions);
-  const uint64_t system = write_system(device, regions, user);
+  const uint64_t system = write_system(device, user);
   if (!system) return false;
-  bind_common(list, true, views, system);
+  bind_common(list, true, page_table, system);
   return true;
 }
 

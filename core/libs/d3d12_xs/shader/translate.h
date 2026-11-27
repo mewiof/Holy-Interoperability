@@ -38,19 +38,35 @@ struct ComputeShaderInfo {
   uint32_t lds_bytes = 32768;  // declared group shared memory (host limit 32 KiB)
 };
 
-// Register space of the translation's own bindings: u0-u63 (raw views of
-// title memory, one per region) and b0 (HolySystem: region table, user
-// SGPRs, counts).
+// Register space of the translation's own bindings: u0-u65535 (raw views of
+// title memory, one per memory slot), t0 (the page table) and b0
+// (HolySystem: user SGPRs, NGG values).
 inline constexpr uint32_t kTranslatedSpace = 8;
-inline constexpr uint32_t kRegionTableSize = 64;
+
+// Title memory as translated programs reach it. Every piece of title memory
+// the GPU can use is a host heap with a buffer spanning it; each 4 GiB of
+// such a buffer is a memory slot, a raw view at index `slot` of u0 (slot 0 is
+// a null view: reads give zero, writes are dropped). The page table maps
+// each 64 KiB page of title addresses (below 2^47) to a slot and an offset:
+// - level 1, at byte 0: kPageTableWindows 32-bit entries, one per 1 GiB of
+//   addresses (address bits 30-46), each the number of its level 2 table
+//   counting from 1, or 0 when no page in the window is mapped;
+// - level 2 tables after it, kPageTableTableBytes each: one entry per 64 KiB
+//   page of the window (address bits 16-29), two 32-bit words: the slot
+//   (0: not mapped) and the view offset of the page's start (wrapping: the
+//   page may start before its heap, whose start need not be a page boundary).
+// A title address then reads from view `slot` at offset + (address & 0xFFFF).
+inline constexpr uint32_t kMemoryViews = 65536;
+inline constexpr uint32_t kPageTableWindows = 1u << 17;
+inline constexpr uint32_t kPageTableLevel1Bytes = kPageTableWindows * 4;
+inline constexpr uint32_t kPageTableTableBytes = 16384 * 8;
+inline constexpr uint32_t kPageTableId = 1;  // T1 in the translation's declarations
 
 // HolySystem layout in 16-byte vectors.
-inline constexpr uint32_t kSystemRegionVector = 0;   // [64] base lo, base hi, size, view index
-inline constexpr uint32_t kSystemUserVector = 64;    // [4]  initial user SGPRs
-inline constexpr uint32_t kSystemCountsVector = 68;  // x = region count
-inline constexpr uint32_t kSystemNggVector = 69;     // NGG draws: index area offset, groups in x, first vertex,
-                                                     // first instance (translate_ngg)
-inline constexpr uint32_t kSystemVectors = 70;
+inline constexpr uint32_t kSystemUserVector = 0;  // [4]  initial user SGPRs
+inline constexpr uint32_t kSystemNggVector = 4;   // NGG draws: index area offset, groups in x, first vertex,
+                                                  // first instance (translate_ngg)
+inline constexpr uint32_t kSystemVectors = 5;
 
 // Image instructions address the bound shader-visible heaps through the
 // index in descriptor dword 0 (shader/descriptor_layout.h): float texture

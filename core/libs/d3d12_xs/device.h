@@ -127,13 +127,14 @@ void report_device_removal(Device* device);
 // The root signature of pipelines translated from native code (every stage
 // sees all of it), by parameter:
 enum TranslatedRootParameter : uint32_t {
-  kRootRegions = 0,   // descriptor table: region views
+  kRootMemory = 0,    // descriptor table: the memory slot views (the bound heap's reserved block)
   kRootSystem = 1,    // root CBV: system constants (shader/translate.h)
   kRootImages = 2,    // descriptor table: the bound CBV/SRV/UAV heap from index 0
   kRootSamplers = 3,  // descriptor table: the bound sampler heap from index 0
   kRootNggOutput = 4, // root UAV (u0, space kNggSpace): an NGG draw's records, written
   kRootNggInput = 5,  // root SRV (t0, space kNggSpace): the same records, read
-  kTranslatedRootParameters = 6,
+  kRootPageTable = 6, // root SRV (t0, space kTranslatedSpace): the page table (gpu_memory.h)
+  kTranslatedRootParameters = 7,
 };
 ID3D12RootSignature* translated_root_signature(Device* device);
 // A title resource description as the host takes it: flag bits the desktop

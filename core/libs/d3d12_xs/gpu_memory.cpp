@@ -1,14 +1,18 @@
-#include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
 
 #include <d3d12.h>
+#include <intrin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <vector>
 
+#include "core/libs/d3d12_xs/call_check.h"
+#include "core/libs/d3d12_xs/descriptors.h"
 #include "core/libs/d3d12_xs/device.h"
+#include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/support.h"
 
 namespace holy::d3d12 {
@@ -19,9 +23,130 @@ struct HeapRecord {
   ID3D12Resource* whole = nullptr;  // a buffer spanning the heap
   uint64_t host_gpu_va = 0;
   uint64_t size = 0;
+  uint32_t slot = 0;  // first memory slot
 };
 
 std::mutex g_lock;
+
+// --- memory map (gpu_memory.h) ---------------------------------------------------------
+
+// Level 2 tables: 1 GiB windows of title addresses holding mapped pages.
+constexpr uint32_t kPageTables = 256;
+constexpr size_t kPageTableBytes = kPageTableLevel1Bytes + static_cast<size_t>(kPageTables) * kPageTableTableBytes;
+
+struct Slot {
+  ID3D12Resource* buffer = nullptr;
+  uint64_t first = 0;  // byte offset in the buffer
+  uint64_t bytes = 0;
+};
+
+struct MemoryMap {
+  uint8_t* table = nullptr;  // level 1, then the level 2 tables
+  uint64_t host_va = 0;      // the table's host GPU address
+  uint32_t tables = 0;       // level 2 tables handed out
+  bool failed = false;
+  std::vector<Slot> slots = std::vector<Slot>(1);  // slot 0: the null view
+  std::vector<DescriptorHeap*> heaps;               // shader-visible heaps holding the views
+};
+MemoryMap g_map;  // under g_lock
+std::atomic<const uint8_t*> g_table{nullptr};
+
+const lib::Counter& c_slots() {
+  static const lib::Counter c("d3d12.memory_slots");
+  return c;
+}
+const lib::Counter& c_page_tables() {
+  static const lib::Counter c("d3d12.page_tables");
+  return c;
+}
+
+void write_slot_view(Device* device, const DescriptorHeap* heap, uint32_t slot) {
+  D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+  desc.Format = DXGI_FORMAT_R32_TYPELESS;
+  desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  ID3D12Resource* buffer = nullptr;
+  if (slot) {
+    const Slot& s = g_map.slots[slot];
+    buffer = s.buffer;
+    desc.Buffer.FirstElement = s.first / 4;
+    desc.Buffer.NumElements = static_cast<UINT>(s.bytes / 4);
+  }
+  const uint64_t index = heap->host_count - kReservedHostViews + slot;
+  device->host->CreateUnorderedAccessView(buffer, nullptr, &desc,
+                                          {static_cast<SIZE_T>(heap->host_cpu + index * heap->increment)});
+}
+
+// The slots of a heap's buffer (g_lock held); 0 when there are no more.
+uint32_t add_slots(Device* device, const HeapRecord& record) {
+  const uint32_t first = static_cast<uint32_t>(g_map.slots.size());
+  const uint64_t count = slot_count(record.size);
+  if (first + count > kMemoryViews) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      LIB_LOG(lib::kError, "d3d12",
+              "more than %u memory slots: further title memory is not reachable by translated programs",
+              kMemoryViews - 1);
+    }
+    return 0;
+  }
+  for (uint64_t i = 0; i < count; ++i) {
+    const uint64_t at = i * kSlotStride;
+    g_map.slots.push_back(Slot{record.whole, at, std::min(kSlotBytes, record.size - at)});
+    for (const DescriptorHeap* heap : g_map.heaps) write_slot_view(device, heap, static_cast<uint32_t>(first + i));
+  }
+  c_slots().add(static_cast<int64_t>(count));
+  return first;
+}
+
+// The level 2 entry of the page holding `title_va` (g_lock held), its table
+// made when `make`; null if there is none (or no table is left).
+volatile uint32_t* page_entry(uint64_t title_va, bool make) {
+  if (!g_map.table || (title_va >> 47)) return nullptr;
+  auto* level1 = reinterpret_cast<volatile uint32_t*>(g_map.table);
+  const uint64_t window = title_va >> 30;
+  uint32_t table = level1[window];
+  if (!table) {
+    if (!make) return nullptr;
+    if (g_map.tables == kPageTables) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        LIB_LOG(lib::kError, "d3d12", "title memory spreads over more than %u GiB windows: the page table is full",
+                kPageTables);
+      }
+      return nullptr;
+    }
+    table = ++g_map.tables;
+    c_page_tables().add(1);
+    level1[window] = table;  // the table is zero (no page mapped) until entries are written
+  }
+  return reinterpret_cast<volatile uint32_t*>(g_map.table + kPageTableLevel1Bytes +
+                                              static_cast<uint64_t>(table - 1) * kPageTableTableBytes +
+                                              ((title_va >> 16) & 0x3FFF) * 8);
+}
+
+// Enters [begin, end) of title addresses, at heap offset `heap_offset` from
+// `begin` on in the heap whose first slot is `first_slot` (g_lock held).
+void map_pages(uint64_t begin, uint64_t end, uint32_t first_slot, uint64_t heap_offset) {
+  if (!first_slot) return;
+  for (uint64_t page = begin & ~0xFFFFull; page < end; page += 0x10000) {
+    // The heap offset of the page's start: before the heap for a first page
+    // that starts before it (those addresses then fall outside the view).
+    const int64_t at = static_cast<int64_t>(heap_offset) + static_cast<int64_t>(page - begin);
+    uint64_t index = 0;
+    uint32_t view_offset = 0;
+    page_slot(at, &index, &view_offset);
+    const uint32_t slot = first_slot + static_cast<uint32_t>(index);
+    if (slot >= g_map.slots.size() || g_map.slots[slot].buffer != g_map.slots[first_slot].buffer) continue;
+    volatile uint32_t* entry = page_entry(page, true);
+    if (!entry) return;
+    entry[1] = view_offset;
+    _ReadWriteBarrier();
+    entry[0] = slot;
+  }
+}
 
 // Physical page storage: sections whose pages take commit as they are used
 // (xmem). The GPU reaches a section through heaps opened over committed spans
@@ -57,12 +182,17 @@ QueryPhysicalFn query_physical() {
   return fn;
 }
 
-bool finish_record(Device* device, ID3D12Heap* heap, HeapRecord* record) {
+bool finish_record(Device* device, ID3D12Heap* heap, HeapRecord* record, bool slots = true) {
   record->heap = heap;
   // Buffers take whole 64 KiB units of a heap (measured, the host's debug
   // layer: heaps over committed stretches can end inside one).
   record->size = heap->GetDesc().SizeInBytes & ~0xFFFFull;
   if (!record->size) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 4) {
+      LIB_LOG(lib::kError, "d3d12", "title memory of 0x%llx bytes is less than a 64 KiB unit: the GPU cannot reach it",
+              static_cast<unsigned long long>(heap->GetDesc().SizeInBytes));
+    }
     heap->Release();
     return false;
   }
@@ -85,6 +215,7 @@ bool finish_record(Device* device, ID3D12Heap* heap, HeapRecord* record) {
     return false;
   }
   record->host_gpu_va = record->whole->GetGPUVirtualAddress();
+  if (slots) record->slot = add_slots(device, *record);
   return true;
 }
 
@@ -113,6 +244,29 @@ namespace {
 const lib::Counter& c_block_commit() {
   static const lib::Counter c("d3d12.gpu_block_commit_bytes");
   return c;
+}
+
+// The page table (g_lock held), made on first use: process memory the GPU
+// reads through a heap opened over it, as title memory, so the CPU's entries
+// are seen by work submitted after them. Returns its host GPU address.
+uint64_t ensure_page_table(Device* device) {
+  if (g_map.table || g_map.failed) return g_map.host_va;
+  g_map.failed = true;
+  ID3D12Device3* d3 = device3(device);
+  auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, kPageTableBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  ID3D12Heap* heap = nullptr;
+  const HRESULT hr = memory && d3 ? d3->OpenExistingHeapFromAddress(memory, IID_PPV_ARGS(&heap)) : E_OUTOFMEMORY;
+  HeapRecord record;
+  if (FAILED(hr) || !finish_record(device, heap, &record, false)) {
+    LIB_LOG(lib::kError, "d3d12", "no page table for translated programs (0x%08lX)", static_cast<unsigned long>(hr));
+    if (memory) VirtualFree(memory, 0, MEM_RELEASE);
+    return 0;
+  }
+  g_map.failed = false;
+  g_map.table = memory;
+  g_map.host_va = record.host_gpu_va;
+  g_table.store(memory, std::memory_order_release);
+  return g_map.host_va;
 }
 
 // The heap over the blocks of `section` covering [begin, end), opened (and
@@ -178,6 +332,7 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
   std::lock_guard<std::mutex> lock(g_lock);
   ID3D12Device3* d3 = device3(device);
   if (!d3) return false;
+  ensure_page_table(device);  // before any heap, so every heap's pages are entered
 
   // Physical pages the title mapped: `run` bytes from the address are pages
   // laid out in order in one section.
@@ -188,8 +343,10 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
     const auto* span = section_span(device, section, offset, offset + wanted);
     if (!span) return false;
     const uint64_t at = offset - span->first;
-    *out = Backing{span->second.heap, at, std::min(run, span->second.size - at), span->second.host_gpu_va + at,
-                   span->second.whole, 0, span->second.size};
+    const uint64_t contiguous = std::min(run, span->second.size - at);
+    *out = Backing{span->second.heap, at, contiguous, span->second.host_gpu_va + at,
+                   span->second.whole, 0, span->second.size, span->second.slot};
+    map_pages(title_va, title_va + contiguous, span->second.slot, at);
     return true;
   }
 
@@ -198,7 +355,8 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
   if (region != region_heaps().end() && title_va >= region->second.first) {
     const uint64_t at = title_va - region->second.first;
     *out = Backing{region->second.second.heap, at, region->first - title_va, region->second.second.host_gpu_va + at,
-                   region->second.second.whole, region->second.first, region->second.second.size};
+                   region->second.second.whole, region->second.first, region->second.second.size,
+                   region->second.second.slot};
     return true;
   }
   MEMORY_BASIC_INFORMATION info;
@@ -270,8 +428,9 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
           reinterpret_cast<void*>(allocation), static_cast<unsigned long long>(allocation_end - allocation),
           reinterpret_cast<void*>(record.host_gpu_va));
   region_heaps()[base + record.size] = std::make_pair(base, record);
+  map_pages(base, base + record.size, record.slot, 0);
   const uint64_t at = title_va - base;
-  *out = Backing{heap, at, record.size - at, record.host_gpu_va + at, record.whole, base, record.size};
+  *out = Backing{heap, at, record.size - at, record.host_gpu_va + at, record.whole, base, record.size, record.slot};
   return true;
 }
 
@@ -279,6 +438,72 @@ uint64_t translate_gpu_va(Device* device, uint64_t title_va) {
   if (!title_va) return 0;
   Backing backing;
   return locate(device, title_va, &backing, 1) ? backing.host_gpu_va : 0;
+}
+
+uint64_t page_table_address(Device* device) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  return ensure_page_table(device);
+}
+
+bool page_mapped(uint64_t title_va) {
+  const uint8_t* table = g_table.load(std::memory_order_acquire);
+  if (!table || (title_va >> 47)) return false;
+  const uint32_t number = reinterpret_cast<const volatile uint32_t*>(table)[title_va >> 30];
+  if (!number) return false;
+  const auto* entry = reinterpret_cast<const volatile uint32_t*>(
+      table + kPageTableLevel1Bytes + static_cast<uint64_t>(number - 1) * kPageTableTableBytes +
+      ((title_va >> 16) & 0x3FFF) * 8);
+  return entry[0] != 0;
+}
+
+void reach(Device* device, uint64_t title_va) {
+  if (!title_va || page_mapped(title_va)) return;
+  if (!page_table_address(device)) return;
+  Backing backing;
+  locate(device, title_va, &backing, 64ull << 20);
+}
+
+bool map_alias(Device* device, uint64_t alias, uint64_t size, uint64_t target) {
+  if (!page_table_address(device)) return false;
+  for (uint64_t at = 0; at < size;) {
+    Backing backing;
+    if (!locate(device, target + at, &backing, size - at) || !backing.contiguous) {
+      LIB_LOG(lib::kError, "d3d12", "alias %p of 0x%llx bytes: memory at %p (+0x%llx) has no GPU heap",
+              reinterpret_cast<void*>(alias), static_cast<unsigned long long>(size),
+              reinterpret_cast<void*>(target), static_cast<unsigned long long>(at));
+      return false;
+    }
+    const uint64_t n = std::min(backing.contiguous, size - at);
+    {
+      std::lock_guard<std::mutex> lock(g_lock);
+      map_pages(alias + at, alias + at + n, backing.slot, backing.heap_offset);
+    }
+    at += n;
+  }
+  return true;
+}
+
+void unmap_range(uint64_t title_va, uint64_t size) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  for (uint64_t page = title_va & ~0xFFFFull; page < title_va + size; page += 0x10000) {
+    if (volatile uint32_t* entry = page_entry(page, false)) entry[0] = 0;
+  }
+}
+
+void add_view_heap(Device* device, DescriptorHeap* heap) {
+  if (!heap || heap->host_count <= kReservedHostViews) return;
+  std::lock_guard<std::mutex> lock(g_lock);
+  for (uint32_t slot = 0; slot < g_map.slots.size(); ++slot) write_slot_view(device, heap, slot);
+  g_map.heaps.push_back(heap);
+}
+
+void remove_view_heap(DescriptorHeap* heap) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  g_map.heaps.erase(std::remove(g_map.heaps.begin(), g_map.heaps.end(), heap), g_map.heaps.end());
+}
+
+uint64_t memory_views(const DescriptorHeap* heap) {
+  return heap->host_gpu + static_cast<uint64_t>(heap->host_count - kReservedHostViews) * heap->increment;
 }
 
 }  // namespace holy::d3d12

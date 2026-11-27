@@ -81,6 +81,11 @@ std::unordered_map<void*, SIZE_T>& page_allocations() {
 std::atomic<int> g_log_budget{32};
 
 void* allocate_pages(SIZE_T size, SIZE_T alignment) {
+  // Whole 64 KiB units (the host's allocation granularity, which the address
+  // takes anyway): the GPU reaches title memory through buffers over heaps
+  // opened over it, and a buffer takes whole 64 KiB units of its heap, so a
+  // smaller allocation could not be reached at all. The title sees its size.
+  size = (size + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);
   void* block = nullptr;
   const bool defer = size >= kDeferredCommit;
   if (alignment <= kAllocationGranularity) {

@@ -332,37 +332,29 @@ class Translator {
   }
 
   // ---- memory ----
-  // Resolves a title GPU address to (view, offset) through the region table.
+  // Resolves a title GPU address to (view, offset) through the page table
+  // (translate.h): view 0, the null view, when no page is mapped there.
   std::pair<uint32_t, uint32_t> find(const Operand& lo, const Operand& hi) {
-    const uint32_t view = fresh(), offset = fresh(), i = fresh();
-    put(view, I(kNoView));
-    put(offset, I(0));
-    put(i, I(0));
+    const uint32_t view = fresh(), offset = fresh();
     const Operand alo = in_temp(lo), ahi = in_temp(hi);
-    // The table has kRegionTableSize entries whatever the count says.
-    const uint32_t count = fresh();
-    emit(dx::kUmin, {D(count), dxbc::cb(0, kSystemCountsVector, 0), I(kRegionTableSize)});
-    emit(dx::kLoop, {});
-    const uint32_t t = fresh(), d = fresh(), dh = fresh(), u = fresh();
-    emit(dx::kUge, {D(t), R(i), R(count)});
-    emit(dx::kBreakc, {R(t)}, dxbc::kTestNonZero);
-    emit(dx::kIadd, {D(d), alo, dxbc::neg(dxbc::cb_indexed(0, i, kSystemRegionVector, 0))});
-    emit(dx::kUlt, {D(t), alo, dxbc::cb_indexed(0, i, kSystemRegionVector, 0)});  // borrow mask
-    emit(dx::kIadd, {D(dh), ahi, dxbc::neg(dxbc::cb_indexed(0, i, kSystemRegionVector, 1))});
-    emit(dx::kIadd, {D(dh), R(dh), R(t)});
-    emit(dx::kIeq, {D(dh), R(dh), I(0)});
-    emit(dx::kUlt, {D(u), R(d), dxbc::cb_indexed(0, i, kSystemRegionVector, 2)});
-    emit(dx::kAnd, {D(u), R(u), R(dh)});
-    if_nz(R(u));
-    put(offset, R(d));
-    put(view, dxbc::cb_indexed(0, i, kSystemRegionVector, 3));
-    emit(dx::kBreak, {});
+    put(view, I(0));
+    put(offset, I(0));
+    page_table_used_ = true;
+    if_nz(ult(ahi, I(0x8000)));
+    const uint32_t table = fresh();
+    emit(dx::kLdRaw, {D(table), shl(bor(shl(ahi, I(2)), shr(alo, I(30))), I(2)), dxbc::srv_xyzw(kPageTableId, 0)});
+    if_nz(R(table));
+    const uint32_t entry = fresh();
+    const Operand at = add(add(I(kPageTableLevel1Bytes - kPageTableTableBytes), shl(R(table), I(17))),
+                           shl(ubfe(I(14), I(16), alo), I(3)));
+    emit(dx::kLdRaw, {dxbc::temp_dst_mask(entry, 0x3), at, dxbc::srv_xyzw(kPageTableId, 0)});
+    put(view, R(entry));
+    put(offset, add(dxbc::temp(entry, 1), band(alo, I(0xFFFF))));
     end_if();
-    emit(dx::kIadd, {D(i), R(i), I(1)});
-    emit(dx::kEndloop, {});
+    end_if();
     if (code_data_) {
       const Operand in_code = band(eq(ahi, I(kCodeAddressHi)), ult(alo, I(static_cast<uint32_t>(size_))));
-      if_nz(band(in_code, eq(R(view), I(kNoView))));
+      if_nz(band(in_code, eq(R(view), I(0))));
       put(view, I(kCodeView));
       put(offset, alo);
       end_if();
@@ -403,7 +395,7 @@ class Translator {
       put(value, R(w));
       end_if();
     }
-    if_nz(ult(R(view), I(kRegionTableSize)));
+    if_nz(ult(R(view), I(kMemoryViews)));
     const Operand o = in_temp(offset);
     const Operand aligned = band(o, I(~3u));
     const Operand shift = shl(band(o, I(3)), I(3));
@@ -427,13 +419,13 @@ class Translator {
     scratch_ = mark;
   }
   void write(uint32_t view, const Operand& offset, const Operand& value) {
-    if_nz(ult(R(view), I(kRegionTableSize)));
+    if_nz(ult(R(view), I(kMemoryViews)));
     emit(dx::kStoreRaw, {dxbc::uav_indexed(0, view, dxbc::Access::Store), band(offset, I(~3u)), value});
     end_if();
   }
   // Byte or halfword store inside the containing dword.
   void write_part(uint32_t view, const Operand& offset, const Operand& value, uint32_t bytes) {
-    if_nz(ult(R(view), I(kRegionTableSize)));
+    if_nz(ult(R(view), I(kMemoryViews)));
     const Operand aligned = band(offset, I(~3u));
     const Operand shift = shl(band(offset, I(3)), I(3));
     const Operand mask = shl(I(bytes == 1 ? 0xFFu : 0xFFFFu), shift);
@@ -448,7 +440,7 @@ class Translator {
   Operand atomic(int kind, uint32_t view, const Operand& offset, const Operand& value, const Operand& compare) {
     const uint32_t old = fresh();
     put(old, I(0));
-    if_nz(ult(R(view), I(kRegionTableSize)));
+    if_nz(ult(R(view), I(kMemoryViews)));
     const Operand uav = dxbc::uav_indexed(0, view, dxbc::Access::Atomic);
     const Operand address = band(offset, I(~3u));
     static const uint32_t kOps[] = {dx::kImmAtomicExch, dx::kImmAtomicCmpExch, dx::kImmAtomicIadd,
@@ -726,6 +718,7 @@ class Translator {
   uint64_t features_ = 0;            // SFI0 feature bits
   uint32_t uavs_used_ = 0;
   bool samplers_used_ = false;
+  bool page_table_used_ = false;  // find() reads the page table
 };
 
 bool Translator::emit_sop2(const Instruction& inst) {
@@ -3640,7 +3633,8 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   std::vector<dxbc::SignatureElement> inputs, outputs;
   program.dcl_global_flags(1);  // refactoring allowed
   program.dcl_constant_buffer(0, kTranslatedSpace, kSystemVectors, true);
-  program.dcl_uav_raw_range(0, 0, kRegionTableSize - 1, kTranslatedSpace);
+  program.dcl_uav_raw_range(0, 0, kMemoryViews - 1, kTranslatedSpace);
+  if (page_table_used_) program.dcl_resource_raw_range(kPageTableId, 0, 0, kTranslatedSpace);
   if (code_data_) {
     std::vector<uint32_t> words((code_bytes_ + 3) / 4, 0);
     std::memcpy(words.data(), code_ + code_first_, code_bytes_);

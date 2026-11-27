@@ -23,10 +23,12 @@
 // into the heap's memory (descriptor_memory.h) at those addresses.
 #include "core/libs/d3d12_xs/descriptors.h"
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 
 #include "core/libs/d3d12_xs/forward.h"
+#include "core/libs/d3d12_xs/gpu_memory.h"
 #include "core/libs/support.h"
 
 extern "C" __declspec(dllimport) void* XMemAlloc(SIZE_T size, uint64_t attributes);
@@ -72,6 +74,8 @@ ULONG STDMETHODCALLTYPE heap_release(DescriptorHeap* self) {
       heaps_by_end().erase(self->title_cpu + self->title_bytes);
       if (self->title_gpu) heaps_by_gpu_end().erase(self->title_gpu + self->title_bytes);
     }
+    remove_view_heap(self);
+    if (self->title_gpu) unmap_range(self->title_gpu, self->title_bytes);
     self->host->Release();
     if (self->shadow) self->shadow->Release();
     XMemFree(reinterpret_cast<void*>(self->title_cpu), kDescriptorHeapAttributes);
@@ -114,12 +118,16 @@ HRESULT create_descriptor_heap(Device* device, const D3D12_DESCRIPTOR_HEAP_DESC*
   *out = nullptr;
   D3D12_DESCRIPTOR_HEAP_DESC host_desc = *desc;
   host_desc.NodeMask = 0;
-  if (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
-      (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && desc->NumDescriptors > kHostShaderVisibleLimit) {
-    // Partial: created at the host's limit; descriptors past it are refused.
-    host_desc.NumDescriptors = kHostShaderVisibleLimit;
-    LIB_LOG(lib::kWarn, "d3d12", "shader-visible heap of %u descriptors created with the host limit of %u",
-            desc->NumDescriptors, kHostShaderVisibleLimit);
+  const bool view_heap = desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+                         (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+  if (view_heap) {
+    const uint64_t wanted = static_cast<uint64_t>(desc->NumDescriptors) + kReservedHostViews;
+    host_desc.NumDescriptors = static_cast<UINT>(std::min<uint64_t>(wanted, kHostShaderVisibleLimit));
+    if (desc->NumDescriptors > kHostShaderVisibleLimit) {
+      // Partial: created at the host's limit; descriptors past it are refused.
+      LIB_LOG(lib::kWarn, "d3d12", "shader-visible heap of %u descriptors created with the host limit of %u",
+              desc->NumDescriptors, kHostShaderVisibleLimit);
+    }
   }
   ID3D12DescriptorHeap* host = nullptr;
   const HRESULT hr = device->host->CreateDescriptorHeap(&host_desc, IID_PPV_ARGS(&host));
@@ -170,6 +178,11 @@ HRESULT create_descriptor_heap(Device* device, const D3D12_DESCRIPTOR_HEAP_DESC*
       }
       heaps_by_gpu_end()[heap->title_gpu + bytes] = heap;
     }
+  }
+  if (view_heap) add_view_heap(device, heap);
+  // Translated programs read descriptors at the heap's GPU addresses.
+  if (heap->title_gpu && !map_alias(device, heap->title_gpu, bytes, heap->title_cpu)) {
+    LIB_LOG(lib::kError, "d3d12", "the GPU range of a descriptor heap is not reachable by translated programs");
   }
   *out = heap;
   return S_OK;

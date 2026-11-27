@@ -184,7 +184,7 @@ TEST(translated_program_is_valid_bytecode) {
   const std::string text = disassemble(bytecode);
   EXPECT(text.find("cs_5_1") != std::string::npos);
   EXPECT(text.find("dcl_thread_group 64, 1, 1") != std::string::npos);
-  EXPECT(text.find("dcl_uav_raw U0[0:63], space=8") != std::string::npos);
+  EXPECT(text.find("dcl_uav_raw U0[0:65535], space=8") != std::string::npos);
   // Blocks at 0, 12 and 16, selected by comparisons on the next block.
   EXPECT(text.find("loop") != std::string::npos);
   EXPECT(text.find("l(16)") != std::string::npos);

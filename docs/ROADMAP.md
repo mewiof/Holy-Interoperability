@@ -79,8 +79,9 @@ The largest piece.
 - done: compute pipelines from native code given directly (slot 67), native graphics pipelines (slot 57), derived
   pipelines (slot 55), image instructions, gathers, the unified typed buffer formats, cross-lane operations.
 - partial: command recording: state, root arguments, draws and dispatches, barriers, clears, GPU-written values and
-  timestamps; translated pipelines get their root arguments as native code expects them, with a region table per
-  call. Not yet checked against known results; memory reached only through pointers in memory is not covered.
+  timestamps; translated pipelines get their root arguments as native code expects them, and reach title memory
+  through one memory map (memory slots and a page table) for every call. Not yet checked against known results;
+  memory reached only through pointers in memory is covered once something has located it.
 - partial: presentation: frame tokens, `PresentX` onto a swap chain on the title's window, captured frames.
 - done: queue-ordered page mapping updates (queue slot 31) for texture pools, applied when called.
 - done: native pipeline descriptions with sparse stage slots, `buffer_load_format_*` with the descriptor's format
@@ -108,11 +109,15 @@ The largest piece.
   longer leak system commit after the process ends.
 - done: packed 16-bit render targets and depth textures that ask for unordered access are made as the host
   supports them (the reference title stopped at its own checks on both).
-- next: buffers over physical pages that are not contiguous in one section (the reference title stops at its own
-  check when one cannot be placed; seen with the host's commit exhausted, when sections can only be reserved).
-  Tiled host buffers over the pages are not possible (the host refuses tile mappings into heaps over existing
-  memory, measured); the direction is a page table translated programs consult (title page to section heap and
-  slot), which also replaces the per-access scan of the region table.
+- done: a page table translated programs consult (title page to memory slot and offset) replaces the per-call
+  region table: no scan per memory access, no views written per call, no limit of 64 pieces of memory, and memory
+  located once stays reachable from every call. Unit tests cover the slot arithmetic and the lookup on the GPU.
+- next: placed resources over physical pages that are not contiguous in one section (the reference title stops
+  at its own check when one cannot be placed; seen with the host's commit exhausted, when sections can only be
+  reserved). Tiled host buffers over the pages are not possible (the host refuses tile mappings into heaps over
+  existing memory, measured); translated programs already reach such pages one by one through the page table.
+- next: enter physical pages in the page table when the title maps them (not only when located), and remove
+  them when it unmaps them.
 - done: native pipelines with a program that neither exports nor interpolates (depth-only passes) and with an
   unusual target field; placeholder pipelines in the reference title's first minute went from 426 to 66.
 - done: unordered-access views of depth textures, through a twin texture kept in step at barriers.

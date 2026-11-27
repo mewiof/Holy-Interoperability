@@ -44,7 +44,8 @@ struct Gpu {
   ID3D12Resource* target = nullptr;
   ID3D12Resource* readback = nullptr;
   ID3D12Resource* constants = nullptr;
-  ID3D12Resource* memory = nullptr;  // "title memory": region 0, view u0
+  ID3D12Resource* memory = nullptr;  // "title memory" at 2^32: memory slot 1
+  ID3D12Resource* page_table = nullptr;  // maps the page at 2^32 to slot 1
   ID3D12Resource* cube = nullptr;    // make_cube
   ID3D12DescriptorHeap* samplers = nullptr;
   UINT64 fence_value = 0;
@@ -52,6 +53,7 @@ struct Gpu {
   ~Gpu() {
     release(samplers);
     release(cube);
+    release(page_table);
     release(memory);
     release(constants);
     release(readback);
@@ -94,11 +96,12 @@ struct Gpu {
   }
 
   // The bindings every translated program declares: the system constants
-  // (b0) and the region table (u0-u63) in the translated register space.
+  // (b0), the memory slot views (u0-u65535) and the page table (t0) in the
+  // translated register space.
   bool make_root() {
     D3D12_DESCRIPTOR_RANGE1 range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    range.NumDescriptors = kRegionTableSize;
+    range.NumDescriptors = kMemoryViews;
     range.RegisterSpace = kTranslatedSpace;
     range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
     // Cube images (make_cube) and samplers as translated programs index them.
@@ -110,7 +113,7 @@ struct Gpu {
     D3D12_DESCRIPTOR_RANGE1 sampler_range = images;
     sampler_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
     sampler_range.RegisterSpace = kTextureSpace;
-    D3D12_ROOT_PARAMETER1 parameters[4] = {};
+    D3D12_ROOT_PARAMETER1 parameters[5] = {};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[0].Descriptor.RegisterSpace = kTranslatedSpace;
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -119,9 +122,12 @@ struct Gpu {
     parameters[2].DescriptorTable = {1, &images};
     parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[3].DescriptorTable = {1, &sampler_range};
+    parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[4].Descriptor.RegisterSpace = kTranslatedSpace;
+    parameters[4].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
     desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    desc.Desc_1_1.NumParameters = 4;
+    desc.Desc_1_1.NumParameters = 5;
     desc.Desc_1_1.pParameters = parameters;
     ID3DBlob* blob = nullptr;
     if (FAILED(D3D12SerializeVersionedRootSignature(&desc, &blob, nullptr))) return false;
@@ -132,8 +138,8 @@ struct Gpu {
   }
 
   bool make_resources() {
-    // The region views, then one image (make_cube).
-    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRegionTableSize + 1,
+    // The memory slot views, then one image (make_cube).
+    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kMemoryViews + 1,
                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(device->CreateDescriptorHeap(&heap, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&views)))) {
       return false;
@@ -143,13 +149,9 @@ struct Gpu {
     null_view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     null_view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     const UINT increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    for (UINT i = 0; i < kRegionTableSize; ++i) {
-      D3D12_CPU_DESCRIPTOR_HANDLE at = views->GetCPUDescriptorHandleForHeapStart();
-      at.ptr += static_cast<SIZE_T>(i) * increment;
-      device->CreateUnorderedAccessView(nullptr, nullptr, &null_view, at);
-    }
+    device->CreateUnorderedAccessView(nullptr, nullptr, &null_view, views->GetCPUDescriptorHandleForHeapStart());
     {
-      // Region 0: 256 bytes of title memory at GPU address 1 << 32.
+      // Slot 1: 256 bytes of title memory at GPU address 1 << 32.
       const D3D12_HEAP_PROPERTIES local = heap_of(D3D12_HEAP_TYPE_DEFAULT);
       D3D12_RESOURCE_DESC buffer{};
       buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -165,7 +167,38 @@ struct Gpu {
       }
       D3D12_UNORDERED_ACCESS_VIEW_DESC raw = null_view;
       raw.Buffer.NumElements = 64;
-      device->CreateUnorderedAccessView(memory, nullptr, &raw, views->GetCPUDescriptorHandleForHeapStart());
+      D3D12_CPU_DESCRIPTOR_HANDLE at = views->GetCPUDescriptorHandleForHeapStart();
+      at.ptr += increment;
+      device->CreateUnorderedAccessView(memory, nullptr, &raw, at);
+    }
+    {
+      // The page table (shader/translate.h): window 4 (addresses from 2^32)
+      // is level 2 table 1, whose first page is slot 1 at view offset 0; the
+      // second page starts at view offset 0x40 of the same slot, the third
+      // 0x40 bytes before the view (as the page holding a heap's start does).
+      const D3D12_HEAP_PROPERTIES upload = heap_of(D3D12_HEAP_TYPE_UPLOAD);
+      D3D12_RESOURCE_DESC buffer{};
+      buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      buffer.Width = kPageTableLevel1Bytes + kPageTableTableBytes;
+      buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+      buffer.SampleDesc.Count = 1;
+      buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      if (FAILED(device->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                 D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, __uuidof(ID3D12Resource),
+                                                 reinterpret_cast<void**>(&page_table)))) {
+        return false;
+      }
+      uint32_t* table = nullptr;
+      if (FAILED(page_table->Map(0, nullptr, reinterpret_cast<void**>(&table)))) return false;
+      std::memset(table, 0, static_cast<size_t>(buffer.Width));
+      table[4] = 1;
+      table[kPageTableLevel1Bytes / 4] = 1;
+      table[kPageTableLevel1Bytes / 4 + 1] = 0;
+      table[kPageTableLevel1Bytes / 4 + 2] = 1;
+      table[kPageTableLevel1Bytes / 4 + 3] = 0x40;
+      table[kPageTableLevel1Bytes / 4 + 4] = 1;
+      table[kPageTableLevel1Bytes / 4 + 5] = 0xFFFFFFC0u;
+      page_table->Unmap(0, nullptr);
     }
     D3D12_DESCRIPTOR_HEAP_DESC rtv_heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (FAILED(device->CreateDescriptorHeap(&rtv_heap, __uuidof(ID3D12DescriptorHeap),
@@ -207,16 +240,13 @@ struct Gpu {
     return set_constants({}, false);
   }
 
-  // HolySystem: the user SGPRs and, when `region`, region 0 over `memory`.
+  // HolySystem: the user SGPRs. (`memory` is always mapped at 2^32 by the
+  // page table; `region` is kept for the callers' readability.)
   bool set_constants(std::initializer_list<uint32_t> user, bool region) {
+    (void)region;
     uint32_t* mapped = nullptr;
     if (FAILED(constants->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) return false;
     std::memset(mapped, 0, 2048);
-    if (region) {
-      const uint32_t entry[4] = {0, 1, 256, 0};  // base lo, base hi, size, view
-      std::memcpy(mapped + 4 * kSystemRegionVector, entry, sizeof(entry));
-      mapped[4 * kSystemCountsVector] = 1;
-    }
     uint32_t i = 0;
     for (uint32_t value : user) mapped[4 * kSystemUserVector + i++] = value;
     constants->Unmap(0, nullptr);
@@ -293,7 +323,7 @@ struct Gpu {
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.TextureCube.MipLevels = 1;
     D3D12_CPU_DESCRIPTOR_HANDLE at = views->GetCPUDescriptorHandleForHeapStart();
-    at.ptr += static_cast<SIZE_T>(kRegionTableSize) *
+    at.ptr += static_cast<SIZE_T>(kMemoryViews) *
               device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     device->CreateShaderResourceView(cube, &view, at);
     D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -337,9 +367,10 @@ struct Gpu {
     list->SetDescriptorHeaps(samplers ? 2 : 1, heaps);
     list->SetComputeRootConstantBufferView(0, constants->GetGPUVirtualAddress());
     list->SetComputeRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRootShaderResourceView(4, page_table->GetGPUVirtualAddress());
     if (samplers) {
       D3D12_GPU_DESCRIPTOR_HANDLE images = views->GetGPUDescriptorHandleForHeapStart();
-      images.ptr += static_cast<UINT64>(kRegionTableSize) *
+      images.ptr += static_cast<UINT64>(kMemoryViews) *
                     device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
       list->SetComputeRootDescriptorTable(2, images);
       list->SetComputeRootDescriptorTable(3, samplers->GetGPUDescriptorHandleForHeapStart());
@@ -391,6 +422,7 @@ struct Gpu {
     list->SetDescriptorHeaps(1, &views);
     list->SetGraphicsRootConstantBufferView(0, constants->GetGPUVirtualAddress());
     list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
+    list->SetGraphicsRootShaderResourceView(4, page_table->GetGPUVirtualAddress());
     const D3D12_VIEWPORT viewport{0, 0, kSize, kSize, 0, 1};
     const D3D12_RECT scissor{0, 0, kSize, kSize};
     list->RSSetViewports(1, &viewport);
@@ -548,6 +580,41 @@ TEST(pixel_quad_permutes_are_exact_on_the_host) {
   EXPECT(exact_diagonal);
   EXPECT(exact_horizontal);
   EXPECT(exact_difference);
+}
+
+TEST(page_table_entries_place_pages_at_their_view_offsets) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // buffer_load_dword v0, off, s[0:3], 0; v1 with s[4:7]; v2 with s[8:11];
+  // buffer_store_dwordx3 v[0:2], off, s[12:15], 0 offset:128; s_endpgm.
+  const std::vector<uint32_t> program = {0xE0300000u, 0x80000000u, 0xE0300000u, 0x80010100u, 0xE0300000u,
+                                         0x80020200u, 0xE07C0080u, 0x80030000u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  info.user_sgprs = 16;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  // Buffers at the second page (view offset 0x40), 0x80 into the third page
+  // (0x40 - 0x40 + 0x80 = view offset 0x40), the third page's start (before
+  // the view: reads zero), and the first page.
+  EXPECT(gpu.set_constants({0x10000, 1, 256, 0, 0x20080, 1, 256, 0, 0x20000, 1, 256, 0, 0, 1, 256, 0}, true));
+  std::vector<uint32_t> contents(64);
+  for (uint32_t i = 0; i < 64; ++i) contents[i] = 0x1000 + i;
+  const std::vector<uint32_t> after = gpu.dispatch(cs, contents);
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[32] == 0x1010);  // word 16, through the second page
+  EXPECT(after[33] == 0x1010);  // word 16, through the third page
+  EXPECT(after[34] == 0);       // before the view
 }
 
 TEST(format_loads_take_format_and_selects_from_the_descriptor) {

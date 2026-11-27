@@ -3,6 +3,7 @@
 add_executable(holy_unit_tests
   unit/main.cpp
   unit/test_manifest.cpp
+  unit/test_memory_map.cpp
   unit/test_pe.cpp
   unit/test_provider.cpp
   unit/test_shader_container.cpp

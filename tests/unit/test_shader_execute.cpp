@@ -690,6 +690,42 @@ TEST(buffer_accesses_past_the_records_read_zero_and_write_nothing) {
   EXPECT(after[5] == 0x1005);
 }
 
+// EXEC (the lane model): after s_and_saveexec an inactive lane keeps what a
+// vector write would have changed; a region s_cbranch_execz guards is
+// skipped by it (and runs unmasked in active lanes); writes after EXEC is
+// restored reach both lanes.
+TEST(inactive_lanes_keep_registers_and_skip_execz_regions) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v_cmp_eq_u32 vcc, 0, v0; s_and_saveexec_b32 s0, vcc_lo; v1 = 7;
+  // s_cbranch_execz skip; v2 = 9; skip: s_or_b32 exec_lo, exec_lo, s0;
+  // v3 = 5; v4 = v0 * 16; buffer_store_dwordx3 v[1:3], v4, s[4:7], 0 offen;
+  // s_endpgm.
+  const std::vector<uint32_t> program = {0x7D840080u, 0xBE803C6Au, 0x7E020287u, 0xBF880001u, 0x7E040289u,
+                                         0x887E007Eu, 0x7E060285u, 0x34080084u, 0xE07C1000u, 0x80010104u,
+                                         0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 2;
+  info.user_sgprs = 8;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(gpu.set_constants({0, 0, 0, 0, 0, 1, 256, 0}, true));
+  const std::vector<uint32_t> after = gpu.dispatch(cs, std::vector<uint32_t>(64, 0));
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[0] == 7 && after[1] == 9 && after[2] == 5);  // lane 0, active
+  EXPECT(after[4] == 0 && after[5] == 0 && after[6] == 5);  // lane 1, inactive until the restore
+}
+
 // Control flow (the linear layout): nested loops closed by backward
 // branches, a branch forward out of both, uniform scalar counters.
 TEST(nested_loops_and_a_branch_out_of_both_run_as_written) {

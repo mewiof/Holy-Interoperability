@@ -705,7 +705,12 @@ Notes describe the platform, never a title.
   reads zero and drops writes); the page lookup has no branches (a table of zeros, "table 0", for windows
   without a table and addresses from 2^47), and tests for cached pages only when the page cache runs; buffer
   formats come from a table in the immediate constant buffer instead of a 128-case switch at every typed access;
-  the container checksum is computed with the MD5 rounds written out.
+  the container checksum is computed with the MD5 rounds written out. Where EXEC is known to be on (from the
+  program's start, after an `s_cbranch_execz` not taken in a block nothing branches to, after EXEC is set to a
+  constant with the lane's bit or or-ed while on) results are written without the lane test (2% less over the
+  saved programs; EXEC is unknown after the first branch joins, the restored mask being a register's). The
+  EXEC tests of `s_cbranch_execz`/`execnz` look at the lane's bit alone (the lane model: each thread is a wave of
+  one lane; the high word can keep bits of a 64-bit write while the lane is inactive).
 - Implementation, program layout: a native program's blocks (split at branches and their targets) were each a
   case of one loop that found the next block by a binary search on its address, so every register stayed live
   around that loop. They are now laid out in program order: a block is guarded by a test of the next block's

@@ -127,14 +127,26 @@ class Translator {
   // EXEC is kept as this lane's bit alone (the lane model: a lane mask holds
   // the lane's bit at bit 0), so it serves as the lane's condition as it is.
   void put(uint32_t reg, const Operand& v) {
-    if (reg == kExecLoR) return emit(dx::kAnd, {D(reg), v, I(1)});
+    if (reg == kExecLoR) {
+      exec_written_ = true;
+      return emit(dx::kAnd, {D(reg), v, I(1)});
+    }
     emit(dx::kMov, {D(reg), v});
   }
   // put(reg, select(mask, a, b)) as one instruction (its sources are read
   // before the register is written).
   void put_select(uint32_t reg, const Operand& mask, const Operand& a, const Operand& b) {
+    if (known_on(mask)) return put(reg, a);
     emit(dx::kMovc, {D(reg), mask, a, b});
-    if (reg == kExecLoR) emit(dx::kAnd, {D(reg), R(reg), I(1)});
+    if (reg == kExecLoR) {
+      exec_written_ = true;
+      emit(dx::kAnd, {D(reg), R(reg), I(1)});
+    }
+  }
+  // The lane's condition when EXEC is known on (active()).
+  static bool known_on(const Operand& mask) {
+    const Operand on = I(1);
+    return mask.size() == on.size() && std::equal(mask.begin(), mask.end(), on.begin());
   }
   Operand in_temp(const Operand& v) { return is_temp(v) ? v : op1(dx::kMov, v); }
   Operand copy(const Operand& v) { return op1(dx::kMov, v); }
@@ -189,8 +201,20 @@ class Translator {
     emit(dx::kUsubb, {D(r), D(c), a, b});
     return {R(r), R(c)};
   }
-  void if_nz(const Operand& c) { emit(dx::kIf, {c}, dxbc::kTestNonZero); }
-  void end_if() { emit(dx::kEndif, {}); }
+  void if_nz(const Operand& c) {
+    emit(dx::kIf, {c}, dxbc::kTestNonZero);
+    ifs_.push_back(1);
+  }
+  // An if on the lane being active: left out where EXEC is known on.
+  void if_active() {
+    if (exec_on_) ifs_.push_back(0);
+    else if_nz(active());
+  }
+  void end_if() {
+    const bool emitted = ifs_.empty() || ifs_.back();
+    if (!ifs_.empty()) ifs_.pop_back();
+    if (emitted) emit(dx::kEndif, {});
+  }
 
   // ---- register access ----
   void use_vgpr(uint16_t code, int count = 1) {
@@ -249,7 +273,7 @@ class Translator {
       case 247: return I(0xc0800000u);
       case 248: return I(0x3e22f983u);
       case 251: return bit01(eq(bor(R(kVccLoR), R(kVccHiR)), I(0)));
-      case 252: return bit01(eq(bor(R(kExecLoR), R(kExecHiR)), I(0)));
+      case 252: return bit01(eq(R(kExecLoR), I(0)));  // the lane model: EXEC is the lane's bit
       default: break;
     }
     if (code >= 128 && code <= 192) return I(code - 128u);
@@ -335,7 +359,9 @@ class Translator {
     set_s64(code, bit, I(0));
   }
   Operand mask_bit(const Instruction& inst, uint16_t code) { return bit01(src(inst, code)); }
-  Operand active() { return R(kExecLoR); }
+  // The lane's condition: EXEC (its bit alone), or true where EXEC is known
+  // on (exec_on_).
+  Operand active() { return exec_on_ ? I(1) : R(kExecLoR); }
   // Stages that run as host compute programs (thread groups, group shared
   // memory, exchanges between lanes).
   bool computeish() const { return stage_ == Stage::Compute || stage_ == Stage::Ngg; }
@@ -606,6 +632,7 @@ class Translator {
     return value;
   }
 
+  bool exec_on_after(const Instruction& inst, bool before) const;
   bool linear_layout(const std::vector<std::pair<uint32_t, dxbc::Program>>& blocks,
                      const std::vector<char>& barrier_after, dxbc::Program& body);
   bool emit(const Instruction& inst);
@@ -760,7 +787,7 @@ class Translator {
     auto vgpr = [&](int i) { return R(vreg(inst.src[i] - rdna::kVgpr0)); };
     const uint32_t target = inst.target;
     if (target == 9 || (target >= 13 && target <= 15)) return true;  // null, point size, clip distances
-    if_nz(active());
+    if_active();
     const Operand slot = in_temp(ngg_slot());
     if (target == 12 || (target >= 32 && target < 64)) {
       if (target == 12) iface_.position = true;
@@ -836,6 +863,13 @@ class Translator {
   uint32_t vgprs_ = 3;
   uint32_t relative_limit_ = 0;  // relative_vgpr_limit()
   bool doubles_ = false;         // double-precision operations are used
+  // EXEC known on where the code is being translated: from the program's
+  // start, after an s_cbranch_execz not taken (in a block no branch goes
+  // to), after EXEC is set to a constant with the lane's bit or or-ed while
+  // on; until anything else writes it.
+  bool exec_on_ = false;
+  bool exec_written_ = false;  // the instruction being translated wrote EXEC
+  std::vector<char> ifs_;      // open ifs: emitted (1) or left out (0, if_active)
   bool barrier_ = false;
   bool lds_ = false;
   // s_getpc_b64 present: program bytes [code_first_, + code_bytes_) are an
@@ -1473,6 +1507,22 @@ bool Translator::linear_layout(const std::vector<std::pair<uint32_t, dxbc::Progr
   return true;
 }
 
+// After an instruction wrote EXEC: known on when it set EXEC to a constant
+// with the lane's bit (s_mov_b32/b64), or or-ed into it while it was on
+// (s_or_b32/b64 with EXEC as a source); else unknown.
+bool Translator::exec_on_after(const Instruction& inst, bool before) const {
+  if (inst.dst != rdna::kExecLo) return false;
+  if (inst.encoding == Encoding::SOP1 && (inst.op == 3 || inst.op == 4)) {
+    const uint16_t code = inst.src[0];
+    if (code >= 129 && code <= 192) return ((code - 128) & 1) != 0;  // 1 to 64
+    if (code >= 193 && code <= 208) return ((code - 192) & 1) != 0;  // -1 to -16
+    if (code == rdna::kLiteral) return (inst.literal & 1) != 0;
+    return false;
+  }
+  return inst.encoding == Encoding::SOP2 && (inst.op == 16 || inst.op == 17) && before &&
+         (inst.src[0] == rdna::kExecLo || inst.src[1] == rdna::kExecLo);
+}
+
 bool Translator::emit_smem(const Instruction& inst) {
   static const int kCounts[] = {1, 2, 4, 8, 16};
   const uint16_t base = inst.src[0];
@@ -1526,7 +1576,7 @@ bool Translator::emit_flat(const Instruction& inst) {
   use_vgpr(vaddr, saddr ? 1 : 2);
   const uint32_t data = inst.src[1] - rdna::kVgpr0;
   const uint32_t dst = inst.dst;
-  if_nz(active());
+  if_active();
   Operand lo, hi;
   if (saddr) {
     auto [l, h] = add64(R(inst.src[2]), R(inst.src[2] + 1u), R(vreg(vaddr - rdna::kVgpr0)), false);
@@ -1837,7 +1887,7 @@ bool Translator::emit_mubuf(const Instruction& inst) {
   } else if (inst.offen) {
     offset = add(offset, R(vreg(vaddr)));
   }
-  if_nz(active());
+  if_active();
   // Descriptor: base (48 bits), stride (bits 16-29 of word 1), records (word 2).
   const Operand stride = ubfe(I(14), I(16), R(r + 1));
   const Operand inside = select(eq(stride, I(0)), ult(offset, R(r + 2)), ult(index, R(r + 2)));
@@ -1924,7 +1974,7 @@ bool Translator::emit_ds(const Instruction& inst) {
   const uint32_t d0 = inst.src[1] - rdna::kVgpr0;
   const uint32_t d1 = inst.src[2] - rdna::kVgpr0;
   const uint32_t offset0 = inst.imm & 0xFF, offset1 = (inst.imm >> 8) & 0xFF, offset = inst.imm & 0xFFFF;
-  if_nz(active());
+  if_active();
   auto address = [&](uint32_t byte_offset) { return band(add(R(addr), I(byte_offset)), I(~3u)); };
   auto load = [&](uint32_t at) {
     const uint32_t r = fresh();
@@ -2928,7 +2978,7 @@ bool Translator::emit_bvh(const Instruction& inst) {
   constexpr uint32_t kInfinity = 0x7F800000u;
   constexpr uint32_t kFltMax = 0x7F7FFFFFu;
 
-  if_nz(active());
+  if_active();
   // Operands.
   uint32_t a = 0;
   const uint32_t ptr_lo = fresh(), ptr_hi = fresh(), extent = fresh();
@@ -3267,7 +3317,7 @@ bool Translator::emit_image(const Instruction& inst) {
         }
         emit(dx::kMov, {dxbc::temp_dst_mask(value, 1u << c), v});
       }
-      if_nz(active());
+      if_active();
       emit(dx::kStoreUavTyped,
            {dxbc::typed_uav_indexed(uav_id, index_reg, true), dxbc::temp_xyzw(coords), dxbc::temp_xyzw(value)});
       end_if();
@@ -3287,7 +3337,7 @@ bool Translator::emit_image(const Instruction& inst) {
       const Operand uav = dxbc::typed_uav_atomic(30 + dim.slot, index_reg);
       const Operand value = R(vreg(data));
       const uint32_t old = fresh();
-      if_nz(active());
+      if_active();
       if (op == 16) {
         emit(dx::kImmAtomicCmpExch, {D(old), uav, dxbc::temp_xyzw(coords), R(vreg(data + 1)), value});
       } else if (op == 18) {
@@ -3482,7 +3532,7 @@ bool Translator::image_atomic64(const Instruction& inst, uint32_t slot, uint32_t
     emit(dx::kMov, {dxbc::temp_dst_mask(coords, 1u << c), v});
   }
   if (inst.raw[0] & 6) return fail("64-bit image atomic with separate address registers");
-  if_nz(active());
+  if_active();
   const uint32_t old = fresh();
   emit(dx::kLdUavTyped,
        {dxbc::temp_dst_mask(old, 0x3), dxbc::temp_xyzw(coords), dxbc::typed_uav_indexed(30 + slot, index_reg, false)});
@@ -3795,8 +3845,10 @@ bool Translator::finish_exchange(const Instruction& inst, uint32_t value, Operan
   }
   // The operation itself, with src0 the exchanged value, in lanes that write.
   const uint32_t saved = fresh();
+  const bool was_on = exec_on_;
   put(saved, R(kExecLoR));
   put(kExecLoR, band(R(kExecLoR), bit01(write)));
+  exec_on_ = false;  // narrowed to the lanes that write
   exchange_reg_ = value;
   bool ok;
   if (inst.encoding == Encoding::VOP3) {
@@ -3809,6 +3861,7 @@ bool Translator::finish_exchange(const Instruction& inst, uint32_t value, Operan
     ok = emit_vector(work);
   }
   put(kExecLoR, R(saved));
+  exec_on_ = was_on;
   return ok;
 }
 
@@ -4157,6 +4210,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
 
   // Block leaders: entry, branch targets, instructions after branches.
   std::set<uint32_t> leaders = {0};
+  std::set<uint32_t> targets(indirect_targets_.begin(), indirect_targets_.end());
   leaders.insert(indirect_targets_.begin(), indirect_targets_.end());
   auto is_branch = [](const Instruction& i) {
     return (i.encoding == Encoding::SOPP && (i.op == 2 || (i.op >= 4 && i.op <= 9) || i.op == 1 || i.op == 10)) ||
@@ -4167,6 +4221,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
     if (!is_branch(inst)) continue;
     if (inst.encoding == Encoding::SOPP && inst.op != 1 && inst.op != 10) {
       leaders.insert(static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm));
+      targets.insert(static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm));
     }
     if (i + 1 < program_.size()) leaders.insert(program_[i + 1].pc);
   }
@@ -4186,7 +4241,21 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       }
       blocks.emplace_back(inst.pc, dxbc::Program());
       barrier_after.push_back(0);
+      // EXEC at the block's start: on at the program's start; unknown where
+      // a branch arrives; else as the previous block left it, on after an
+      // s_cbranch_execz not taken.
+      if (i == 0) {
+        exec_on_ = true;
+      } else if (targets.count(inst.pc)) {
+        exec_on_ = false;
+      } else if (program_[i - 1].encoding == Encoding::SOPP && program_[i - 1].op == 8) {
+        exec_on_ = true;
+      } else if (program_[i - 1].encoding == Encoding::SOPP && program_[i - 1].op == 9) {
+        exec_on_ = false;
+      }
     }
+    const bool exec_before = exec_on_;
+    exec_written_ = false;
     if (inst.encoding == Encoding::SOPP) {
       const uint32_t target = static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm);
       const uint32_t next = i + 1 < program_.size() ? program_[i + 1].pc : 0xFFFFFFFFu;
@@ -4198,8 +4267,8 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
         case 5: branch(R(kSccR)); continue;
         case 6: branch(eq(bor(R(kVccLoR), R(kVccHiR)), I(0))); continue;
         case 7: branch(bor(R(kVccLoR), R(kVccHiR))); continue;
-        case 8: branch(eq(bor(R(kExecLoR), R(kExecHiR)), I(0))); continue;
-        case 9: branch(bor(R(kExecLoR), R(kExecHiR))); continue;
+        case 8: branch(eq(R(kExecLoR), I(0))); continue;  // the lane's bit alone (lane model)
+        case 9: branch(R(kExecLoR)); continue;
         case 10:
           // Workgroup barrier: leave the dispatcher, synchronise at the top
           // level, come back at the next block.
@@ -4243,6 +4312,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       *error = format("at 0x%x: %s", inst.pc, error_.c_str());
       return false;
     }
+    if (exec_written_) exec_on_ = exec_on_after(inst, exec_before);
     if (!error_.empty()) {
       *error = format("at 0x%x: %s", inst.pc, error_.c_str());
       return false;

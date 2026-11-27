@@ -73,6 +73,10 @@ In exploration mode (`--unimplemented continue`), a pipeline whose creation repo
 handed out as a placeholder whose draws are dropped (counted as `d3d12.placeholder_pipelines`), so the title's
 later calls show.
 
+`holy run` warns, before starting the title and after a failure, when the host has less than 8 GiB of commit
+left: titles commit several GiB, and a host short of it fails them in ways that point elsewhere (the GPU device
+removed, the title's own allocations failing).
+
 Exit codes: `0` the title exited with 0; `1` the title exited with a failure code; `2` usage error; `3` the
 title could not be started; `4` stopped by `--timeout`; `5` the title called an unimplemented import.
 

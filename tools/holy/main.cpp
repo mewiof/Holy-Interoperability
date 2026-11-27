@@ -3,6 +3,7 @@
 //   holy inspect <package-dir> [--all]
 //   holy run <package-dir> [options] [-- title arguments]
 #include <windows.h>
+#include <psapi.h>
 
 #include <cstdio>
 #include <string>
@@ -192,6 +193,26 @@ int cmd_inspect(const std::vector<std::wstring>& args) {
   return ok ? kOk : kLaunchFailed;
 }
 
+// Titles commit several GiB (the console gives them about 13.5 GiB of
+// memory). With less than this left on the host, runs fail in ways that
+// point elsewhere (the host removing the GPU device, the title's own
+// allocations failing), so it is said up front and after a failure.
+constexpr uint64_t kCommitWarningBytes = 8ull << 30;
+
+void warn_if_short_of_commit() {
+  PERFORMANCE_INFORMATION info{};
+  info.cb = sizeof(info);
+  if (!K32GetPerformanceInfo(&info, sizeof(info))) return;
+  const uint64_t page = info.PageSize;
+  const uint64_t limit = static_cast<uint64_t>(info.CommitLimit) * page;
+  const uint64_t used = static_cast<uint64_t>(info.CommitTotal) * page;
+  if (used > limit || limit - used >= kCommitWarningBytes) return;
+  std::fprintf(stderr,
+               "holy: warning: the host has %.1f GiB of commit left (of %.1f GiB); titles may fail for lack of memory "
+               "(GPU device removals, failed allocations): close programs or restart the host\n",
+               static_cast<double>(limit - used) / (1ull << 30), static_cast<double>(limit) / (1ull << 30));
+}
+
 int cmd_run(const std::vector<std::wstring>& args) {
   loader::LaunchOptions options;
   size_t i = 0;
@@ -283,6 +304,7 @@ int cmd_run(const std::vector<std::wstring>& args) {
     return kUsage;
   }
 
+  warn_if_short_of_commit();
   std::fflush(stdout);
   const loader::LaunchResult result = loader::launch(options);
   switch (result.status) {
@@ -298,6 +320,7 @@ int cmd_run(const std::vector<std::wstring>& args) {
   }
   if (result.exit_code == 0) return kOk;
   std::fprintf(stderr, "holy: the title exited with code 0x%08X\n", result.exit_code);
+  warn_if_short_of_commit();
   std::fprintf(stderr, "holy: runtime log: %s\n", narrow(result.log_path).c_str());
   return result.exit_code == kExitUnimplementedImport ? kUnimplemented : kTitleFailed;
 }

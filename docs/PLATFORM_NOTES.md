@@ -76,6 +76,10 @@ Notes describe the platform, never a title.
   errors) the range is reserved instead and committed in 64 KiB chunks on first touch, from a vectored
   exception handler in the runtime. `ReadFile` into such memory commits the buffer first, because the kernel
   reports an access to uncommitted memory as an error instead of faulting it in. A warning is logged once.
+  Which chunks are committed is kept in a bitmap per range, so a buffer that is already committed costs no host
+  call (*measured*: asking the host about every buffer kept a loading thread in the kernel for most of the first
+  half minute); the title's `VirtualFree` is interposed so that decommitted or released memory is forgotten, and
+  a read the kernel still refuses for lack of access is retried after asking the host.
 - *observed*: the physical-page functions have the shape of the desktop's user-physical-pages functions with
   64 KiB pages: `BOOL XMemAllocatePhysicalPages(uint64_t attributes, ULONG_PTR* count, ULONG_PTR* pages)`
   (count in and out; titles round byte sizes up with `>> 16` and check for `TRUE` and the full count),
@@ -664,11 +668,22 @@ Notes describe the platform, never a title.
   `ds_consume` (the dword at M0's base plus the offset, by one a lane: see lane masks) are translated, as are SDWA
   output modifiers (clamp, omod), the 16-bit pack conversions (`v_cvt_pknorm_*`, `v_cvt_pk_*16_*32`) and
   `v_pk_fmac_f16`.
-- Implementation, translation cache: translations are stored in `<data>/translated` under a hash of the native
-  code, the parameters that shape the translation and the translator build, and reused by later runs. Host
-  pipelines are compiled on worker threads; translations of more than 256 KiB are compiled one at a time
-  (*observed* host behaviour: the driver refuses some such programs with `E_OUTOFMEMORY` when several compile at
-  once, and accepts them alone), with one retry. The private host cache is discarded only after such a refusal.
+- Implementation, translation cache: translations are stored in `<data>/translated/<translator build>` under a
+  hash of the native code and the parameters that shape the translation, and reused by later runs; directories
+  of other translator builds are deleted in the background when a run first uses the cache (they are never hit
+  again). Translations of more than 256 KiB are compiled one at a time (*observed* host behaviour: the driver
+  refuses some such programs with `E_OUTOFMEMORY` when several compile at once, and accepts them alone), with
+  one retry. The private host cache is discarded only after such a refusal.
+- *observed*: titles create pipelines by the tens of thousands while loading (over 80,000 in the first minutes,
+  about 63,000 of them distinct once translated), and draw with a small part of them; creation is cheap on the
+  console. *measured* on the development host: a compiled translated pipeline holds about 45 KB of driver
+  memory, and compiling all of them takes minutes of processor time.
+- Implementation, pipelines (`core/libs/d3d12_xs/pipeline_cache.h`): a title pipeline holds a recipe (the host
+  stream, its programs as shared content-addressed programs; programs the translation cache holds are reloaded
+  from it instead of being kept in memory). Title pipelines with equal content share one host pipeline, released
+  with the last of them. A host pipeline is compiled when a title pipeline is first used, unless it was used in
+  an earlier run (`<data>/pipelines-used.bin`, by content key): those compile on worker threads as soon as the
+  title creates them. `HOLY_PIPELINES=eager` compiles every pipeline at creation, `lazy` only at first use.
 
 ## Texture layout (`xg_xs.dll`)
 

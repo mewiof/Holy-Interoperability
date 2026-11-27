@@ -43,6 +43,19 @@ holy run <package-dir> [options] [-- <title arguments>]
 | `--trace <patterns>` | comma separated import-library patterns to trace, e.g. `xmem.dll,d3d12*` |
 | `--log-level <level>` | `trace`, `debug`, `info` (default), `warn`, `error` |
 | `--timeout <seconds>` | stop the title after this long |
+| `--profile [ms]` | sample the title's threads (default every 2 ms) into `<data>/logs/profile.txt` |
+
+Environment: `HOLY_PIPELINES=eager|warm|lazy` chooses when host pipelines are compiled: `warm` (default) at first
+use, and at creation for pipelines used in an earlier run; `eager` all at creation; `lazy` only at first use.
+
+### Measuring
+
+Every ten seconds, and when the title ends or crashes, the runtime log gets a statistics report: the process's
+commit and working set, the system's commit, and named counters with their change since the previous report
+(`d3d12.presents` is the frame count, `d3d12.frame_gap_max_ms` the longest frame of the last ten seconds,
+`d3d12.vram_local_mb` the host GPU memory in use, `xmem.*` and `memory.*` title memory). A counter of live objects
+that only grows while the title does the same thing over and over is a leak. `--profile` adds where the
+title's threads spend their time.
 
 Exit codes: `0` the title exited with 0; `1` the title exited with a failure code; `2` usage error; `3` the
 title could not be started; `4` stopped by `--timeout`; `5` the title called an unimplemented import.

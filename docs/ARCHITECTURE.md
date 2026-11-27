@@ -127,6 +127,15 @@ registers and a module+offset stack trace, before the title's own filter runs.
 
 **Logs** never spell out the package location (`<package>`, `<data>`) or the executable's name (`title+0x…`).
 
+**Measurement.** Libraries keep named counters of what they hold and do (live pipelines, programs in memory,
+physical storage, presents, compiles; `HolyCounter` in [core/runtime/api.h](../core/runtime/api.h)). A runtime
+thread logs the process's commit and working set, the system's commit and every counter with its change every
+ten seconds, and once more when the process ends or crashes ([core/runtime/stats.h](../core/runtime/stats.h)):
+frame rate, memory growth and leaks are read from the log. `holy run --profile` adds a sampling profiler that
+runs in the launcher, outside the title process, so it cannot deadlock with what the title's threads hold
+([core/loader/profiler.h](../core/loader/profiler.h)); it reports where threads run, where they wait and their
+processor time.
+
 ## Console libraries
 
 Each library under `core/libs` is a normal DLL exporting the console API's names. Implementations state their

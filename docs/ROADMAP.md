@@ -142,6 +142,13 @@ The console's fast-storage factory. Plan: implement on host file I/O first, the 
 
 - done: console processor instructions the host lacks (`CLZERO`, `MONITORX`, `MWAITX`) carried out by the runtime.
 - done: process exits the title starts are logged with their stack.
+- done: measurement: named counters and a periodic statistics report in the runtime log (memory, live objects,
+  frame rate, GPU memory); a sampling profiler in the launcher (`holy run --profile`).
+- done: pipelines compiled at first use (and early for pipelines used in earlier runs), shared by content,
+  programs reloaded from the translation cache instead of kept in memory: the reference title's commit at its
+  first frames went from about 17 GiB (exhausting the host) to about 5 GiB.
+- done: commit on demand remembers what it committed: the reference title's first frame comes after 3 seconds
+  instead of 30.
 
 - A way to run more than the default executable of a package, and to pass a launch context.
 - Symbol-free minidumps next to the runtime log.

@@ -691,6 +691,43 @@ TEST(nested_loops_and_a_branch_out_of_both_run_as_written) {
   EXPECT(after[33] == 1);
 }
 
+// Loops whose ranges overlap (one region with a loop inside): a branch back
+// from B to A and one from C to B.
+TEST(overlapping_loops_run_as_written) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // s4 = s5 = s6 = 0;
+  // A: s5 += 1; B: s4 += s5; if (s5 < 3) goto A;
+  // C: s6 += 1; if (s6 < 2) goto B;
+  // v0..v2 = s4, s5, s6; buffer_store_dwordx3 v[0:2], off, s[0:3], 0 offset:128; s_endpgm.
+  const std::vector<uint32_t> program = {0xBE840380u, 0xBE850380u, 0xBE860380u, 0x80058105u, 0x80040504u,
+                                         0xBF0A8305u, 0xBF85FFFCu, 0x80068106u, 0xBF0A8206u, 0xBF85FFFAu,
+                                         0x7E000204u, 0x7E020205u, 0x7E040206u, 0xE07C0080u, 0x80000000u,
+                                         0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  info.user_sgprs = 4;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));
+  const std::vector<uint32_t> after = gpu.dispatch(cs, std::vector<uint32_t>(64, 0));
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  // A-B three times (sum 1 + 2 + 3), C, B again (sum 9), C.
+  EXPECT(after[32] == 9);
+  EXPECT(after[33] == 3);
+  EXPECT(after[34] == 2);
+}
+
 // A group barrier between local data share writes and reads of other
 // threads' values (two waves of 32: the barrier is the group's).
 TEST(group_barriers_order_local_data_share_between_waves) {

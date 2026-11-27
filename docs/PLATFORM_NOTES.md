@@ -709,12 +709,15 @@ Notes describe the platform, never a title.
 - Implementation, program layout: a native program's blocks (split at branches and their targets) were each a
   case of one loop that found the next block by a binary search on its address, so every register stayed live
   around that loop. They are now laid out in program order: a block is guarded by a test of the next block's
-  address only where an earlier branch can pass over it; a loop surrounds each region a backward branch closes
-  (its target, the header, to the last block branching back to it) and continues while the next block is the
-  header; group barriers are in line after the block they end. *measured*: the host compiler's time for the same
-  60 compute programs fell from 136 s to 68 s at an unchanged size (166 s before the size work). Programs that
-  jump through registers (subroutines) or whose loop regions overlap without nesting keep the dispatcher loop.
-  Unit tests run nested loops with a branch out of both, and a group barrier between waves.
+  address only where an earlier branch can pass over it; loops surround the regions backward branches go back
+  into (each needs a region holding its block and its target; overlapping ranges merge into one region, ranges
+  inside others stay loops of their own) and continue while the next block is one of the region's; group
+  barriers are in line after the block they end. *observed*: the console compiler's loops are often entered in
+  the middle, past the block their branch back goes to (a loop's step placed before its body), which makes such
+  ranges overlap. *measured*: the host compiler's time for the same 60 compute programs fell from 136 s to 68 s at
+  an unchanged size (166 s before the size work); of the reference title's 19,305 saved programs, 18 keep the
+  dispatcher loop (they jump through registers: subroutines). Unit tests run nested loops with a branch out of
+  both, overlapping loops, and a group barrier between waves.
 - *documented* (RDNA 2): the two low bits of each part of a scalar memory address (base, offset, instruction
   offset) are ignored, so `s_load_*` and `s_buffer_load_*` read whole, aligned dwords. Translated as such: one
   load, no alignment test (a unit test reads at unaligned parts).

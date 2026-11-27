@@ -1336,15 +1336,18 @@ bool Translator::emit_sopc(const Instruction& inst) {
 
 // The linear layout: blocks in program order, each run when the next-block
 // register names it (a test only where an earlier branch can pass over it);
-// a loop only around each region a backward branch closes (from its target,
-// the loop's header, to the last block branching back to it), continuing
-// while the register names the header; group barriers in line, where the
-// block they follow ends (every thread passes them there; programs that are
-// correct on the console reach the same barriers in every thread). Branches
+// loops only around regions of blocks that backward branches go back into,
+// continuing while the register names a block of the region; group
+// barriers in line, where the block they follow ends (every thread passes
+// them there; programs that are correct on the console reach the same
+// barriers in every thread). Each backward branch needs a region holding
+// its block and its target; regions that overlap are merged (a loop the
+// program enters in its middle, past the block its branch back goes to, is
+// one region), regions inside others stay loops of their own. Branches
 // forward need no loop and no search, and the host compiler sees code
 // outside loops as such (the dispatcher keeps every register live around
-// one loop). Programs that jump through registers, or whose loop regions
-// overlap without nesting, keep the dispatcher (false).
+// one loop). Programs that jump through registers keep the dispatcher
+// (false).
 bool Translator::linear_layout(const std::vector<std::pair<uint32_t, dxbc::Program>>& blocks,
                                const std::vector<char>& barrier_after, dxbc::Program& body) {
   const size_t count = blocks.size();
@@ -1356,68 +1359,92 @@ bool Translator::linear_layout(const std::vector<std::pair<uint32_t, dxbc::Progr
     }
     return lo;
   };
-  auto block_at = [&](uint32_t pc) -> size_t {
-    const size_t b = block_of(pc);
-    return blocks[b].first == pc ? b : count;
-  };
-  // Loop regions: header block -> last block branching back to it.
-  std::map<size_t, size_t> loop_end;
   struct Skip {
-    size_t from;     // the block the branch ends
-    uint32_t target; // kEndBlock: the program's end; backward: the header
+    size_t from;      // the block the branch ends
+    uint32_t target;  // kEndBlock: the program's end
+    size_t to;        // backward: the target's block
     bool backward;
   };
   std::vector<Skip> skips;
+  std::vector<std::pair<size_t, size_t>> back;  // target block, branching block
   for (const Instruction& inst : program_) {
     if (inst.encoding == Encoding::SOP1 && (inst.op == 32 || inst.op == 33)) return false;
     if (inst.encoding != Encoding::SOPP) continue;
     const size_t from = block_of(inst.pc);
     if (inst.op == 1) {
-      skips.push_back({from, kEndBlock, false});
+      skips.push_back({from, kEndBlock, 0, false});
       continue;
     }
     if (inst.op != 2 && (inst.op < 4 || inst.op > 9)) continue;
     const uint32_t target = static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm);
     if (target > inst.pc) {
-      skips.push_back({from, target, false});
+      skips.push_back({from, target, 0, false});
       continue;
     }
-    const size_t header = block_at(target);
-    if (header == count) return false;
-    loop_end[header] = std::max(loop_end[header], from);
-    skips.push_back({from, target, true});
+    const size_t to = block_of(target);
+    if (blocks[to].first != target) return false;
+    back.emplace_back(to, from);
+    skips.push_back({from, target, to, true});
   }
-  // Regions nest or are disjoint.
+  // Regions [first, last] (block indices), nested or disjoint: in order of
+  // start (the widest first), each backward branch's range goes inside the
+  // innermost open region holding its start, whose ancestors grow to its end
+  // where it reaches past them.
+  struct Region {
+    size_t first, last;
+  };
+  std::vector<Region> regions;
+  std::sort(back.begin(), back.end(), [](const auto& a, const auto& b) {
+    return a.first != b.first ? a.first < b.first : a.second > b.second;
+  });
   {
     std::vector<size_t> open;
-    for (const auto& [header, end] : loop_end) {
-      while (!open.empty() && open.back() < header) open.pop_back();
-      if (!open.empty() && end > open.back()) return false;
-      open.push_back(end);
+    for (const auto& [first, last] : back) {
+      while (!open.empty() && regions[open.back()].last < first) open.pop_back();
+      for (size_t k = open.size(); k-- > 0 && regions[open[k]].last < last;) regions[open[k]].last = last;
+      if (!open.empty() && regions[open.back()].first == first && regions[open.back()].last == last) continue;
+      regions.push_back({first, last});
+      open.push_back(regions.size() - 1);
     }
   }
   // Blocks a branch can pass over: forward, those up to its target (all, for
-  // the program's end); backward, the rest of its header's region.
+  // the program's end); backward, the rest of the innermost region holding
+  // both ends (whose loop takes the branch back).
   std::vector<int> delta(count + 1, 0);
   for (const Skip& skip : skips) {
     const size_t first = skip.from + 1;
-    size_t last;  // one past
-    if (skip.backward) last = loop_end[block_at(skip.target)] + 1;
-    else if (skip.target == kEndBlock) last = count;
-    else last = std::min(count, block_of(skip.target - 1) + 1);
+    size_t last = count;  // one past
+    if (skip.backward) {
+      size_t span = SIZE_MAX;
+      for (const Region& r : regions) {
+        if (r.first <= skip.to && r.last >= skip.from && r.last - r.first < span) {
+          span = r.last - r.first;
+          last = r.last + 1;
+        }
+      }
+    } else if (skip.target != kEndBlock) {
+      last = std::min(count, block_of(skip.target - 1) + 1);
+    }
     if (first < last) {
       ++delta[first];
       --delta[last];
     }
   }
-  std::vector<std::pair<size_t, uint32_t>> loops;  // open loops: last block, header address
+  // Regions by first block, the widest first.
+  std::vector<size_t> order(regions.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return regions[a].first != regions[b].first ? regions[a].first < regions[b].first
+                                                : regions[a].last > regions[b].last;
+  });
+  size_t next_region = 0;
+  std::vector<size_t> loops;  // open regions, innermost last
   int passed = 0;
   for (size_t b = 0; b < count; ++b) {
     passed += delta[b];
-    const auto region = loop_end.find(b);
-    if (region != loop_end.end()) {
+    for (; next_region < order.size() && regions[order[next_region]].first == b; ++next_region) {
       body.emit(dx::kLoop, {});
-      loops.emplace_back(region->second, blocks[b].first);
+      loops.push_back(order[next_region]);
     }
     if (passed > 0) {
       body.emit(dx::kIeq, {D(kScratch), R(kNextR), I(blocks[b].first)});
@@ -1430,8 +1457,13 @@ bool Translator::linear_layout(const std::vector<std::pair<uint32_t, dxbc::Progr
     if (barrier_after[b]) {
       body.emit(dx::kSync, {}, dxbc::kSyncThreads | dxbc::kSyncGroupMemory | dxbc::kSyncUavGlobal);
     }
-    while (!loops.empty() && loops.back().first == b) {
-      body.emit(dx::kIne, {D(kScratch), R(kNextR), I(loops.back().second)});
+    // Round again while the next block is one of the region's (a branch
+    // back); forward branches out of it and the program's end leave.
+    while (!loops.empty() && regions[loops.back()].last == b) {
+      const Region& r = regions[loops.back()];
+      const uint32_t start = blocks[r.first].first;
+      body.emit(dx::kIadd, {D(kScratch), R(kNextR), I(0u - start)});
+      body.emit(dx::kUge, {D(kScratch), R(kScratch), I(blocks[r.last].first - start + 1)});
       body.emit(dx::kBreakc, {R(kScratch)}, dxbc::kTestNonZero);
       body.emit(dx::kEndloop, {});
       loops.pop_back();

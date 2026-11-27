@@ -406,18 +406,23 @@ class Translator {
   // memory access has one, and the host compiler's time grows faster than
   // the size of what it compiles (measured).
   std::pair<uint32_t, uint32_t> find(const Operand& lo, const Operand& hi, bool write = false) {
+    // The view is the level 2 entry's first word, read into its register.
     const uint32_t view = fresh(), offset = fresh();
+    const uint32_t entry = view;
     const uint32_t mark = scratch_;  // what find uses besides its results goes when it returns
     const Operand alo = in_temp(lo), ahi = in_temp(hi);
     page_table_used_ = true;
-    const Operand window = shl(bor(shl(ahi, I(2)), shr(alo, I(30))), I(2));
+    // Level 1: the window's entry at (address >> 30) * 4, (hi << 4) with
+    // (lo >> 30) in bits 3-2.
+    const Operand window = op4(dx::kBfi, I(2), I(2), shr(alo, I(30)), shl(ahi, I(4)));
     const uint32_t table = fresh();
     emit(dx::kLdRaw, {D(table), select(ult(ahi, I(0x8000)), window, I(kPageTableZeroTable)),
                       dxbc::srv_xyzw(kPageTableId, 0)});
-    const uint32_t entry = fresh();
-    const Operand at = add(add(I(kPageTableZeroTable), shl(R(table), I(17))), shl(ubfe(I(14), I(16), alo), I(3)));
+    // Level 2: the table's start (table 0: the zero table) with the page
+    // (address bits 29-16) in bits 16-3.
+    const Operand at = op4(dx::kBfi, I(14), I(3), shr(alo, I(16)),
+                           op3(dx::kUmad, R(table), I(kPageTableTableBytes), I(kPageTableZeroTable)));
     emit(dx::kLdRaw, {dxbc::temp_dst_mask(entry, 0x3), at, dxbc::srv_xyzw(kPageTableId, 0)});
-    put(view, R(entry));
     if (translator_options().page_cache_reads) {
       put(offset, dxbc::temp(entry, 1));
       if_nz(band(R(view), I(kCachedPageBit)));

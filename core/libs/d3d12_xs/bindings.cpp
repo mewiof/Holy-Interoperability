@@ -158,11 +158,41 @@ void pack_root(const CommandList* list, const RootBinding& binding, uint32_t* us
   if (at < limit && list->heaps[1]) user[at] = static_cast<uint32_t>(list->heaps[1]->title_gpu);
 }
 
+// A shader-visible heap of the runtime's own holding only the memory slot
+// views, for translated calls of lists the title bound no CBV/SRV/UAV heap to
+// (observed in no title yet; drawing without descriptors needs none).
+DescriptorHeap* memory_heap(Device* device) {
+  static DescriptorHeap* heap = [device] {
+    const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    void* made = nullptr;
+    if (FAILED(create_descriptor_heap(device, &desc, &made))) {
+      LIB_LOG(lib::kError, "d3d12", "no heap of memory views for translated calls without a bound heap");
+    }
+    return static_cast<DescriptorHeap*>(made);
+  }();
+  return heap;
+}
+
+// The heap whose memory slot views a translated call uses: the bound
+// CBV/SRV/UAV heap, or the runtime's own (bound on the host for the call).
+const DescriptorHeap* views_heap(CommandList* list) {
+  if (list->heaps[0] && list->heaps[0]->host_count > kReservedViews) return list->heaps[0];
+  DescriptorHeap* own = memory_heap(list->device);
+  if (!own) return nullptr;
+  if (!list->memory_heap_bound) {
+    ID3D12DescriptorHeap* hosts[2] = {own->host, list->heaps[1] ? list->heaps[1]->host : nullptr};
+    list->host->SetDescriptorHeaps(list->heaps[1] ? 2 : 1, hosts);
+    list->memory_heap_bound = true;
+  }
+  return own;
+}
+
 void bind_common(CommandList* list, bool compute, uint64_t page_table, uint64_t system) {
   ID3D12GraphicsCommandList* host = list->host;
   ID3D12RootSignature* root = translated_root_signature(list->device);
   RootBinding& binding = compute ? list->compute : list->graphics;
-  const D3D12_GPU_DESCRIPTOR_HANDLE views{memory_views(list->heaps[0])};
+  const D3D12_GPU_DESCRIPTOR_HANDLE views{memory_views(views_heap(list))};
   if (compute) {
     host->SetComputeRootSignature(root);
     host->SetComputeRootDescriptorTable(kRootMemory, views);
@@ -219,10 +249,7 @@ const RootLayout* root_layout(const void* signature) {
 
 bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t start_instance, const NggPass* ngg) {
   Device* device = list->device;
-  if (!list->heaps[0] || list->heaps[0]->host_count <= kReservedViews) {
-    LIB_LOG(lib::kError, "d3d12", "a translated draw without a bound shader-visible heap");
-    return false;
-  }
+  if (!views_heap(list)) return false;
   const uint64_t page_table = page_table_address(device);
   if (!page_table) return false;
   reach_ring(device);
@@ -260,10 +287,7 @@ bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t 
 
 bool bind_translated_compute(CommandList* list) {
   Device* device = list->device;
-  if (!list->heaps[0] || list->heaps[0]->host_count <= kReservedViews) {
-    LIB_LOG(lib::kError, "d3d12", "a translated dispatch without a bound shader-visible heap");
-    return false;
-  }
+  if (!views_heap(list)) return false;
   const uint64_t page_table = page_table_address(device);
   if (!page_table) return false;
   reach_ring(device);

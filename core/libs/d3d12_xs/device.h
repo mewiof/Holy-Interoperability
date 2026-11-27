@@ -78,6 +78,9 @@ struct CommandList {
   ID3D12GraphicsCommandList7* host7 = nullptr;  // enhanced barriers (null if the host has none)
   D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
   DescriptorHeap* heaps[2] = {};  // bound shader-visible heaps: CBV/SRV/UAV, sampler
+  // The runtime's own heap of memory slot views is bound on the host (the
+  // title bound no CBV/SRV/UAV heap; bindings.cpp).
+  bool memory_heap_bound = false;
   RootBinding graphics, compute;
   const void* pipeline = nullptr;  // the title's current pipeline (a Wrapper)
   bool translated = false;         // it runs translated native code

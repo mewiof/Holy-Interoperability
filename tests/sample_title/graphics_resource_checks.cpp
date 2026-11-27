@@ -790,7 +790,218 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   }
 }
 
+// A draw with native vertex and pixel programs into a render target, as
+// titles draw their loading screens: the vertex program fetches position and
+// colour through the vertex buffer table (s[0:1]) by vertex index, the pixel
+// program exports the colour, flat. A native compute program then reads the
+// target through a view and stores the pixel at (0, 0).
+void test_native_draw(void* device, void* queue) {
+  void* allocator = nullptr;
+  void* list = nullptr;
+  void* fence = nullptr;
+  void* heap = nullptr;
+  void* targets = nullptr;
+  void* graphics_root = nullptr;
+  void* compute_root = nullptr;
+  void* draw_pipeline = nullptr;
+  void* read_pipeline = nullptr;
+  void* target = nullptr;
+  void* placed = nullptr;
+  const uint32_t list_desc[4] = {0, 2, 1, 0};
+  call<HRESULT>(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), &allocator);
+  if (allocator) call<HRESULT>(device, 73, list_desc, allocator, static_cast<void*>(nullptr), kListIid, &list);
+  call<HRESULT>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), &fence);
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16,
+                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 1};
+  call<HRESULT>(device, 14, &heap_desc, __uuidof(ID3D12DescriptorHeap), &heap);
+  D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 1};
+  call<HRESULT>(device, 14, &rtv_desc, __uuidof(ID3D12DescriptorHeap), &targets);
+
+  // Root signatures: none for the draw; a table and two constants for the read.
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty{};
+  empty.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  ID3DBlob* serialized = nullptr;
+  if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&empty, &serialized, nullptr)) && serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &graphics_root);
+  }
+  D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+  D3D12_ROOT_PARAMETER1 parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable = {1, &range};
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants = {0, 0, 2};
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC read_desc{};
+  read_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  read_desc.Desc_1_1.NumParameters = 2;
+  read_desc.Desc_1_1.pParameters = parameters;
+  serialized = nullptr;
+  if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&read_desc, &serialized, nullptr)) && serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &compute_root);
+  }
+
+  // Vertex program: s_load_dwordx4 s[4:7], s[0:1] (vertex buffer 0's
+  // descriptor); buffer_load_dwordx4 v[1:4], v0, s[4:7] idxen (position);
+  // buffer_load_dwordx4 v[5:8], v0, s[4:7] idxen offset:16 (colour);
+  // exp param0 v[5:8]; exp pos0 v[1:4] done; s_endpgm.
+  const std::vector<uint8_t> native_vs = native_only_container(
+      {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xE0382000u, 0x80010100u, 0xE0382010u, 0x80010500u, 0xBF8C3F70u,
+       0xF800020Fu, 0x08070605u, 0xF80008CFu, 0x04030201u, 0xBF810000u});
+  // Pixel program: v_interp_mov_f32 v2..v5, p0, attr0.xyzw; exp mrt0 v[2:5] done; s_endpgm.
+  const std::vector<uint8_t> native_ps = native_only_container(
+      {0xC80A0002u, 0xC80E0102u, 0xC8120202u, 0xC8160302u, 0xF800080Fu, 0x05040302u, 0xBF810000u});
+  struct alignas(void*) RootSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+    void* value;
+  };
+  struct alignas(void*) ShaderSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+    D3D12_SHADER_BYTECODE value;
+  };
+  struct alignas(void*) TopologySubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY;
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  };
+  struct alignas(void*) FormatsSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+    D3D12_RT_FORMAT_ARRAY value{{DXGI_FORMAT_R8G8B8A8_UNORM}, 1};
+  };
+  struct Stream {
+    RootSubobject root;
+    ShaderSubobject vs;
+    ShaderSubobject ps;
+    TopologySubobject topology;
+    FormatsSubobject formats;
+  } stream{};
+  stream.root.value = graphics_root;
+  stream.vs = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {native_vs.data(), native_vs.size()}};
+  stream.ps = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {native_ps.data(), native_ps.size()}};
+  D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+  if (graphics_root) call<HRESULT>(device, 86, &stream_desc, __uuidof(ID3D12PipelineState), &draw_pipeline);
+  const std::vector<uint8_t> read_cs = native_only_container(
+      {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE880304u, 0xBE890380u, 0xF40C0304u, 0xFA000000u, 0xBF8CC07Fu,
+       0x7E000280u, 0x7E020280u, 0xF0001F08u, 0x00030200u, 0xBF8C3F70u, 0xBE940305u, 0xBE950306u, 0xB0160040u,
+       0xBE970380u, 0xE0780000u, 0x80050200u, 0xBF810000u});
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+  pso.CS = {read_cs.data(), read_cs.size()};
+  call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
+                __uuidof(ID3D12PipelineState), &read_pipeline);
+
+  // The render target.
+  D3D12_HEAP_PROPERTIES local{};
+  local.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC texture{};
+  texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  texture.Width = 64;
+  texture.Height = 64;
+  texture.DepthOrArraySize = 1;
+  texture.MipLevels = 1;
+  texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture.SampleDesc.Count = 1;
+  texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  // Slot 127 (the shape of CreateCommittedResource3), as titles create their
+  // targets: the initial state is a layout.
+  call<HRESULT>(device, 127, &local, D3D12_HEAP_FLAG_NONE, &texture, static_cast<UINT>(D3D12_BARRIER_LAYOUT_RENDER_TARGET),
+                static_cast<const D3D12_CLEAR_VALUE*>(nullptr), static_cast<void*>(nullptr), 0u,
+                static_cast<const void*>(nullptr), __uuidof(ID3D12Resource), &target);
+
+  // Vertices (position, colour) of a triangle covering the target, and the
+  // output, in title memory.
+  auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  if (!list || !fence || !heap || !targets || !compute_root || !draw_pipeline || !read_pipeline || !target || !memory) {
+    check(false, "the objects for a native draw exist");
+    return;
+  }
+  const float vertices[3][8] = {{-1, -1, 0, 1, 0.25f, 0.5f, 0.75f, 1},
+                                {-1, 3, 0, 1, 0.25f, 0.5f, 0.75f, 1},
+                                {3, -1, 0, 1, 0.25f, 0.5f, 0.75f, 1}};
+  std::memcpy(memory, vertices, sizeof(vertices));
+  auto* output = reinterpret_cast<volatile float*>(memory + 0x10000);
+  const uint64_t output_address = reinterpret_cast<uint64_t>(output);
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 0x10000;
+  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  call<HRESULT>(device, 133, output_address, &buffer, static_cast<UINT>(0xFFFFFFFF), static_cast<const void*>(nullptr),
+                __uuidof(ID3D12Resource), &placed);
+
+  const uint64_t rtv = call<uint64_t>(targets, 9);
+  call<void>(device, 20, target, static_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(nullptr), rtv);
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+  srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2D.MipLevels = 1;
+  call<void>(device, 18, target, &srv, call<uint64_t>(heap, 9));
+
+  bool recorded = call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
+  call<void>(list, 25, draw_pipeline);
+  call<void>(list, 34, graphics_root);
+  call<void>(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VERTEX_BUFFER_VIEW vertex_buffer{reinterpret_cast<uint64_t>(memory), sizeof(vertices), 32};
+  call<void>(list, 48, 0u, 1u, &vertex_buffer);
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle{static_cast<SIZE_T>(rtv)};
+  call<void>(list, 50, 1u, &rtv_handle, FALSE, static_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(nullptr));
+  const D3D12_VIEWPORT viewport{0, 0, 64, 64, 0, 1};
+  const D3D12_RECT scissor{0, 0, 64, 64};
+  call<void>(list, 21, 1u, &viewport);
+  call<void>(list, 22, 1u, &scissor);
+  call<void>(list, 12, 3u, 1u, 0u, 0u);
+  D3D12_TEXTURE_BARRIER barrier{};
+  barrier.SyncBefore = D3D12_BARRIER_SYNC_RENDER_TARGET;
+  barrier.SyncAfter = D3D12_BARRIER_SYNC_COMPUTE_SHADING;
+  barrier.AccessBefore = D3D12_BARRIER_ACCESS_RENDER_TARGET;
+  barrier.AccessAfter = D3D12_BARRIER_ACCESS_SHADER_RESOURCE;
+  barrier.LayoutBefore = D3D12_BARRIER_LAYOUT_RENDER_TARGET;
+  barrier.LayoutAfter = D3D12_BARRIER_LAYOUT_SHADER_RESOURCE;
+  barrier.pResource = static_cast<ID3D12Resource*>(target);
+  barrier.Subresources.IndexOrFirstMipLevel = 0xFFFFFFFFu;
+  D3D12_BARRIER_GROUP group{};
+  group.Type = D3D12_BARRIER_TYPE_TEXTURE;
+  group.NumBarriers = 1;
+  group.pTextureBarriers = &barrier;
+  call<void>(list, 146, 1u, static_cast<const D3D12_BARRIER_GROUP*>(&group));
+  const uint32_t constants[2] = {static_cast<uint32_t>(output_address), static_cast<uint32_t>(output_address >> 32)};
+  void* heaps[] = {heap};
+  call<void>(list, 32, 1u, static_cast<void* const*>(heaps));
+  call<void>(list, 33, compute_root);
+  call<void>(list, 35, 0u, call<uint64_t>(heap, 10));
+  call<void>(list, 39, 1u, 2u, static_cast<const void*>(constants), 0u);
+  call<void>(list, 25, read_pipeline);
+  call<void>(list, 14, 1u, 1u, 1u);
+  recorded = recorded && call<HRESULT>(list, 9) == S_OK;
+  void* lists[] = {list};
+  call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+  call<HRESULT>(queue, 16, fence, UINT64{1});
+  const auto* value = call<const volatile uint64_t*>(fence, 12);
+  for (int i = 0; value && *value < 1 && i < 5000; ++i) Sleep(1);
+  auto close_to = [](float a, float b) { return a > b - 0.01f && a < b + 0.01f; };
+  const float pixel[4] = {output[0], output[1], output[2], output[3]};
+  std::printf("    (pixel the draw left: %.3f %.3f %.3f %.3f)\n", pixel[0], pixel[1], pixel[2], pixel[3]);
+  check(recorded && value && *value == 1 && close_to(pixel[0], 0.25f) && close_to(pixel[1], 0.5f) &&
+            close_to(pixel[2], 0.75f) && close_to(pixel[3], 1.0f),
+        "a draw with native programs fetching vertices through the vertex buffer table colours its target");
+
+  if (placed) call<ULONG>(placed, 2);
+  call<ULONG>(target, 2);
+  call<ULONG>(read_pipeline, 2);
+  call<ULONG>(draw_pipeline, 2);
+  call<ULONG>(compute_root, 2);
+  call<ULONG>(graphics_root, 2);
+  call<ULONG>(targets, 2);
+  call<ULONG>(heap, 2);
+  call<ULONG>(fence, 2);
+  call<ULONG>(list, 2);
+  call<ULONG>(allocator, 2);
+  VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 void test_graphics_resources(void* device, void* queue) {
+  if (queue) test_native_draw(device, queue);
   test_page_mapping_update(device);
   test_released_memory(device);
   if (queue) {

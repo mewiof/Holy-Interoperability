@@ -132,6 +132,7 @@ HRESULT STDMETHODCALLTYPE list_reset_x(CommandList* self, void* allocator, void*
     return E_NOTIMPL;
   }
   self->heaps[0] = self->heaps[1] = nullptr;
+  self->memory_heap_bound = false;
   self->graphics = RootBinding{};
   self->compute = RootBinding{};
   self->pipeline = nullptr;
@@ -187,6 +188,9 @@ HRESULT STDMETHODCALLTYPE list_reset_x(CommandList* self, void* allocator, void*
 void STDMETHODCALLTYPE list_set_descriptor_heaps(CommandList* self, UINT count, void* const* heaps) {
   ID3D12DescriptorHeap* host[2] = {};
   UINT used = 0;
+  // The call replaces every bound heap.
+  self->heaps[0] = self->heaps[1] = nullptr;
+  self->memory_heap_bound = false;
   for (UINT i = 0; i < count && i < 2; ++i) {
     auto* heap = static_cast<DescriptorHeap*>(heaps[i]);
     if (!heap) continue;

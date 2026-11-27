@@ -57,7 +57,7 @@ flowchart LR
 | Graphics: performance | `███▌░░░░░░` 35% (host shader compile time, the first run's main cost, 3 times lower: 166 s to 56 s for 60 compute programs, measured without the driver's cache answering; page table and root arguments in memory the GPU caches; aligned reads as one load; memory accesses: two page-table reads instead of a scan; no views written per draw; recording a draw of native programs costs 0.3 us of CPU time, 0.4 us with a pipeline and table change each draw, measured over 20,000 draws; translated memory reads now cost the same as the desktop's on the same memory (1.0 times, was 1.5), and the GPU reads title memory over the bus without its second-level cache, about 20 times slower than video memory: measured; copies in video memory of what translated programs read, opt-in for now, make such reads 3 times faster) |
 | Input | `████░░░░░░` 40% |
 | Audio | `█░░░░░░░░░` 10% |
-| Measurement: statistics, profiler, leak checks, call check, frame trace | `████████░░` 75% |
+| Measurement: statistics, profiler, leak checks, call check, frame trace | `████████▌░` 85% (a run report turns a run's log into frames a second, frame times, memory growth and leak suspects, with exit codes; one command runs and checks a title; offline host compile times of every kind of translated program, without the driver's cache answering) |
 
 ## How it works
 

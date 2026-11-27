@@ -703,9 +703,12 @@ double host_commit_left() {
 // the view; memory from XMemVirtualAlloc, and physical pages the title mapped,
 // both written after the view was made and the work submitted a frame later
 // (the host copy of the texture follows the write: tracked writes, writes
-// through the title's view of physical pages); and a physical page the title
-// maps (and writes) only after viewing the texture there.
-enum class TextureMemory { Plain, Reserved, Physical, Unmapped };
+// through the title's view of physical pages); a physical page the title
+// maps (and writes) only after viewing the texture there; and memory from
+// XMemVirtualAlloc a texture without render-target or unordered-access usage
+// is placed in (CreatePlacedResourceX), written after the placement and the
+// view (titles write glyphs into such textures on the CPU).
+enum class TextureMemory { Plain, Reserved, Physical, Unmapped, Placed };
 
 // The command list interface titles ask for.
 constexpr GUID kListIid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
@@ -774,8 +777,9 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
     output = static_cast<volatile float*>(VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
   } else {
     memory = static_cast<volatile uint8_t*>(
-        kind == TextureMemory::Reserved ? XMemVirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, 0x23, PAGE_READWRITE)
-                                        : VirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        kind == TextureMemory::Reserved || kind == TextureMemory::Placed
+            ? XMemVirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, 0x23, PAGE_READWRITE)
+            : VirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (memory) output = reinterpret_cast<volatile float*>(memory + 0x10000);
   }
   if (!list || !fence || !heap || !signature || !pipeline || !memory || !output) {
@@ -790,6 +794,7 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   const uint8_t base_byte = kind == TextureMemory::Plain      ? 0x10
                             : kind == TextureMemory::Reserved ? 0x50
                             : kind == TextureMemory::Physical ? 0x90
+                            : kind == TextureMemory::Placed   ? 0x30
                                                               : 0xC0;
   const uint8_t texel_bytes[4] = {base_byte, static_cast<uint8_t>(base_byte + 0x10),
                                   static_cast<uint8_t>(base_byte + 0x20), 0xFF};
@@ -825,6 +830,12 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   view.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   view.srv.Texture2D.MipLevels = 1;
   view.address = reinterpret_cast<uint64_t>(memory);
+  void* placed_texture = nullptr;
+  if (kind == TextureMemory::Placed) {
+    // Initial state 6: the shader-resource layout titles pass.
+    call<HRESULT>(device, 133, reinterpret_cast<uint64_t>(memory), &texture, 6u, static_cast<const void*>(nullptr),
+                  __uuidof(ID3D12Resource), &placed_texture);
+  }
   call<void>(device, 70, &texture, &view, call<uint64_t>(heap, 9));
   if (kind == TextureMemory::Unmapped) XMemMapPhysicalPages(const_cast<uint8_t*>(memory), 1, &page);
   if (after) {
@@ -867,8 +878,12 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
         : kind == TextureMemory::Reserved ? "a texture written after its view shows the new texels to the GPU"
         : kind == TextureMemory::Physical ? "a texture in physical pages written through the title's view after its view "
                                             "shows the new texels to the GPU"
+        : kind == TextureMemory::Placed   ? "a placed texture the GPU does not write shows what the title writes into its "
+                                            "memory"
                                           : "a texture viewed before its physical page was mapped shows what the title "
                                             "wrote there");
+  if (kind == TextureMemory::Placed) check(placed_texture != nullptr, "a texture is placed in title memory");
+  if (placed_texture) call<ULONG>(placed_texture, 2);
 
   if (placed) call<ULONG>(placed, 2);
   call<ULONG>(pipeline, 2);
@@ -2361,6 +2376,7 @@ void test_graphics_resources(void* device, void* queue) {
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Reserved);
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Physical);
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Unmapped);
+    test_compute_reads_a_texture_view(device, queue, TextureMemory::Placed);
   }
   test_allocation_hooks();
   test_placeholders();

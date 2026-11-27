@@ -44,6 +44,11 @@ struct Record {
   D3D12_RESOURCE_DESC desc{};
   uint64_t size = 0;         // bytes in title memory
   bool from_memory = false;  // filled from title memory: kept current
+  // The state the texture rests in between fills: textures viewed by address
+  // are shader resources; placed textures following memory stay common (the
+  // title's barriers on them keep that layout), which copies and shader reads
+  // both allow.
+  D3D12_RESOURCE_STATES rest = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
   bool protected_watch = false;  // its memory is watched by page protection (write_watch.h)
   bool tracked = false;          // its allocation's writes are tracked by the host
   bool dirty = false;
@@ -156,7 +161,7 @@ bool allocation_of(uint64_t address, uint64_t* base, uint64_t* size, bool* watch
 }
 
 void mark(Record* record) {
-  if (record->dirty || !record->texture) return;
+  if (record->dirty || !record->texture || !record->from_memory) return;
   record->dirty = true;
   g_dirty.push_back(record);
 }
@@ -507,7 +512,7 @@ bool record_fill(Device* device, Uploader* up, const Record& record, ID3D12Resou
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   barrier.Transition.pResource = texture;
   barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+  barrier.Transition.StateBefore = record.rest;
   barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
   if (!first) up->list->ResourceBarrier(1, &barrier);
   const uint32_t count = lib::subresource_count(shape);
@@ -547,8 +552,104 @@ void replace(const Key& key, Record* record) {
 
 }  // namespace
 
+bool placed_texture_follows_memory(const D3D12_RESOURCE_DESC& desc) {
+  constexpr D3D12_RESOURCE_FLAGS kWritten = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  return desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && (desc.Flags & kWritten) == 0 && tracking();
+}
+
+namespace {
+
+// A placed texture the GPU does not write: filled from its title memory now
+// and kept current like textures viewed by address (g_lock not held). The
+// caller receives a reference.
+ID3D12Resource* memory_texture(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address) {
+  const lib::TextureShape shape = shape_of(desc);
+  const Key key = key_of(address, shape);
+  const uint64_t size = lib::texture_size(shape);
+  if (!size) return nullptr;
+  std::lock_guard<std::mutex> guard(g_lock);
+  apply_changes();
+  release_retired();
+  Uploader* up = uploader(device);
+  if (!up) return nullptr;
+  D3D12_RESOURCE_DESC host_desc = desktop_resource_desc(desc);
+  host_desc.Alignment = 0;
+  auto* record = new Record();
+  record->address = address;
+  record->desc = desc;
+  record->size = size;
+  record->from_memory = true;
+  record->rest = D3D12_RESOURCE_STATE_COMMON;
+  if (!committed_whole(address, size) && !readable(address, size)) {
+    HolyEnsureCommitted(reinterpret_cast<void*>(address), static_cast<size_t>(size));
+  }
+  track(record);
+  if (!record->tracked && !record->protected_watch) c_untracked().add(1);
+  begin_upload(up);
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  ID3D12Resource* texture = nullptr;
+  const HRESULT hr = device->host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &host_desc,
+                                                           D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                           IID_PPV_ARGS(&texture));
+  LIB_LOG(hr < 0 ? lib::kError : lib::kDebug, "d3d12",
+          "placed texture dim %d %llux%ux%u, %u mips, format %u, flags 0x%x at %p, following its memory -> 0x%08lX",
+          desc.Dimension, static_cast<unsigned long long>(desc.Width), desc.Height, desc.DepthOrArraySize,
+          desc.MipLevels, desc.Format, desc.Flags, reinterpret_cast<void*>(address), static_cast<unsigned long>(hr));
+  if (FAILED(hr)) {
+    up->list->Close();
+    drop(record);
+    return nullptr;
+  }
+  if (!record_fill(device, up, *record, texture, true)) {
+    // Not readable yet (pages not mapped): zeros until the memory changes.
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST,
+                          record->rest};
+    up->list->ResourceBarrier(1, &barrier);
+  }
+  record->texture = texture;
+  const uint64_t value = submit_upload(up);
+  up->fence->SetEventOnCompletion(value, up->event);
+  WaitForSingleObject(up->event, INFINITE);
+  replace(key, record);
+  g_largest = std::max(g_largest, size);
+  c_live_textures().add(1);
+  c_live_texture_bytes().add(static_cast<int64_t>(size));
+  texture->AddRef();
+  return texture;
+}
+
+}  // namespace
+
+void texture_written_by_gpu(const D3D12_RESOURCE_DESC& desc, uint64_t address) {
+  if (!address || !placed_texture_follows_memory(desc)) return;
+  std::lock_guard<std::mutex> guard(g_lock);
+  auto found = textures().find(key_of(address, shape_of(desc)));
+  if (found == textures().end()) return;
+  Record* record = found->second;
+  if (!record->from_memory || record->rest != D3D12_RESOURCE_STATE_COMMON) return;
+  // Its contents are the GPU's from now on: memory no longer overwrites them.
+  if (record->protected_watch) unwatch(reinterpret_cast<WatchToken>(record));
+  record->protected_watch = false;
+  record->tracked = false;
+  for (auto& [base, allocation] : tracked()) {
+    auto& list = allocation.records;
+    list.erase(std::remove(list.begin(), list.end(), record), list.end());
+  }
+  g_dirty.erase(std::remove(g_dirty.begin(), g_dirty.end(), record), g_dirty.end());
+  record->dirty = false;
+  record->from_memory = false;
+  c_live_textures().add(-1);
+  c_live_texture_bytes().add(-static_cast<int64_t>(record->size));
+}
+
 ID3D12Resource* placed_texture(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address,
                                UINT initial_layout, const D3D12_CLEAR_VALUE* clear) {
+  if (address && placed_texture_follows_memory(desc)) return memory_texture(device, desc, address);
   const lib::TextureShape shape = shape_of(desc);
   const Key key = key_of(address, shape);
   D3D12_RESOURCE_DESC host_desc = desktop_resource_desc(desc);
@@ -635,7 +736,20 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   // Tracked from before the copy reads the memory (a write from now on makes
   // it dirty; the copy may already hold part of it).
   track(record);
-  if (!record->tracked && !record->protected_watch) c_untracked().add(1);
+  if (!record->tracked && !record->protected_watch) {
+    c_untracked().add(1);
+    // Whose memory it is: the CPU's writes to it are not seen.
+    static std::atomic<int> logged{0};
+    MEMORY_BASIC_INFORMATION info{};
+    if (address && logged.fetch_add(1) < 64 &&
+        VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info))) {
+      LIB_LOG(lib::kWarn, "d3d12",
+              "host texture of format %u %llux%ux%u at %p: writes to its memory are not tracked (state 0x%lx, type "
+              "0x%lx, protection 0x%lx, allocation %p)",
+              shape.format, static_cast<unsigned long long>(shape.width), shape.height, shape.depth_or_array,
+              reinterpret_cast<void*>(address), info.State, info.Type, info.Protect, info.AllocationBase);
+    }
+  }
 
   begin_upload(up);
   D3D12_HEAP_PROPERTIES heap{};

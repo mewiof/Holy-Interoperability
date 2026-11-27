@@ -428,6 +428,13 @@ Notes describe the platform, never a title.
 - *observed*: the initial state titles pass to `CreatePlacedResourceX` for textures and to slot 127 is a barrier
   layout (3 and 6 seen, then named as the layout before the first barrier). Implementation: host textures are
   created in that layout (`CreateCommittedResource3`); each placement gets its own host texture.
+- *observed*: titles write glyphs on the CPU into placed textures without render-target, depth or
+  unordered-access usage (A8 textures of 1024x1024 and 2048x2048), which their text draws then sample; with
+  host textures of their own (never filled from memory) every glyph rasterised after the texture was placed was
+  missing on screen. Implementation (texture_upload.h): such placed textures follow their memory like textures
+  viewed by address (filled from it, refreshed when it is written); they rest in the common layout, which allows
+  both copies and shader reads, and the title's barriers on them keep that layout (and never discard). A GPU copy
+  into one makes its contents the GPU's: memory no longer overwrites them.
 - *observed*: slot 70 may be called with a description buffer the title left unwritten (dimension zero in the
   title's own texture record); a null view of the requested kind is made. The same is done, and logged, for
   descriptions no texture can have (sizes above 65,536, more than 17 levels, sample counts outside 1-16, formats

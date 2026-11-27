@@ -10,7 +10,13 @@
 // textures of their own, registered under their address and shape: the host
 // cannot place textures in the heaps over title memory (those take buffers
 // and row-major textures only), and textures the GPU writes are only ever
-// read through views, which then find the same host texture.
+// read through views, which then find the same host texture. Placed textures
+// the GPU does not write (no render-target, depth or unordered-access usage)
+// follow their memory instead, like textures viewed by address (observed:
+// titles write glyphs into such textures on the CPU, and their host textures
+// stayed empty); they rest in the common layout, which the title's barriers
+// on them keep. A GPU copy into one makes its contents the GPU's: memory no
+// longer overwrites them.
 //
 // Host textures filled from title memory are kept current: the host tracks
 // writes to title memory xmem reserved (MEM_WRITE_WATCH: CPU and kernel
@@ -46,6 +52,10 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
 // The caller receives a reference.
 ID3D12Resource* placed_texture(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address,
                                UINT initial_layout, const D3D12_CLEAR_VALUE* clear);
+// Whether a placed texture of `desc` follows its memory (see above).
+bool placed_texture_follows_memory(const D3D12_RESOURCE_DESC& desc);
+// The GPU copied into the placed texture at `address`.
+void texture_written_by_gpu(const D3D12_RESOURCE_DESC& desc, uint64_t address);
 
 // Registers the host texture of a title resource at `address` (committed
 // textures live in memory the runtime allocates for them, as on the console),

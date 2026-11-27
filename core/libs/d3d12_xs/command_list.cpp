@@ -28,6 +28,7 @@
 #include "core/libs/d3d12_xs/ngg.h"
 #include "core/libs/d3d12_xs/page_cache.h"
 #include "core/libs/d3d12_xs/texture_dump.h"
+#include "core/libs/d3d12_xs/texture_upload.h"
 #include "core/libs/d3d12_xs/views.h"
 #include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/support.h"
@@ -407,6 +408,9 @@ void STDMETHODCALLTYPE list_barrier(CommandList* self, UINT32 count, const D3D12
         b.pResource = title ? title->host : nullptr;
         b.LayoutBefore = host_texture_layout(title, host_layout(b.LayoutBefore));
         b.LayoutAfter = host_texture_layout(title, host_layout(b.LayoutAfter));
+        if (title && title->title_va && placed_texture_follows_memory(title->desc)) {
+          b.Flags &= ~D3D12_TEXTURE_BARRIER_FLAG_DISCARD;  // its contents are its memory's
+        }
         note_texture_layout(static_cast<Resource*>(static_cast<void*>(g.pTextureBarriers[i].pResource)), b.LayoutAfter);
         textures.push_back(b);
       }
@@ -1002,6 +1006,10 @@ void STDMETHODCALLTYPE list_copy_texture_region(CommandList* self, const D3D12_T
                                                 const D3D12_BOX* box) {
   D3D12_TEXTURE_COPY_LOCATION to{}, from{};
   if (!destination || !source || !host_copy_location(*destination, &to) || !host_copy_location(*source, &from)) return;
+  if (destination->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+    const auto* target = static_cast<const Resource*>(static_cast<const void*>(destination->pResource));
+    texture_written_by_gpu(target->desc, target->title_va);
+  }
   HOLY_TRACE("list %u copies a texture region", self->number);
   if (destination->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
     const D3D12_SUBRESOURCE_FOOTPRINT& f = destination->PlacedFootprint.Footprint;
@@ -1017,6 +1025,7 @@ void STDMETHODCALLTYPE list_copy_resource(CommandList* self, void* destination, 
   const Resource* from = copied(source, "a resource copy");
   if (!to || !from) return;
   HOLY_TRACE("list %u copies a resource", self->number);
+  texture_written_by_gpu(to->desc, to->title_va);
   if (to->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) page_cache_gpu_writes(to->title_va, to->desc.Width);
   if (to->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && from->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     // Host buffers of placed buffers are wider than the title's (or shorter).

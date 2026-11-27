@@ -466,6 +466,10 @@ D3D12_BARRIER_LAYOUT layout_for_flags(D3D12_BARRIER_LAYOUT layout, D3D12_RESOURC
 
 D3D12_BARRIER_LAYOUT host_texture_layout(const Resource* resource, D3D12_BARRIER_LAYOUT layout) {
   if (!resource || resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return layout;
+  // Placed textures following their memory rest in the common layout
+  // (texture_upload.h), whatever layout the title names.
+  // (Undefined too: their contents are the memory's, never discarded.)
+  if (resource->title_va && placed_texture_follows_memory(resource->desc)) return D3D12_BARRIER_LAYOUT_COMMON;
   return layout_for_flags(layout, desktop_resource_desc(resource->desc).Flags);
 }
 

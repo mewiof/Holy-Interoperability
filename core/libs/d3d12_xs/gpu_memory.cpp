@@ -205,10 +205,16 @@ std::mutex g_events_lock;
 std::vector<MappingEvent> g_events;
 std::atomic<bool> g_events_pending{false};
 
+// Bumped whenever a title address may stop translating as before (heaps
+// released, physical pages mapped or unmapped): translate_gpu_va's per-thread
+// cache holds ranges of one generation.
+std::atomic<uint64_t> g_generation{1};
+
 void observe_mapping(void*, uintptr_t granule, HANDLE section, uint64_t offset) {
   std::lock_guard<std::mutex> lock(g_events_lock);
   g_events.push_back({granule, section, offset});
   g_events_pending.store(true, std::memory_order_release);
+  g_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 using ObserveFn = void (*)(void (*)(void*, uintptr_t, HANDLE, uint64_t), void*);
@@ -318,6 +324,7 @@ void release_title_memory(const void* address, size_t size) {
       c_slots().add(-static_cast<int64_t>(slots));
       retired.push_back(record);
       it = region_heaps().erase(it);
+      g_generation.fetch_add(1, std::memory_order_acq_rel);
     }
   }
   for (const HeapRecord& record : retired) {
@@ -569,10 +576,28 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
   return true;
 }
 
+// Called for the system constants of every translated call, vertex buffers
+// and root views: ranges translated before are found without the lock in a
+// small per-thread cache (cleared by g_generation).
 uint64_t translate_gpu_va(Device* device, uint64_t title_va) {
   if (!title_va) return 0;
+  struct Range {
+    uint64_t begin = 0, end = 0, host = 0, generation = 0;
+  };
+  thread_local Range cache[8];
+  thread_local uint32_t next = 0;
+  const uint64_t generation = g_generation.load(std::memory_order_acquire);
+  for (const Range& range : cache) {
+    if (range.generation == generation && title_va >= range.begin && title_va < range.end) {
+      return range.host + (title_va - range.begin);
+    }
+  }
+  static const lib::Counter slow("d3d12.address_translations_locked");
+  slow.add(1);
   Backing backing;
-  return locate(device, title_va, &backing, 1) ? backing.host_gpu_va : 0;
+  if (!locate(device, title_va, &backing, 1)) return 0;
+  if (backing.contiguous) cache[next++ % 8] = Range{title_va, title_va + backing.contiguous, backing.host_gpu_va, generation};
+  return backing.host_gpu_va;
 }
 
 uint64_t page_table_address(Device* device) {

@@ -440,6 +440,41 @@ class Translator {
     put(dest, read(view, byte_offset == 0 ? R(at) : add(R(at), I(byte_offset))));
     scratch_ = mark;
   }
+  // Reads `count` consecutive dwords (1-4) from byte `byte_offset` past `at`
+  // into registers `dest(i)`: one guard, and one load when the address is a
+  // multiple of 4 (else dword by dword, any alignment); 0 when unresolved.
+  // Programs reading their own code as data read dword by dword.
+  template <typename Dest>
+  void read_dwords(Dest dest, int count, uint32_t view, uint32_t at, uint32_t byte_offset) {
+    if (code_data_ || count == 1) {
+      for (int i = 0; i < count; ++i) read_to(dest(i), view, at, byte_offset + 4u * static_cast<uint32_t>(i));
+      return;
+    }
+    const uint32_t mark = scratch_;
+    const uint32_t o = fresh();
+    put(o, byte_offset == 0 ? R(at) : add(R(at), I(byte_offset)));
+    for (int i = 0; i < count; ++i) put(dest(i), I(0));
+    if_nz(ult(R(view), I(kMemoryViews)));
+    if_nz(band(R(o), I(3)));
+    for (int i = 0; i < count; ++i) {
+      const uint32_t inner = scratch_;
+      const Operand aligned = band(add(R(o), I(4u * static_cast<uint32_t>(i))), I(~3u));
+      const Operand shift = shl(band(R(o), I(3)), I(3));
+      const uint32_t w = fresh(), w2 = fresh();
+      emit(dx::kLdRaw, {D(w), aligned, dxbc::uav_indexed(0, view, dxbc::Access::Load)});
+      emit(dx::kLdRaw, {D(w2), add(aligned, I(4)), dxbc::uav_indexed(0, view, dxbc::Access::Load)});
+      put(dest(i), bor(shr(R(w), shift), shl(R(w2), sub(I(32), shift))));
+      scratch_ = inner;
+    }
+    emit(dx::kElse, {});
+    const uint32_t v = fresh();
+    emit(dx::kLdRaw,
+         {dxbc::temp_dst_mask(v, (1u << count) - 1), R(o), dxbc::uav_indexed(0, view, dxbc::Access::LoadVector)});
+    for (int i = 0; i < count; ++i) put(dest(i), dxbc::temp(v, static_cast<uint32_t>(i)));
+    end_if();
+    end_if();
+    scratch_ = mark;
+  }
   void write(uint32_t view, const Operand& offset, const Operand& value) {
     if_nz(ult(R(view), I(kMemoryViews)));
     emit(dx::kStoreRaw, {dxbc::uav_indexed(0, view, dxbc::Access::Store), band(offset, I(~3u)), value});
@@ -1223,7 +1258,10 @@ bool Translator::emit_smem(const Instruction& inst) {
     const int count = kCounts[inst.op];
     auto [lo, hi] = add64(R(base), band(R(base + 1u), I(0xFFFF)), offset, true);
     auto [view, at] = find(lo, hi);
-    for (int i = 0; i < count; ++i) read_to(inst.dst + static_cast<uint32_t>(i), view, at, 4u * i);
+    for (int i = 0; i < count; i += 4) {
+      read_dwords([&](int k) { return inst.dst + static_cast<uint32_t>(i + k); }, std::min(4, count - i), view, at,
+                  4u * static_cast<uint32_t>(i));
+    }
     return true;
   }
   if (inst.op >= 8 && inst.op <= 12) {
@@ -1233,9 +1271,12 @@ bool Translator::emit_smem(const Instruction& inst) {
     auto [lo, hi] = add64(R(base), band(R(base + 1u), I(0xFFFF)), o, false);
     const Operand records = copy(R(base + 2u));
     auto [view, at] = find(lo, hi);
+    for (int i = 0; i < count; i += 4) {
+      read_dwords([&](int k) { return inst.dst + static_cast<uint32_t>(i + k); }, std::min(4, count - i), view, at,
+                  4u * static_cast<uint32_t>(i));
+    }
     for (int i = 0; i < count; ++i) {
       const uint32_t dest = inst.dst + static_cast<uint32_t>(i);
-      read_to(dest, view, at, 4u * i);
       const uint32_t mark = scratch_;
       put(dest, select(op2(dx::kUge, records, add(o, I(4u * i + 4u))), R(dest), I(0)));
       scratch_ = mark;
@@ -1269,7 +1310,7 @@ bool Translator::emit_flat(const Instruction& inst) {
   const auto location = find(lo, hi, inst.op >= 24);  // stores and atomics from 24 on
   const uint32_t view = location.first, at = location.second;
   auto load = [&](int count) {
-    for (int i = 0; i < count; ++i) read_to(vreg(dst + static_cast<uint32_t>(i)), view, at, 4u * i);
+    read_dwords([&](int k) { return vreg(dst + static_cast<uint32_t>(k)); }, count, view, at, 0);
   };
   auto store = [&](int count) {
     use_vgpr(inst.src[1], count);
@@ -1612,7 +1653,7 @@ bool Translator::emit_mubuf(const Instruction& inst) {
   const uint32_t view = fresh();
   put(view, select(inside, R(location.first), I(kNoView)));
   auto load = [&](int count) {
-    for (int i = 0; i < count; ++i) read_to(vreg(data + static_cast<uint32_t>(i)), view, at, 4u * i);
+    read_dwords([&](int k) { return vreg(data + static_cast<uint32_t>(k)); }, count, view, at, 0);
   };
   auto store = [&](int count) {
     use_vgpr(inst.src[1], count);

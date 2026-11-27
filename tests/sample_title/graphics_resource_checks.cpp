@@ -1889,10 +1889,12 @@ void test_root_arguments_outlive_later_recording(void* device, void* queue) {
 }
 
 // What translated memory reads cost the GPU against the desktop's: a native
-// compute program and the same program in HLSL each read 16 times 16 bytes
-// per thread (unrolled) and store the sums, dispatched 4 times 4096 groups of
-// 64 between GPU timestamps. Both sums must agree; the times are printed (the
-// ratio is the cost of reaching title memory through the memory map).
+// compute program and the same program in HLSL each read 256 times 16 bytes
+// per thread over a 1 MiB working set (more than the first-level caches hold)
+// and store the sums, 256 groups of 64 between GPU timestamps. The data is
+// reached through root constants only, so it is never copied into video
+// memory: both read title memory. Both sums must agree; the times are printed
+// (the ratio is the cost of the translated access path).
 void test_memory_read_cost(void* device, void* queue) {
   void* allocator = nullptr;
   void* list = nullptr;
@@ -1941,13 +1943,15 @@ void test_memory_read_cost(void* device, void* queue) {
   // v1 = v0 << 4; v[6:9] = 0; 16 times: buffer_load_dwordx4 v[2:5], v1,
   // s[20:23] offen offset:256k, then v[6:9] += v[2:5]; buffer_store_dwordx4
   // v[6:9], v1, s[24:27] offen; s_endpgm.
+  // The reader of test_memory_copies: s[20:23] the data (1 MiB + 4 KiB),
+  // s[24:27] the sums (at +2 MiB), 256 reads at offsets 4096k.
   std::vector<uint32_t> code = {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE940305u, 0xBE950306u, 0xBE9603FFu,
-                                0x00010000u, 0xBE970380u, 0x8018FF05u, 0x00010000u, 0x82198006u, 0xBE9A03FFu,
+                                0x00101000u, 0xBE970380u, 0x8018FF05u, 0x00200000u, 0x82198006u, 0xBE9A03FFu,
                                 0x00000400u, 0xBE9B0380u, 0x34020084u, 0x7E0C0280u, 0x7E0E0280u, 0x7E100280u,
                                 0x7E120280u};
-  for (uint32_t k = 0; k < 16; ++k) {
-    for (uint32_t word : {0xE0381000u | (k * 256u), 0x80050201u, 0xBF8C3F70u, 0x4A0C0D02u, 0x4A0E0F03u, 0x4A101104u,
-                          0x4A121305u}) {
+  for (uint32_t k = 0; k < 256; ++k) {
+    for (uint32_t word : {0xBE9E03FFu, k * 4096u, 0xE0381000u, 0x1E050201u, 0xBF8C3F70u, 0x4A0C0D02u, 0x4A0E0F03u,
+                          0x4A101104u, 0x4A121305u}) {
       code.push_back(word);
     }
   }
@@ -1964,7 +1968,7 @@ void test_memory_read_cost(void* device, void* queue) {
   const char source[] =
       "ByteAddressBuffer data : register(t0); RWByteAddressBuffer sums : register(u0);"
       "[numthreads(64,1,1)] void main(uint3 t : SV_GroupThreadID) { uint4 sum = 0;"
-      "[unroll] for (uint k = 0; k < 16; ++k) sum += data.Load4(t.x * 16 + k * 256);"
+      "[loop] for (uint k = 0; k < 256; ++k) sum += data.Load4(t.x * 16 + k * 4096);"
       "sums.Store4(t.x * 16, sum); }";
   void* shader = nullptr;
   if (compile) compile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_1", 0, 0, &shader, nullptr);
@@ -1977,31 +1981,34 @@ void test_memory_read_cost(void* device, void* queue) {
   }
   // Data at +0, native sums at +64 KiB, desktop sums at +128 KiB, timestamps
   // at +192 KiB.
-  auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x40000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  // Data at +0 (1 MiB + 4 KiB), native sums at +2 MiB, desktop sums at
+  // +2 MiB + 64 KiB, timestamps at +3 MiB.
+  constexpr uint32_t kDataWords = 0x101000 / 4, kSums = 0x200000, kDesktopSums = 0x210000, kStamps = 0x300000;
+  auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x400000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
   if (!list || !fence || !heap || !native_root || !desktop_root || !native || !desktop || !memory) {
     check(false, "the objects for measuring translated memory reads exist");
     return;
   }
   auto* data = reinterpret_cast<uint32_t*>(memory);
-  for (uint32_t i = 0; i < 0x4000; ++i) data[i] = i * 2654435761u;
+  for (uint32_t i = 0; i < kDataWords; ++i) data[i] = i * 2654435761u;
   const auto base = reinterpret_cast<uint64_t>(memory);
   D3D12_RESOURCE_DESC buffer{};
   buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  buffer.Width = 0x40000;
+  buffer.Width = 0x400000;
   buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
   buffer.SampleDesc.Count = 1;
   buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   call<HRESULT>(device, 133, base, &buffer, static_cast<UINT>(0xFFFFFFFF), static_cast<const void*>(nullptr),
                 __uuidof(ID3D12Resource), &placed);
-  const uint64_t stamps = base + 0x30000;
+  const uint64_t stamps = base + kStamps;
   D3D12_GLOBAL_BARRIER global{D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COMPUTE_SHADING,
                               D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS};
   D3D12_BARRIER_GROUP group{};
   group.Type = D3D12_BARRIER_TYPE_GLOBAL;
   group.NumBarriers = 1;
   group.pGlobalBarriers = &global;
-  constexpr uint32_t kRepeats = 4, kGroups = 4096;
+  constexpr uint32_t kRepeats = 1, kGroups = 256;
   bool recorded = call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
   void* heaps[] = {heap};
   call<void>(list, 32, 1u, static_cast<void* const*>(heaps));
@@ -2016,7 +2023,7 @@ void test_memory_read_cost(void* device, void* queue) {
   call<void>(list, 72, stamps + 8, UINT64{0}, UINT64{0}, 1u);
   call<void>(list, 33, desktop_root);
   call<void>(list, 43, 0u, base);
-  call<void>(list, 45, 1u, base + 0x20000);
+  call<void>(list, 45, 1u, base + kDesktopSums);
   call<void>(list, 25, desktop);
   for (uint32_t i = 0; i < kRepeats; ++i) call<void>(list, 14, kGroups, 1u, 1u);
   call<void>(list, 146, 1u, static_cast<const D3D12_BARRIER_GROUP*>(&group));
@@ -2029,14 +2036,14 @@ void test_memory_read_cost(void* device, void* queue) {
   for (int i = 0; value && *value < 1 && i < 10000; ++i) Sleep(1);
   UINT64 frequency = 0;
   call<HRESULT>(queue, 18, &frequency);
-  const auto* times = reinterpret_cast<const volatile uint64_t*>(memory + 0x30000);
+  const auto* times = reinterpret_cast<const volatile uint64_t*>(memory + kStamps);
   const double native_ms = frequency ? static_cast<double>(times[1] - times[0]) * 1e3 / static_cast<double>(frequency) : 0;
   const double desktop_ms = frequency ? static_cast<double>(times[2] - times[1]) * 1e3 / static_cast<double>(frequency) : 0;
-  const bool same = std::memcmp(memory + 0x10000, memory + 0x20000, 0x400) == 0;
+  const bool same = std::memcmp(memory + kSums, memory + kDesktopSums, 0x400) == 0;
   uint32_t expected = 0;
-  for (uint32_t k = 0; k < 16; ++k) expected += data[k * 64];
-  const uint32_t first_sum = *reinterpret_cast<const volatile uint32_t*>(memory + 0x10000);
-  std::printf("    (16 reads of 16 bytes per thread, %u x %u groups of 64: translated %.3f ms, desktop %.3f ms on the "
+  for (uint32_t k = 0; k < 256; ++k) expected += data[k * 1024];
+  const uint32_t first_sum = *reinterpret_cast<const volatile uint32_t*>(memory + kSums);
+  std::printf("    (256 reads of 16 bytes per thread over 1 MiB, %u x %u groups of 64: translated %.3f ms, desktop %.3f ms on the "
               "GPU, %.1fx; sums %s; fence %llu)\n",
               kRepeats, kGroups, native_ms, desktop_ms, desktop_ms > 0 ? native_ms / desktop_ms : 0.0,
               same && first_sum == expected ? "agree" : "differ", static_cast<unsigned long long>(value ? *value : 0));

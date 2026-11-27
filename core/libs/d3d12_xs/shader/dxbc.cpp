@@ -81,7 +81,10 @@ Operand icb_indexed(uint32_t temp_index, uint32_t component) {
   return out;
 }
 Operand uav_indexed(uint32_t id, uint32_t temp_index, Access access) {
-  uint32_t components = access == Access::Load ? swizzle_xxxx() : access == Access::Store ? mask_x() : 0u;
+  uint32_t components = access == Access::Load         ? swizzle_xxxx()
+                        : access == Access::LoadVector ? swizzle_xxxx() | (0xE4u << 4)
+                        : access == Access::Store      ? mask_x()
+                                                       : 0u;
   Operand out{kExtended | components | type_bits(kUav) | dimension(2) | relative_index(1),
               1u | (1u << 17),  // modifier token: non-uniform index
               id};

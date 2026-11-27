@@ -471,9 +471,11 @@ Notes describe the platform, never a title.
 
   Title memory reaches the GPU through heaps of the first two kinds, so whatever misses the first-level caches
   (vertices, structured data, tables beyond a few KiB) crosses the bus each time: about 20 times slower than video
-  memory. Measured through the runtime (sample title): a native compute program and the same program in HLSL
-  reading title memory take the same time (47 against 46-52 ms for 4 GiB of reads), so the memory, not the
-  translation, sets the cost. Textures are not affected (host copies in video memory).
+  memory. Measured through the runtime (sample title): a native compute program reading 256 times 16 bytes
+  per thread over 1 MiB of title memory takes 0.98 ms, the same program in HLSL 0.65 ms (1.5 times: the
+  translated access path, page table reads and a guard per access). An earlier version of this measurement read
+  a few KiB and had every thread store to the same addresses: its equal times (about 47 ms) were set by those
+  stores, not by the reads. Textures are not affected (host copies in video memory).
 - Implementation (opt-in, `HOLY_BUFFER_COPIES` in MiB): pages that translated calls read through bound buffers
   (vertex buffers, buffers of descriptor tables, root views) get copies in video memory, and their page table
   entries name cache lines (`shader/translate.h`); a copy is made on a queue of the runtime's own the submitting
@@ -484,10 +486,11 @@ Notes describe the platform, never a title.
   records them; the CPU's writes are found by write watching before each submission (results shared with the
   texture scan, whose resets would hide them) and the copies refreshed first, and pages written in three of the
   last eight submissions leave. Memory the host does not watch (mapped views: physical pages) is not copied.
-  *Measured* (sample title): a native program reading 256 times 16 bytes per thread over 1 MiB takes 0.39 ms
-  from the copies against 0.87 ms from title memory (2.2 times), with the same results; the CPU's writes, a
-  native store read back in the same program and a buffer copy into the memory are all seen. The translated
-  access path (page table, cache line and flag reads, a guard per dword) is now the larger part of the cost.
+  *Measured* (sample title): a native program reading 256 times 16 bytes per thread over 1 MiB takes 0.31 ms
+  from the copies against 0.97 ms from title memory (3.1 times), with the same results; the CPU's writes, a
+  native store read back in the same program and a buffer copy into the memory are all seen. Reads of several
+  dwords at an address that is a multiple of 4 are one load (dword by dword otherwise): with the copies, 0.39 ms
+  before that.
 - *measured* host behaviour (development host): memory a heap was opened over stays charged to the process after
   the title releases it, for as long as the heap lives (16 rounds of 64 MiB placed, released and freed left
   1,026 MiB charged). The runtime therefore lets go of heaps over title memory before the title's `VirtualFree`

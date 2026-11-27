@@ -101,7 +101,9 @@ Operand cb_indexed(uint32_t id, uint32_t temp_index, uint32_t reg, uint32_t comp
 // icb[temp.x].component: the immediate constant buffer indexed by a temp.
 Operand icb_indexed(uint32_t temp_index, uint32_t component);
 
-enum class Access { Load, Store, Atomic };
+// Load selects .xxxx (one dword); LoadVector .xyzw (up to four, by the
+// destination's mask).
+enum class Access { Load, LoadVector, Store, Atomic };
 
 // Shader feature bits of the SFI0 part (the desktop runtime's documented
 // D3D_SHADER_REQUIRES_* values).

@@ -68,6 +68,10 @@ void reach(Device* device, uint64_t title_va);
 // Maps the title addresses [alias, alias + size) to the memory at `target`:
 // descriptor heaps, whose GPU range reads their title memory.
 bool map_alias(Device* device, uint64_t alias, uint64_t size, uint64_t target);
+// Maps the title addresses [alias, alias + size) (64 KiB aligned) to a buffer
+// of the runtime's own from its start: memory the CPU writes through a mapping
+// of its own and translated programs read at those addresses.
+bool map_host_buffer(Device* device, ID3D12Resource* buffer, uint64_t alias, uint64_t size);
 void unmap_range(uint64_t title_va, uint64_t size);
 
 // A slot views kSlotBytes of its heap's buffer (2^27 raw elements, the

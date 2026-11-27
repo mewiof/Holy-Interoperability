@@ -436,8 +436,10 @@ Notes describe the platform, never a title.
   table at s[0:1] (40-bit address) and add s2 to the vertex index. *assumed*: s3 holds the start instance;
   compute programs read the same packing from a root table at s[0:1].
 - Implementation: shader-visible heaps get GPU addresses from 0x40000000; descriptor tables are 32 bytes per
-  resource view and 16 per sampler. Per draw or dispatch of a translated pipeline, an upload ring below 2^40 holds
-  the system constants (user SGPRs) and the vertex buffer table. Title memory is reached through one memory map
+  resource view and 16 per sampler. Per draw or dispatch of a translated pipeline, an upload ring holds the system
+  constants (user SGPRs) and the vertex buffer table: system memory the host allocates (write-back, which the GPU
+  caches; measured below), at title addresses of a range reserved below 2^40. The page table is memory of the same
+  kind. Title memory is reached through one memory map
   for every call: each host heap over title memory has memory slots (raw views of 512 MiB of its buffer, in a block
   of 65536 descriptors past the title's own in every shader-visible host heap) and a page table maps each 64 KiB
   page of title addresses to a slot and offset (`shader/translate.h`). Heaps' pages enter the table when the heaps

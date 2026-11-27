@@ -358,27 +358,41 @@ void release_title_memory(const void* address, size_t size) {
   release_retired(retired);
 }
 
-// The page table (g_lock held), made on first use: process memory the GPU
-// reads through a heap opened over it, as title memory, so the CPU's entries
-// are seen by work submitted after them. Returns its host GPU address.
+// The page table (g_lock held), made on first use: a buffer in system memory
+// the host allocates, write-back and mapped for the CPU's entries, which work
+// submitted after them sees. Measured (PLATFORM_NOTES.md): the GPU caches
+// such memory, not process memory a heap is opened over, and every translated
+// memory access reads two entries. Returns its host GPU address.
 uint64_t ensure_page_table(Device* device) {
   if (g_map.table || g_map.failed) return g_map.host_va;
   g_map.failed = true;
-  ID3D12Device3* d3 = device3(device);
-  auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, kPageTableBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  ID3D12Heap* heap = nullptr;
-  const HRESULT hr = memory && d3 ? d3->OpenExistingHeapFromAddress(memory, IID_PPV_ARGS(&heap)) : E_OUTOFMEMORY;
-  HeapRecord record;
-  if (FAILED(hr) || !finish_record(device, heap, &record, false)) {
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+  heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+  heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  desc.Width = kPageTableBytes;
+  desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  ID3D12Resource* buffer = nullptr;
+  void* memory = nullptr;
+  HRESULT hr = device->host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                                     nullptr, IID_PPV_ARGS(&buffer));
+  const D3D12_RANGE nothing_read{0, 0};
+  if (SUCCEEDED(hr)) hr = buffer->Map(0, &nothing_read, &memory);  // kept mapped (zeroed: no page mapped)
+  if (FAILED(hr) || !memory) {
     LIB_LOG(lib::kError, "d3d12", "no page table for translated programs (0x%08lX)", static_cast<unsigned long>(hr));
-    if (memory) VirtualFree(memory, 0, MEM_RELEASE);
+    if (buffer) buffer->Release();
     return 0;
   }
+  buffer->SetName(L"holy page table");
   g_map.failed = false;
-  g_map.table = memory;
-  g_map.host_va = record.host_gpu_va;
-  g_table.store(memory, std::memory_order_release);
-  g_table_va.store(record.host_gpu_va, std::memory_order_release);
+  g_map.table = static_cast<uint8_t*>(memory);
+  g_map.host_va = buffer->GetGPUVirtualAddress();
+  g_table.store(g_map.table, std::memory_order_release);
+  g_table_va.store(g_map.host_va, std::memory_order_release);
   g_map.device = device;
   HolySetReleaseHook(&release_title_memory);
   if (const auto observe = reinterpret_cast<ObserveFn>(
@@ -688,6 +702,18 @@ bool map_alias(Device* device, uint64_t alias, uint64_t size, uint64_t target) {
     }
     at += n;
   }
+  return true;
+}
+
+bool map_host_buffer(Device* device, ID3D12Resource* buffer, uint64_t alias, uint64_t size) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  if (!ensure_page_table(device) || !buffer || (alias & 0xFFFF)) return false;
+  HeapRecord record;
+  record.whole = buffer;
+  record.size = size;
+  const uint32_t slot = add_slots(device, record);
+  if (!slot) return false;
+  map_pages(alias, alias + size, slot, 0);
   return true;
 }
 

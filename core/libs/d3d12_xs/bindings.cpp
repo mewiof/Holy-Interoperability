@@ -20,7 +20,7 @@
 // every call. Memory the call names (buffers of the bound descriptor tables
 // and root views, vertex buffers) is located first if the page table does not
 // have it yet; descriptor heaps' GPU ranges are entered when the heaps are
-// made, the ring once.
+// made, the ring when it is.
 //
 // Partial: memory reached only through addresses held in memory (pointers
 // in constant data, descriptors outside the bound tables) that nothing has
@@ -53,37 +53,81 @@ std::map<const void*, RootLayout>& layouts() {
 }
 
 // --- upload ring ---------------------------------------------------------------------
+//
+// System memory the host allocates, write-back and kept mapped for the CPU:
+// measured, the GPU caches such memory and not process memory a heap is
+// opened over (PLATFORM_NOTES.md), and every translated call reads its root
+// arguments from here. Translated programs reach it at the title addresses of
+// a range reserved below 2^40 (vertex shaders take the vertex buffer table's
+// address with only 8 bits of its high dword); root constant views take its
+// host GPU address.
 
 constexpr size_t kRingBytes = 64ull << 20;
 
 struct Ring {
-  uint8_t* base = nullptr;
+  uint8_t* cpu = nullptr;  // the mapping
+  uint64_t title = 0;      // the reserved range translated programs use
+  uint64_t gpu = 0;        // host GPU address
   std::atomic<uint64_t> next{0};
 };
 
-Ring* ring() {
-  static Ring* instance = [] {
+// A piece of the ring: where the CPU writes it, its title and GPU addresses.
+struct RingBlock {
+  uint8_t* cpu = nullptr;
+  uint64_t title = 0;
+  uint64_t gpu = 0;
+};
+
+Ring* ring(Device* device) {
+  static Ring* instance = [device] {
     auto* made = new Ring();
-    // Below 2^40: vertex shaders take the vertex buffer table's address with
-    // only 8 bits of its high dword.
-    for (uint64_t at = 0x0000008000000000ull; at >= 0x0000001000000000ull && !made->base; at >>= 1) {
-      made->base = static_cast<uint8_t*>(
-          VirtualAlloc(reinterpret_cast<void*>(at), kRingBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    void* range = nullptr;
+    for (uint64_t at = 0x0000008000000000ull; at >= 0x0000001000000000ull && !range; at >>= 1) {
+      range = VirtualAlloc(reinterpret_cast<void*>(at), kRingBytes, MEM_RESERVE, PAGE_NOACCESS);
     }
-    if (!made->base) LIB_LOG(lib::kError, "d3d12", "no upload ring below 2^40");
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+    heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+    heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = kRingBytes;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;  // memory slots are raw unordered-access views
+    ID3D12Resource* buffer = nullptr;
+    void* mapped = nullptr;
+    HRESULT hr = range ? device->host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                               D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                               IID_PPV_ARGS(&buffer))
+                       : E_OUTOFMEMORY;
+    const D3D12_RANGE nothing_read{0, 0};
+    if (SUCCEEDED(hr)) hr = buffer->Map(0, &nothing_read, &mapped);
+    const bool mapped_in = SUCCEEDED(hr) && mapped &&
+                           map_host_buffer(device, buffer, reinterpret_cast<uint64_t>(range), kRingBytes);
+    if (!mapped_in) {
+      LIB_LOG(lib::kError, "d3d12", "no upload ring for translated calls (0x%08lX, range %p)",
+              static_cast<unsigned long>(hr), range);
+      return made;
+    }
+    buffer->SetName(L"holy upload ring");
+    made->cpu = static_cast<uint8_t*>(mapped);
+    made->title = reinterpret_cast<uint64_t>(range);
+    made->gpu = buffer->GetGPUVirtualAddress();
     return made;
   }();
   return instance;
 }
 
-// `bytes` of ring memory aligned to 256, or null.
-uint8_t* ring_alloc(size_t bytes) {
-  Ring* r = ring();
-  if (!r->base) return nullptr;
+// `bytes` of ring memory aligned to 256 (cpu null when there is no ring).
+RingBlock ring_alloc(Device* device, size_t bytes) {
+  Ring* r = ring(device);
+  if (!r->cpu) return {};
   bytes = (bytes + 255) & ~size_t{255};
   for (;;) {
     uint64_t at = r->next.fetch_add(bytes);
-    if (at + bytes <= kRingBytes) return r->base + at;
+    if (at + bytes <= kRingBytes) return {r->cpu + at, r->title + at, r->gpu + at};
     uint64_t expected = at + bytes;
     r->next.compare_exchange_strong(expected, 0);  // wrap (one thread wins)
   }
@@ -118,25 +162,13 @@ void reach_root(Device* device, const RootBinding& binding) {
   }
 }
 
-// The ring in the memory map (once).
-void reach_ring(Device* device) {
-  static std::once_flag once;
-  std::call_once(once, [device] {
-    Ring* r = ring();
-    Backing backing;
-    if (!r->base || !locate(device, reinterpret_cast<uint64_t>(r->base), &backing, kRingBytes) || !backing.slot) {
-      LIB_LOG(lib::kError, "d3d12", "the upload ring is not reachable by translated programs");
-    }
-  });
-}
-
 constexpr UINT kReservedViews = kReservedHostViews;
 
 // The system constants of shader/translate.h, written into the ring.
 uint64_t write_system(Device* device, const uint32_t (&user)[16], const NggPass* ngg = nullptr) {
-  uint8_t* block = ring_alloc(kSystemVectors * 16);
-  if (!block) return 0;
-  auto* v = reinterpret_cast<uint32_t*>(block);
+  const RingBlock block = ring_alloc(device, kSystemVectors * 16);
+  if (!block.cpu) return 0;
+  auto* v = reinterpret_cast<uint32_t*>(block.cpu);
   std::memset(v, 0, kSystemVectors * 16);
   std::memcpy(&v[4 * kSystemUserVector], user, sizeof(user));
   if (ngg) {
@@ -145,7 +177,7 @@ uint64_t write_system(Device* device, const uint32_t (&user)[16], const NggPass*
     v[4 * kSystemNggVector + 2] = ngg->first_vertex;
     v[4 * kSystemNggVector + 3] = ngg->first_instance;
   }
-  return translate_gpu_va(device, reinterpret_cast<uint64_t>(block));
+  return block.gpu;
 }
 
 // User SGPRs from s8: the packed root arguments, then the sampler heap base.
@@ -252,13 +284,12 @@ bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t 
   if (!views_heap(list)) return false;
   const uint64_t page_table = page_table_address(device);
   if (!page_table) return false;
-  reach_ring(device);
   reach_root(device, list->graphics);
   // Vertex buffer table: RDNA 2 buffer descriptors (base, stride, records,
   // identity component selection).
-  uint8_t* table = ring_alloc(16 * 16);
-  if (!table) return false;
-  auto* vt = reinterpret_cast<uint32_t*>(table);
+  const RingBlock table = ring_alloc(device, 16 * 16);
+  if (!table.cpu) return false;
+  auto* vt = reinterpret_cast<uint32_t*>(table.cpu);
   std::memset(vt, 0, 16 * 16);
   for (int i = 0; i < 16; ++i) {
     const D3D12_VERTEX_BUFFER_VIEW& v = list->vertex_buffers[i];
@@ -270,9 +301,8 @@ bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t 
     reach(device, v.BufferLocation);
   }
   uint32_t user[16] = {};
-  const uint64_t table_address = reinterpret_cast<uint64_t>(table);
-  user[0] = static_cast<uint32_t>(table_address);
-  user[1] = static_cast<uint32_t>(table_address >> 32);
+  user[0] = static_cast<uint32_t>(table.title);
+  user[1] = static_cast<uint32_t>(table.title >> 32);
   user[2] = base_vertex;
   user[3] = start_instance;
   pack_root(list, list->graphics, user, 8, 16);
@@ -290,18 +320,16 @@ bool bind_translated_compute(CommandList* list) {
   if (!views_heap(list)) return false;
   const uint64_t page_table = page_table_address(device);
   if (!page_table) return false;
-  reach_ring(device);
   reach_root(device, list->compute);
   // The root table: the packed arguments, then the sampler heap base.
-  uint8_t* table = ring_alloc(4 * 66);
-  if (!table) return false;
-  auto* root = reinterpret_cast<uint32_t*>(table);
+  const RingBlock table = ring_alloc(device, 4 * 66);
+  if (!table.cpu) return false;
+  auto* root = reinterpret_cast<uint32_t*>(table.cpu);
   std::memset(root, 0, 4 * 66);
   pack_root(list, list->compute, root, 0, 66);
   uint32_t user[16] = {};
-  const uint64_t table_address = reinterpret_cast<uint64_t>(table);
-  user[0] = static_cast<uint32_t>(table_address);
-  user[1] = static_cast<uint32_t>(table_address >> 32);
+  user[0] = static_cast<uint32_t>(table.title);
+  user[1] = static_cast<uint32_t>(table.title >> 32);
   const uint64_t system = write_system(device, user);
   if (!system) return false;
   bind_common(list, true, page_table, system);

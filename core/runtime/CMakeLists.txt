@@ -19,7 +19,9 @@ add_library(holyrt SHARED
   stats.cpp
   stats.h
   thunks.cpp
-  thunks.h)
+  thunks.h
+  watch.cpp
+  watch.h)
 holy_target_defaults(holyrt)
 target_compile_definitions(holyrt PRIVATE HOLYRT_BUILD)
 target_link_libraries(holyrt PRIVATE holy_common holy_pe holy_analysis psapi)

@@ -15,6 +15,7 @@
 #include "core/runtime/memory.h"
 #include "core/runtime/state.h"
 #include "core/runtime/stats.h"
+#include "core/runtime/watch.h"
 
 namespace holy::rt {
 namespace {
@@ -104,6 +105,7 @@ void boot() {
   install_cpu_compatibility();
   bind_title_imports(image_base, s.title_size, {g_boot.original_import_rva, g_boot.original_import_size});
   restore_directories(image_base, g_boot);
+  start_watch();
   LOG_INFO(kComponent, "imports bound; handing control to the title");
 }
 
@@ -114,6 +116,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     holy::rt::g_self = module;
     holy::rt::boot();
+  } else if (reason == DLL_THREAD_ATTACH) {
+    holy::rt::watch_thread_started();
   }
   return TRUE;
 }
@@ -151,6 +155,10 @@ void HolyUnimplementedFrom(const char* library, const char* symbol, const void* 
   if (holy::rt::state().active && holy::rt::state().trap_unimplemented) {
     holy::rt::fatal_exit(holy::kExitUnimplementedImport);
   }
+}
+
+int HolyTrapsUnimplemented(void) {
+  return holy::rt::state().trap_unimplemented ? 1 : 0;
 }
 
 void HolyDescribeAddress(const void* address, char* buffer, size_t size) {

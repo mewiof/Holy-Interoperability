@@ -32,6 +32,10 @@ HOLYRT_API void HolyUnimplemented(const char* library, const char* symbol);
 // code that made the call, so the report points at the title.
 HOLYRT_API void HolyUnimplementedFrom(const char* library, const char* symbol, const void* caller);
 
+// Non-zero when a call into unimplemented functionality ends the title
+// (the default); zero in exploration mode, where such calls return.
+HOLYRT_API int HolyTrapsUnimplemented(void);
+
 // Writes "title+0x…", "module.dll+0x…" or a bare address for `address` into
 // `buffer` (always terminated). The title image is never named.
 HOLYRT_API void HolyDescribeAddress(const void* address, char* buffer, size_t size);

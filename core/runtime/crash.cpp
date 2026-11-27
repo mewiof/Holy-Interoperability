@@ -2,6 +2,7 @@
 #include "core/runtime/stats.h"
 
 #include <atomic>
+#include <cstdio>
 
 #include "core/common/log.h"
 #include "core/runtime/state.h"
@@ -47,12 +48,16 @@ void walk_stack_unguarded(CONTEXT context) {
   }
 }
 
+}  // namespace
+
 void walk_stack(const CONTEXT* context) {
   __try {
     walk_stack_unguarded(*context);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
   }
 }
+
+namespace {
 
 void log_exception(const char* kind, const EXCEPTION_POINTERS* info) {
   const EXCEPTION_RECORD* record = info->ExceptionRecord;
@@ -83,14 +88,38 @@ void log_registers(const CONTEXT* c) {
     const std::string where = describe_address(reinterpret_cast<const void*>(r.value));
     if (where.find('+') != std::string::npos) LOG_ERROR(kComponent, "  %s = %s", r.name, where.c_str());
   }
-  // The first 64 bytes of readable memory registers point at (objects the
-  // faulting code was working on).
+  // The first 128 bytes of readable memory registers point at (objects the
+  // faulting code was working on), and the first 64 bytes of what those
+  // point at in turn (one level), with values inside images named.
+  auto dump = [](const char* label, uint64_t address, size_t count) {
+    uint64_t words[16] = {};
+    if (count > 16 || !read_memory(address, words, count * 8)) return false;
+    for (size_t row = 0; row < count; row += 8) {
+      LOG_ERROR(kComponent, "  %s+%02zx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx", label,
+                row * 8, words[row], words[row + 1], words[row + 2], words[row + 3], words[row + 4], words[row + 5],
+                words[row + 6], words[row + 7]);
+    }
+    return true;
+  };
   for (const auto& r : registers) {
     if (r.value < 0x10000) continue;
-    uint64_t words[8];
-    if (!read_memory(r.value, words, sizeof(words))) continue;
-    LOG_ERROR(kComponent, "  [%s] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx", r.name,
-              words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    char label[32];
+    std::snprintf(label, sizeof(label), "[%s]", r.name);
+    if (!dump(label, r.value, 16)) continue;
+    uint64_t words[16];
+    read_memory(r.value, words, sizeof(words));
+    for (size_t i = 0; i < 16; ++i) {
+      if (words[i] < 0x10000 || (words[i] >> 48) != 0) continue;
+      const std::string where = describe_address(reinterpret_cast<const void*>(words[i]));
+      if (where.find('+') != std::string::npos) continue;  // code or static data: named below instead
+      std::snprintf(label, sizeof(label), "[[%s+%02zx]]", r.name, i * 8);
+      dump(label, words[i], 8);
+    }
+    for (size_t i = 0; i < 16; ++i) {
+      if (words[i] < 0x10000) continue;
+      const std::string where = describe_address(reinterpret_cast<const void*>(words[i]));
+      if (where.find('+') != std::string::npos) LOG_ERROR(kComponent, "  [%s+%02zx] = %s", r.name, i * 8, where.c_str());
+    }
   }
 }
 

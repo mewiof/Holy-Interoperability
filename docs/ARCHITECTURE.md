@@ -153,7 +153,10 @@ host, over the reference title's 19,305 saved programs):
   driver's own cache keeps compiled code across runs.
 
 Prebaking everything on the first run is therefore not done: translating everything is affordable but happens
-anyway as pipelines are created, and compiling everything would take hours. What makes the first run smooth is
+anyway as pipelines are created, and compiling everything would take hours. Translation stays on the creating
+thread rather than going to a pool of its own: titles create pipelines from many threads at once (*observed*:
+a run of the reference title with an empty translation cache translated 8,800 programs in 8 seconds, about
+1,100 a second, with an earlier translator four times slower than today's). What makes the first run smooth is
 the size and shape of what the driver compiles. The translator's output is measured for that
 (`holy_translate_corpus --compile`, which keeps the driver's cache out of the measurement): blocks laid out in
 program order with loops only where the code loops, page lookups without branches and moves folded into the

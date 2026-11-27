@@ -19,9 +19,13 @@
 #include <intrin.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "core/libs/inflate.h"
@@ -181,13 +185,30 @@ HRESULT STDMETHODCALLTYPE create_status_array(Object*, uint32_t capacity, const 
 
 const holy::lib::VtableInfo kQueueInfo{kLibrary, "IDStorageQueueX"};
 
+// What a queue carries out in order: a request, a status (the first failure
+// since the previous one), or a fence signal.
+struct Operation {
+  enum Kind { kRequest, kStatus, kSignal } kind = kRequest;
+  uint64_t options = 0, destination = 0, source = 0, offset = 0;
+  uint32_t destination_size = 0, source_size = 0;
+  struct StatusArray* array = nullptr;
+  uint32_t index = 0;
+  IUnknown* fence = nullptr;
+  uint64_t value = 0;
+};
+
 struct Queue {
   void* const* vtable;
   const holy::lib::VtableInfo* info;
   std::atomic<long> refs{1};
   uint32_t source_type = 0;
   uint16_t capacity = 0;
-  std::atomic<HRESULT> error{S_OK};  // first failure since the last status
+  // Enqueued since the last submission, and submitted (the worker's).
+  std::mutex lock;
+  std::vector<Operation> pending;
+  std::deque<Operation> submitted;
+  std::condition_variable ready;
+  HRESULT error = S_OK;  // first failure since the last status (the worker's)
 };
 
 ULONG STDMETHODCALLTYPE queue_add_ref(Queue* self) {
@@ -204,8 +225,6 @@ ULONG STDMETHODCALLTYPE queue_release(Queue* self) {
 // bit 0: set for the title's format 3, a zlib stream), destination
 // address at 8, destination size at 0x18, source at 0x20 (a file object, or
 // a memory address), file offset at 0x28, source size at 0x30.
-// Requests are carried out when enqueued: completion is only earlier than
-// the console's.
 constexpr uint64_t kSourceMemory = 1ull << 22;
 constexpr uint64_t kCompressed = 1ull;
 
@@ -227,43 +246,105 @@ HRESULT read_into(File* file, uint64_t offset, void* destination, uint32_t size)
   return got == size ? S_OK : HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
 }
 
-HRESULT enqueue_request_body(const uint8_t* request);
+HRESULT carry_out(const Operation& op);
+
+// Queues carry out what was enqueued when it is submitted (the documented
+// model), in order, on a worker thread of their own: titles enqueue reads into
+// memory they map before submitting (observed: carried out at enqueue, reads
+// landed in memory the title then mapped other pages over, and later reads
+// of what they loaded found zeroes). A status entry turns pending when
+// enqueued and gets the first failure since the previous status when the
+// worker reaches it; fences are signalled after the operations before them.
+// A queue whose enqueued operations reach its capacity submits them itself
+// (the desktop's behaviour).
+void worker(Queue* queue) {
+  for (;;) {
+    Operation op;
+    {
+      std::unique_lock<std::mutex> hold(queue->lock);
+      queue->ready.wait(hold, [queue] { return !queue->submitted.empty(); });
+      op = queue->submitted.front();
+      queue->submitted.pop_front();
+    }
+    switch (op.kind) {
+      case Operation::kRequest: {
+        const HRESULT hr = carry_out(op);
+        if (FAILED(hr) && SUCCEEDED(queue->error)) queue->error = hr;
+        break;
+      }
+      case Operation::kStatus:
+        op.array->entries[op.index].store(queue->error);
+        queue->error = S_OK;
+        reinterpret_cast<IUnknown*>(op.array)->Release();
+        break;
+      case Operation::kSignal:
+        // The title's fence keeps the desktop ID3D12Fence order: Signal at slot 10.
+        reinterpret_cast<ID3D12Fence*>(op.fence)->Signal(op.value);
+        op.fence->Release();
+        break;
+    }
+  }
+}
+
+void submit_locked(Queue* self) {
+  if (self->pending.empty()) return;
+  for (Operation& op : self->pending) self->submitted.push_back(op);
+  self->pending.clear();
+  self->ready.notify_one();
+}
+
+void enqueue(Queue* self, const Operation& op) {
+  std::lock_guard<std::mutex> hold(self->lock);
+  self->pending.push_back(op);
+  if (self->capacity && self->pending.size() >= self->capacity) submit_locked(self);
+}
 
 HRESULT STDMETHODCALLTYPE enqueue_request(Queue* self, const uint8_t* request) {
-  const HRESULT hr = enqueue_request_body(request);
-  if (FAILED(hr)) {
-    HRESULT expected = S_OK;
-    self->error.compare_exchange_strong(expected, hr);
-  }
-  return hr;
+  if (!request) return E_POINTER;
+  Operation op;
+  op.kind = Operation::kRequest;
+  std::memcpy(&op.options, request, 8);
+  std::memcpy(&op.destination, request + 8, 8);
+  std::memcpy(&op.destination_size, request + 0x18, 4);
+  std::memcpy(&op.source, request + 0x20, 8);
+  std::memcpy(&op.offset, request + 0x28, 8);
+  std::memcpy(&op.source_size, request + 0x30, 4);
+  if (!op.destination || !op.source) return E_INVALIDARG;
+  enqueue(self, op);
+  return S_OK;
 }
 
-// Observed: slot 4 EnqueueStatus(status array, index), the desktop's order;
-// the entry gets the first failure since the previous status (requests are
-// complete by then). Assumed in the desktop order: 5 EnqueueSignal(fence,
-// value), 6 Submit().
+// Observed: slot 4 EnqueueStatus(status array, index), the desktop's order.
+// Assumed in the desktop order: 5 EnqueueSignal(fence, value), 6 Submit().
 void STDMETHODCALLTYPE enqueue_status(Queue* self, StatusArray* array, uint32_t index) {
   if (!array || index >= array->capacity) return;
-  array->entries[index].store(self->error.exchange(S_OK));
+  array->entries[index].store(kPending);
+  reinterpret_cast<IUnknown*>(array)->AddRef();
+  Operation op;
+  op.kind = Operation::kStatus;
+  op.array = array;
+  op.index = index;
+  enqueue(self, op);
 }
 
-void STDMETHODCALLTYPE enqueue_signal(Queue*, IUnknown* fence, uint64_t value) {
-  // The title's fence keeps the desktop ID3D12Fence order: Signal at slot 10.
-  if (fence) reinterpret_cast<ID3D12Fence*>(fence)->Signal(value);
+void STDMETHODCALLTYPE enqueue_signal(Queue* self, IUnknown* fence, uint64_t value) {
+  if (!fence) return;
+  fence->AddRef();
+  Operation op;
+  op.kind = Operation::kSignal;
+  op.fence = fence;
+  op.value = value;
+  enqueue(self, op);
 }
 
-void STDMETHODCALLTYPE submit(Queue*) {}
+void STDMETHODCALLTYPE submit(Queue* self) {
+  std::lock_guard<std::mutex> hold(self->lock);
+  submit_locked(self);
+}
 
-HRESULT enqueue_request_body(const uint8_t* request) {
-  if (!request) return E_POINTER;
-  uint64_t options = 0, destination = 0, source = 0, offset = 0;
-  uint32_t destination_size = 0, source_size = 0;
-  std::memcpy(&options, request, 8);
-  std::memcpy(&destination, request + 8, 8);
-  std::memcpy(&destination_size, request + 0x18, 4);
-  std::memcpy(&source, request + 0x20, 8);
-  std::memcpy(&offset, request + 0x28, 8);
-  std::memcpy(&source_size, request + 0x30, 4);
+HRESULT carry_out(const Operation& op) {
+  const uint64_t options = op.options, destination = op.destination, source = op.source, offset = op.offset;
+  const uint32_t destination_size = op.destination_size, source_size = op.source_size;
   LIB_LOG(holy::lib::kDebug, "dstorage",
           "request options 0x%llx destination %p (0x%x) source %p offset 0x%llx size 0x%x",
           static_cast<unsigned long long>(options), reinterpret_cast<void*>(destination), destination_size,
@@ -326,6 +407,9 @@ HRESULT STDMETHODCALLTYPE create_queue(Object*, const uint8_t* desc, REFIID, voi
   queue->info = &kQueueInfo;
   std::memcpy(&queue->source_type, desc, 4);
   std::memcpy(&queue->capacity, desc + 4, 2);
+  // The worker lives as long as the process: titles keep their queues.
+  queue->refs.fetch_add(1);
+  std::thread(worker, queue).detach();
   LIB_LOG(holy::lib::kDebug, "dstorage", "queue: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", words[0],
           words[1], words[2], words[3], words[4], words[5], words[6], words[7], words[8], words[9]);
   *out = queue;

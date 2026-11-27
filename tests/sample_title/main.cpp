@@ -618,12 +618,23 @@ void test_fast_storage() {
     std::memcpy(r.data() + 0x30, &source_size, 4);
     return r;
   };
+  using SubmitFn = void(STDMETHODCALLTYPE*)(void*);
+  auto wait_for = [&](uint32_t index) {
+    for (int i = 0; i < 2000 && !reinterpret_cast<CompleteFn>(st[3])(status, index); ++i) Sleep(1);
+    return reinterpret_cast<CompleteFn>(st[3])(status, index);
+  };
+  // Nothing happens before the queue is submitted (titles map destination
+  // memory in between): the destination is untouched and the status pending.
   char text[5] = {};
   const std::vector<uint8_t> from_file = request(0, text, 4, file, 6, 4);  // "from"
   reinterpret_cast<EnqueueFn>(q[3])(queue, from_file.data());
   reinterpret_cast<StatusFn>(q[4])(queue, status, 0);
-  check(reinterpret_cast<CompleteFn>(st[3])(status, 0) && reinterpret_cast<ResultFn>(st[4])(status, 0) == S_OK &&
-            std::memcmp(text, "from", 4) == 0,
+  Sleep(20);
+  check(!reinterpret_cast<CompleteFn>(st[3])(status, 0) && reinterpret_cast<ResultFn>(st[4])(status, 0) == E_PENDING &&
+            text[0] == 0,
+        "fast storage carries nothing out before the queue is submitted");
+  reinterpret_cast<SubmitFn>(q[6])(queue);
+  check(wait_for(0) && reinterpret_cast<ResultFn>(st[4])(status, 0) == S_OK && std::memcmp(text, "from", 4) == 0,
         "fast storage reads file ranges and completes status entries");
   // zlib stream (one stored block) holding "packed".
   const uint8_t packed[] = {0x78, 0x01, 0x01, 0x06, 0x00, 0xF9, 0xFF, 'p', 'a', 'c', 'k', 'e', 'd',
@@ -632,7 +643,8 @@ void test_fast_storage() {
   const std::vector<uint8_t> from_memory = request((1ull << 22) | 1, unpacked, 6, packed, 0, sizeof(packed));
   reinterpret_cast<EnqueueFn>(q[3])(queue, from_memory.data());
   reinterpret_cast<StatusFn>(q[4])(queue, status, 1);
-  check(reinterpret_cast<ResultFn>(st[4])(status, 1) == S_OK && std::memcmp(unpacked, "packed", 6) == 0,
+  reinterpret_cast<SubmitFn>(q[6])(queue);
+  check(wait_for(1) && reinterpret_cast<ResultFn>(st[4])(status, 1) == S_OK && std::memcmp(unpacked, "packed", 6) == 0,
         "fast storage inflates zlib requests");
   reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(file))[2])(file);
 }

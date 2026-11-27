@@ -421,11 +421,14 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE get_resource_allocation_info(
               d.Flags);
     }
   }
-  if (count && HolyLogEnabled(lib::kDebug)) {
-    LIB_LOG(lib::kDebug, "d3d12", "allocation info dim %d %llux%u fmt %d mips %u flags 0x%x -> 0x%llx align 0x%llx",
-            descs[0].Dimension, static_cast<unsigned long long>(descs[0].Width), descs[0].Height, descs[0].Format,
-            descs[0].MipLevels, descs[0].Flags, static_cast<unsigned long long>(result->SizeInBytes),
-            static_cast<unsigned long long>(result->Alignment));
+  static const bool trace = GetEnvironmentVariableW(L"HOLY_XG_TRACE", nullptr, 0) > 0;
+  if (count && (trace || HolyLogEnabled(lib::kDebug))) {
+    LIB_LOG(trace ? lib::kInfo : lib::kDebug, "d3d12",
+            "allocation info dim %d %llux%ux%u fmt %d mips %u align 0x%llx flags 0x%x layout %d -> 0x%llx align 0x%llx",
+            descs[0].Dimension, static_cast<unsigned long long>(descs[0].Width), descs[0].Height,
+            descs[0].DepthOrArraySize, descs[0].Format, descs[0].MipLevels,
+            static_cast<unsigned long long>(descs[0].Alignment), descs[0].Flags, descs[0].Layout,
+            static_cast<unsigned long long>(result->SizeInBytes), static_cast<unsigned long long>(result->Alignment));
   }
   return result;
 }

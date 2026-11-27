@@ -23,12 +23,13 @@ struct SignatureEntry {
 bool read_output_signature(const uint8_t* container, size_t size, std::vector<SignatureEntry>* out);
 
 // Rectangle lists (documented in public RDNA register references as
-// DI_PT_RECTLIST): each three vertices are three corners of a rectangle, v1
-// and v2 the neighbours of v0, and the GPU adds the fourth corner. The program
-// takes the vertex program's outputs (`vertex_outputs`), passes each triangle
-// on and adds the fourth corner as v1 + v2 - v0 for every output (attributes
-// that vary affinely over the rectangle complete the same way), as a strip of
-// four vertices.
+// DI_PT_RECTLIST): each three vertices are three corners of a rectangle, and
+// the GPU adds the fourth corner. The program takes the vertex program's
+// outputs (`vertex_outputs`), passes each triangle on and adds the other
+// triangle of the rectangle: the corner the given sides meet at is the vertex
+// opposite the longest edge (observed: titles give it as v1, other code as
+// v0), and the fourth corner is the diagonal's ends minus it, for every output
+// (attributes that vary affinely over the rectangle complete the same way).
 std::vector<uint8_t> rectangle_list_program(const std::vector<SignatureEntry>& vertex_outputs);
 
 }  // namespace holy::d3d12

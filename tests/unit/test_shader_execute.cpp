@@ -1932,51 +1932,61 @@ TEST(pack_conversions_and_packed_half_fma_run_as_documented) {
 }
 
 // Rectangle lists: the generated geometry program draws the whole rectangle
-// three corners describe, and attributes take their affine values in the
-// corner it adds.
+// three corners describe, whichever of them the given sides meet at (titles
+// give it as v1, other code as v0), and attributes take their affine values
+// in the corner it adds.
 TEST(rectangle_lists_draw_the_whole_rectangle) {
   Gpu gpu;
-  const std::vector<uint8_t> vs = compiled(
-      "struct O { float4 pos : SV_Position; float4 t : TEXCOORD0; };"
-      "O main(uint id : SV_VertexID) {"
-      "  float2 uv = float2(id == 1, id == 2);"
-      "  O o;"
-      "  o.pos = float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1);"
-      "  o.t = float4(10 + 3 * uv.x + 5 * uv.y, 0, 0, 0);"
-      "  return o;"
-      "}",
-      "vs_5_1");
+  // uv of each vertex id: the corner the given sides meet at is v0
+  // (top-left, top-right, bottom-left), v1 (top-left, bottom-left,
+  // bottom-right) or v2 (top-left, bottom-right, bottom-left).
+  const char* const orders[3] = {"float2(id == 1, id == 2)", "float2(id == 2, id >= 1)", "float2(id == 1, id >= 1)"};
   const std::vector<uint8_t> ps = compiled(
       "float4 main(float4 pos : SV_Position, float4 t : TEXCOORD0) : SV_Target { return t.x; }", "ps_5_1");
-  if (vs.empty() || ps.empty() || !gpu.open()) {
-    std::printf("      (no Direct3D 12 device or shader compiler: not run)\n");
-    return;
-  }
-  std::vector<SignatureEntry> outputs;
-  EXPECT(read_output_signature(vs.data(), vs.size(), &outputs));
-  EXPECT(outputs.size() == 2);
-  const std::vector<uint8_t> gs = rectangle_list_program(outputs);
-  const std::vector<uint32_t> half = gpu.draw(vs, ps);
-  const std::vector<uint32_t> whole = gpu.draw(vs, ps, &gs);
-  EXPECT(half.size() == kSize * kSize && whole.size() == kSize * kSize);
-  if (half.size() != kSize * kSize || whole.size() != kSize * kSize) return;
-  auto as_float = [](uint32_t bits) {
-    float value;
-    std::memcpy(&value, &bits, 4);
-    return value;
-  };
-  bool covered = true, affine = true, half_uncovered = false;
-  for (UINT y = 0; y < kSize; ++y) {
-    for (UINT x = 0; x < kSize; ++x) {
-      const float u = (x + 0.5f) / kSize, v = (y + 0.5f) / kSize;
-      const float expected = 10 + 3 * u + 5 * v;
-      const float got = as_float(whole[y * kSize + x]);
-      covered = covered && got != 0.0f;
-      affine = affine && std::fabs(got - expected) < 1e-4f;
-      half_uncovered = half_uncovered || half[y * kSize + x] == 0;
+  for (int corner = 0; corner < 3; ++corner) {
+    const std::string source = std::string(
+                                   "struct O { float4 pos : SV_Position; float4 t : TEXCOORD0; };"
+                                   "O main(uint id : SV_VertexID) {"
+                                   "  float2 uv = ") +
+                               orders[corner] +
+                               ";"
+                               "  O o;"
+                               "  o.pos = float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1);"
+                               "  o.t = float4(10 + 3 * uv.x + 5 * uv.y, 0, 0, 0);"
+                               "  return o;"
+                               "}";
+    const std::vector<uint8_t> vs = compiled(source.c_str(), "vs_5_1");
+    if (vs.empty() || ps.empty() || !gpu.open()) {
+      std::printf("      (no Direct3D 12 device or shader compiler: not run)\n");
+      return;
     }
+    std::vector<SignatureEntry> outputs;
+    EXPECT(read_output_signature(vs.data(), vs.size(), &outputs));
+    EXPECT(outputs.size() == 2);
+    const std::vector<uint8_t> gs = rectangle_list_program(outputs);
+    const std::vector<uint32_t> half = gpu.draw(vs, ps);
+    const std::vector<uint32_t> whole = gpu.draw(vs, ps, &gs);
+    EXPECT(half.size() == kSize * kSize && whole.size() == kSize * kSize);
+    if (half.size() != kSize * kSize || whole.size() != kSize * kSize) return;
+    auto as_float = [](uint32_t bits) {
+      float value;
+      std::memcpy(&value, &bits, 4);
+      return value;
+    };
+    bool covered = true, affine = true, half_uncovered = false;
+    for (UINT y = 0; y < kSize; ++y) {
+      for (UINT x = 0; x < kSize; ++x) {
+        const float u = (x + 0.5f) / kSize, v = (y + 0.5f) / kSize;
+        const float expected = 10 + 3 * u + 5 * v;
+        const float got = as_float(whole[y * kSize + x]);
+        covered = covered && got != 0.0f;
+        affine = affine && std::fabs(got - expected) < 1e-4f;
+        half_uncovered = half_uncovered || half[y * kSize + x] == 0;
+      }
+    }
+    if (!covered || !affine) std::printf("      (the corner given as v%d)\n", corner);
+    EXPECT(half_uncovered);  // the triangle alone leaves the far corner empty
+    EXPECT(covered);
+    EXPECT(affine);
   }
-  EXPECT(half_uncovered);  // the triangle alone leaves the far corner empty
-  EXPECT(covered);
-  EXPECT(affine);
 }

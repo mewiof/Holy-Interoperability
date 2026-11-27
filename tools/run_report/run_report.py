@@ -38,6 +38,7 @@ RUNNING_TOTALS = {
     'd3d12.presents', 'd3d12.pipeline_compiles', 'd3d12.pipeline_compile_ms', 'd3d12.pipeline_compiles_at_use',
     'd3d12.pipeline_wait_ms', 'd3d12.program_reloads', 'd3d12.texture_refreshes', 'd3d12.cached_page_refreshes',
     'd3d12.gpu_heaps_released', 'd3d12.frame_gaps_over_50ms', 'd3d12.host_pipelines_compiled',
+    'xmem.implicit_page_faults', 'cpu.sse4a_instructions',
     'd3d12.pipelines_refused', 'd3d12.resources_used_after_release', 'd3d12.address_translations_locked',
     'd3d12.cached_pages_rejected', 'memory.committed_on_first_touch_bytes',
 }

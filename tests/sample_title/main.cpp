@@ -133,6 +133,34 @@ void test_cpu_compatibility() {
   std::memcpy(page, kWait, sizeof(kWait));
   FlushInstructionCache(GetCurrentProcess(), page, sizeof(kWait));
   check(reinterpret_cast<int (*)(void*)>(page)(line) == 7, "MONITORX and MWAITX return to the caller");
+  // SSE4a bit fields on the low quadwords of XMM registers loaded from and
+  // stored back to rcx's array (xmm8 and xmm9, saved and restored around).
+  static const unsigned char kFields[] = {
+      0x48, 0x83, 0xEC, 0x28,                    // sub rsp, 0x28
+      0xF3, 0x44, 0x0F, 0x7F, 0x04, 0x24,        // movdqu [rsp], xmm8
+      0xF3, 0x44, 0x0F, 0x7F, 0x4C, 0x24, 0x10,  // movdqu [rsp+0x10], xmm9
+      0xF3, 0x0F, 0x6F, 0x01,                    // movdqu xmm0, [rcx]
+      0xF3, 0x0F, 0x6F, 0x49, 0x10,              // movdqu xmm1, [rcx+0x10]
+      0xF2, 0x0F, 0x78, 0xC1, 0x10, 0x10,        // insertq xmm0, xmm1, 16, 16
+      0xF3, 0x0F, 0x7F, 0x01,                    // movdqu [rcx], xmm0
+      0xF3, 0x0F, 0x6F, 0x51, 0x20,              // movdqu xmm2, [rcx+0x20]
+      0x66, 0x0F, 0x78, 0xC2, 0x08, 0x04,        // extrq xmm2, 8, 4
+      0xF3, 0x0F, 0x7F, 0x51, 0x20,              // movdqu [rcx+0x20], xmm2
+      0xF3, 0x44, 0x0F, 0x6F, 0x41, 0x30,        // movdqu xmm8, [rcx+0x30]
+      0xF3, 0x44, 0x0F, 0x6F, 0x49, 0x40,        // movdqu xmm9, [rcx+0x40]
+      0xF2, 0x45, 0x0F, 0x78, 0xC8, 0x08, 0x00,  // insertq xmm9, xmm8, 8, 0
+      0xF3, 0x44, 0x0F, 0x7F, 0x49, 0x40,        // movdqu [rcx+0x40], xmm9
+      0xF3, 0x44, 0x0F, 0x6F, 0x04, 0x24,        // movdqu xmm8, [rsp]
+      0xF3, 0x44, 0x0F, 0x6F, 0x4C, 0x24, 0x10,  // movdqu xmm9, [rsp+0x10]
+      0x48, 0x83, 0xC4, 0x28,                    // add rsp, 0x28
+      0xC3};                                     // ret
+  std::memcpy(page, kFields, sizeof(kFields));
+  FlushInstructionCache(GetCurrentProcess(), page, sizeof(kFields));
+  alignas(16) uint64_t fields[10] = {0x1111222233334444ull, 0x5555666677778888ull, 0xBEEF, 0, 0x12345, 0xFFFF,
+                                     0xAB, 0, 0x1234567890ABCDEFull, 0x42};
+  reinterpret_cast<void (*)(uint64_t*)>(page)(fields);
+  check(fields[0] == 0x11112222BEEF4444ull && fields[4] == 0x34 && fields[8] == 0x1234567890ABCDABull,
+        "SSE4a's INSERTQ and EXTRQ move bit fields (REX-extended registers too)");
   VirtualFree(page, 0, MEM_RELEASE);
 }
 

@@ -15,6 +15,7 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -63,6 +64,9 @@ struct Profiler::State {
   uint64_t samples = 0, busy_samples = 0, blocked_samples = 0;
   std::unordered_map<DWORD, ThreadInfo> threads;
   std::unordered_map<DWORD64, uint64_t> exclusive, inclusive, wait_sites;
+  // Samples in system calls by (system call, first two frames outside system
+  // DLLs): who makes the calls threads spend their time in.
+  std::map<std::tuple<DWORD64, DWORD64, DWORD64>, uint64_t> syscall_sites;
   std::unordered_map<DWORD64, Module> modules;  // by base
   std::unordered_map<DWORD64, DWORD64> function_of;  // pc -> function start (cache)
   std::unordered_map<DWORD64, bool> syscall_stub;    // function start -> is an Nt/Zw stub
@@ -276,12 +280,12 @@ void Profiler::State::sample_all() {
       ++blocked_samples;
       ++info.blocked;
       ++info.exclusive[functions[0]];  // which system call
-      for (int i = 0; i < depth; ++i) {
-        if (!module_at(functions[i]).system) {
-          ++wait_sites[functions[i]];
-          break;
-        }
+      DWORD64 callers[2] = {0, 0};
+      for (int i = 0, found = 0; i < depth && found < 2; ++i) {
+        if (!module_at(functions[i]).system) callers[found++] = functions[i];
       }
+      if (callers[0]) ++wait_sites[callers[0]];
+      ++syscall_sites[{functions[0], callers[0], callers[1]}];
       continue;
     }
     ++busy_samples;
@@ -361,6 +365,20 @@ void Profiler::State::write_report(bool final_report) {
   }
   std::fprintf(out, "\n");
   table("Blocked: where threads wait from (first frame outside system DLLs)", wait_sites, blocked_samples, 40);
+  {
+    std::vector<std::pair<uint64_t, std::tuple<DWORD64, DWORD64, DWORD64>>> sorted;
+    for (const auto& [site, count] : syscall_sites) sorted.emplace_back(count, site);
+    std::sort(sorted.rbegin(), sorted.rend());
+    std::fprintf(out, "Blocked: system calls by caller (system call <- first two frames outside system DLLs)\n");
+    for (size_t i = 0; i < sorted.size() && i < 60; ++i) {
+      const auto& [call, first, second] = sorted[i].second;
+      std::fprintf(out, "  %7.2f%%  %8llu  %s <- %s <- %s\n",
+                   blocked_samples ? 100.0 * sorted[i].first / blocked_samples : 0.0,
+                   static_cast<unsigned long long>(sorted[i].first), describe(call).c_str(),
+                   first ? describe(first).c_str() : "?", second ? describe(second).c_str() : "?");
+    }
+    std::fprintf(out, "\n");
+  }
   std::fclose(out);
 }
 

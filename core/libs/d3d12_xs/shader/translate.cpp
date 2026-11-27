@@ -127,6 +127,7 @@ class Translator {
   // EXEC is kept as this lane's bit alone (the lane model: a lane mask holds
   // the lane's bit at bit 0), so it serves as the lane's condition as it is.
   void put(uint32_t reg, const Operand& v) {
+    if (reg <= kExecHiR) saved_on_.erase(reg);
     if (reg == kExecLoR) {
       exec_written_ = true;
       return emit(dx::kAnd, {D(reg), v, I(1)});
@@ -137,6 +138,7 @@ class Translator {
   // before the register is written).
   void put_select(uint32_t reg, const Operand& mask, const Operand& a, const Operand& b) {
     if (known_on(mask)) return put(reg, a);
+    if (reg <= kExecHiR) saved_on_.erase(reg);
     emit(dx::kMovc, {D(reg), mask, a, b});
     if (reg == kExecLoR) {
       exec_written_ = true;
@@ -632,7 +634,7 @@ class Translator {
     return value;
   }
 
-  bool exec_on_after(const Instruction& inst, bool before) const;
+  bool exec_on_after(const Instruction& inst, bool before);
   bool linear_layout(const std::vector<std::pair<uint32_t, dxbc::Program>>& blocks,
                      const std::vector<char>& barrier_after, dxbc::Program& body);
   bool emit(const Instruction& inst);
@@ -869,6 +871,17 @@ class Translator {
   // on; until anything else writes it.
   bool exec_on_ = false;
   bool exec_written_ = false;  // the instruction being translated wrote EXEC
+  // Scalar registers known to hold the lane's bit on: masks saved by
+  // s_*_saveexec while EXEC was on, until the register is written. With
+  // EXEC, carried along forward branches to their targets (what holds on
+  // every way in); nothing is known where a branch goes back or through a
+  // register.
+  std::set<uint32_t> saved_on_;
+  struct EdgeFacts {
+    bool exec_on;
+    std::set<uint32_t> saved_on;
+  };
+  std::map<uint32_t, std::vector<EdgeFacts>> incoming_;  // by target address
   std::vector<char> ifs_;      // open ifs: emitted (1) or left out (0, if_active)
   bool barrier_ = false;
   bool lds_ = false;
@@ -1508,19 +1521,30 @@ bool Translator::linear_layout(const std::vector<std::pair<uint32_t, dxbc::Progr
 }
 
 // After an instruction wrote EXEC: known on when it set EXEC to a constant
-// with the lane's bit (s_mov_b32/b64), or or-ed into it while it was on
-// (s_or_b32/b64 with EXEC as a source); else unknown.
-bool Translator::exec_on_after(const Instruction& inst, bool before) const {
+// with the lane's bit or to a register known on (s_mov_b32/b64), or or-ed
+// into it EXEC while it was on or a register known on (s_or_b32/b64: the
+// restore at the end of an if); else unknown.
+bool Translator::exec_on_after(const Instruction& inst, bool before) {
   if (inst.dst != rdna::kExecLo) return false;
+  auto saved = [&](uint16_t code) {
+    if (code > 105 && code != rdna::kVccLo) return false;
+    const uint32_t r = sreg(code);
+    return r != kNoRegister && saved_on_.count(r) != 0;
+  };
   if (inst.encoding == Encoding::SOP1 && (inst.op == 3 || inst.op == 4)) {
     const uint16_t code = inst.src[0];
     if (code >= 129 && code <= 192) return ((code - 128) & 1) != 0;  // 1 to 64
     if (code >= 193 && code <= 208) return ((code - 192) & 1) != 0;  // -1 to -16
     if (code == rdna::kLiteral) return (inst.literal & 1) != 0;
-    return false;
+    return saved(code);
   }
-  return inst.encoding == Encoding::SOP2 && (inst.op == 16 || inst.op == 17) && before &&
-         (inst.src[0] == rdna::kExecLo || inst.src[1] == rdna::kExecLo);
+  if (inst.encoding == Encoding::SOP2 && (inst.op == 16 || inst.op == 17)) {
+    for (uint16_t code : {inst.src[0], inst.src[1]}) {
+      if (code == rdna::kExecLo && before) return true;
+      if (saved(code)) return true;
+    }
+  }
+  return false;
 }
 
 bool Translator::emit_smem(const Instruction& inst) {
@@ -4211,6 +4235,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   // Block leaders: entry, branch targets, instructions after branches.
   std::set<uint32_t> leaders = {0};
   std::set<uint32_t> targets(indirect_targets_.begin(), indirect_targets_.end());
+  std::set<uint32_t> unknown_entry(indirect_targets_.begin(), indirect_targets_.end());  // nothing known there
   leaders.insert(indirect_targets_.begin(), indirect_targets_.end());
   auto is_branch = [](const Instruction& i) {
     return (i.encoding == Encoding::SOPP && (i.op == 2 || (i.op >= 4 && i.op <= 9) || i.op == 1 || i.op == 10)) ||
@@ -4220,8 +4245,10 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
     const Instruction& inst = program_[i];
     if (!is_branch(inst)) continue;
     if (inst.encoding == Encoding::SOPP && inst.op != 1 && inst.op != 10) {
-      leaders.insert(static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm));
-      targets.insert(static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm));
+      const uint32_t target = static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm);
+      leaders.insert(target);
+      targets.insert(target);
+      if (target <= inst.pc) unknown_entry.insert(target);
     }
     if (i + 1 < program_.size()) leaders.insert(program_[i + 1].pc);
   }
@@ -4241,17 +4268,46 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       }
       blocks.emplace_back(inst.pc, dxbc::Program());
       barrier_after.push_back(0);
-      // EXEC at the block's start: on at the program's start; unknown where
-      // a branch arrives; else as the previous block left it, on after an
-      // s_cbranch_execz not taken.
+      // What is known at the block's start: from the program's start, EXEC
+      // on; where branches go back or through registers, nothing; else
+      // what holds on every way in (falling in from the previous block, on
+      // after an s_cbranch_execz not taken; forward branches as noted).
       if (i == 0) {
         exec_on_ = true;
-      } else if (targets.count(inst.pc)) {
+        saved_on_.clear();
+      } else if (unknown_entry.count(inst.pc)) {
         exec_on_ = false;
-      } else if (program_[i - 1].encoding == Encoding::SOPP && program_[i - 1].op == 8) {
-        exec_on_ = true;
-      } else if (program_[i - 1].encoding == Encoding::SOPP && program_[i - 1].op == 9) {
-        exec_on_ = false;
+        saved_on_.clear();
+      } else {
+        const Instruction& prev = program_[i - 1];
+        const bool jumps = (prev.encoding == Encoding::SOPP && (prev.op == 1 || prev.op == 2)) ||
+                           (prev.encoding == Encoding::SOP1 && (prev.op == 32 || prev.op == 33));
+        bool any = false, on = false;
+        std::set<uint32_t> saved;
+        if (!jumps) {
+          any = true;
+          on = prev.encoding == Encoding::SOPP && prev.op == 8   ? true
+               : prev.encoding == Encoding::SOPP && prev.op == 9 ? false
+                                                                 : exec_on_;
+          saved = saved_on_;
+        }
+        const auto edges = incoming_.find(inst.pc);
+        if (edges != incoming_.end()) {
+          for (const EdgeFacts& edge : edges->second) {
+            if (!any) {
+              any = true;
+              on = edge.exec_on;
+              saved = edge.saved_on;
+              continue;
+            }
+            on = on && edge.exec_on;
+            for (auto it = saved.begin(); it != saved.end();) {
+              it = edge.saved_on.count(*it) ? std::next(it) : saved.erase(it);
+            }
+          }
+        }
+        exec_on_ = any && on;
+        saved_on_ = any ? std::move(saved) : std::set<uint32_t>();
       }
     }
     const bool exec_before = exec_on_;
@@ -4260,6 +4316,11 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       const uint32_t target = static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm);
       const uint32_t next = i + 1 < program_.size() ? program_[i + 1].pc : 0xFFFFFFFFu;
       auto branch = [&](const Operand& taken) { put_select(kNextR, taken, I(target), I(next)); };
+      if ((inst.op == 2 || (inst.op >= 4 && inst.op <= 9)) && target > inst.pc) {
+        // Taken: EXEC is zero after execz, the lane's bit after execnz.
+        const bool on = inst.op == 8 ? false : inst.op == 9 ? true : exec_on_;
+        incoming_[target].push_back({on, saved_on_});
+      }
       switch (inst.op) {
         case 1: end_program(); continue;
         case 2: put(kNextR, I(target)); continue;
@@ -4313,6 +4374,13 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       return false;
     }
     if (exec_written_) exec_on_ = exec_on_after(inst, exec_before);
+    if (exec_before && inst.encoding == Encoding::SOP1 &&
+        ((inst.op >= 36 && inst.op <= 40) || inst.op == 55 || inst.op == 56 || (inst.op >= 60 && inst.op <= 64) ||
+         inst.op == 68)) {
+      // s_*_saveexec: the destination is EXEC as it was, on.
+      const uint32_t r = sreg(inst.dst);
+      if (r != kNoRegister) saved_on_.insert(r);
+    }
     if (!error_.empty()) {
       *error = format("at 0x%x: %s", inst.pc, error_.c_str());
       return false;

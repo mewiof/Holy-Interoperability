@@ -149,11 +149,11 @@ Operand group_shared(uint32_t id, Access access) {
 
 Program::Program(ProgramType type) { tokens_ = {(static_cast<uint32_t>(type) << 16) | 0x51u, 0u}; }
 
-void Program::emit(uint32_t opcode, const std::vector<Operand>& operands, uint32_t controls) {
+void Program::emit(uint32_t opcode, const Operand* operands, size_t count, uint32_t controls) {
   size_t length = 1;
-  for (const Operand& o : operands) length += o.size();
+  for (size_t i = 0; i < count; ++i) length += operands[i].size();
   tokens_.push_back(opcode | controls | (static_cast<uint32_t>(length) << 24));
-  for (const Operand& o : operands) tokens_.insert(tokens_.end(), o.begin(), o.end());
+  for (size_t i = 0; i < count; ++i) tokens_.insert(tokens_.end(), operands[i].begin(), operands[i].end());
 }
 
 void Program::dcl_global_flags(uint32_t flags) { tokens_.push_back(kDclGlobalFlags | (flags << 11) | (1u << 24)); }

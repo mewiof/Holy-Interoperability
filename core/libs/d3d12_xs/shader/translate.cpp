@@ -95,6 +95,9 @@ class Translator {
     }
     return kScratch + scratch_++;
   }
+  void emit(uint32_t opcode, std::initializer_list<Operand> operands, uint32_t controls = 0) {
+    p_.emit(opcode, operands, controls);
+  }
   void emit(uint32_t opcode, const std::vector<Operand>& operands, uint32_t controls = 0) {
     p_.emit(opcode, operands, controls);
   }

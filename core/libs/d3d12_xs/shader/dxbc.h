@@ -10,7 +10,10 @@
 // operands; every register value lives in the x component of a temp.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <initializer_list>
 #include <vector>
 
 namespace holy::d3d12::dxbc {
@@ -58,7 +61,46 @@ enum OperandType : uint32_t {
   kThreadId = 32, kThreadGroupId = 33, kThreadIdInGroup = 34, kThreadIdInGroupFlattened = 36,
 };
 
-using Operand = std::vector<uint32_t>;
+// An operand's tokens, kept inline: translation builds millions of them, and
+// heap-allocated ones made it slow and kept threads waiting on the heap
+// (measured). No operand needs more than kCapacity (an extended token, a
+// modifier, the operand token, indices and a relative register's tokens).
+class Operand {
+ public:
+  static constexpr size_t kCapacity = 8;
+  Operand() = default;
+  Operand(std::initializer_list<uint32_t> tokens) {
+    for (uint32_t t : tokens) push_back(t);
+  }
+  void push_back(uint32_t token) {
+    if (size_ == kCapacity) std::abort();  // a writer bug: no operand is this long
+    data_[size_++] = token;
+  }
+  // Inserts before `at` (shifting the rest up).
+  void insert(uint32_t* at, uint32_t token) {
+    const size_t index = static_cast<size_t>(at - data_);
+    push_back(0);
+    for (size_t i = size_ - 1; i > index; --i) data_[i] = data_[i - 1];
+    data_[index] = token;
+  }
+  // Appends [first, last) (`at` must be end()).
+  void insert(uint32_t*, const uint32_t* first, const uint32_t* last) {
+    for (; first != last; ++first) push_back(*first);
+  }
+  uint32_t& operator[](size_t i) { return data_[i]; }
+  uint32_t operator[](size_t i) const { return data_[i]; }
+  size_t size() const { return size_; }
+  bool empty() const { return size_ == 0; }
+  uint32_t* begin() { return data_; }
+  uint32_t* end() { return data_ + size_; }
+  const uint32_t* begin() const { return data_; }
+  const uint32_t* end() const { return data_ + size_; }
+  uint32_t& back() { return data_[size_ - 1]; }
+
+ private:
+  uint32_t data_[kCapacity] = {};
+  uint8_t size_ = 0;
+};
 
 // Sources select one component; destinations write the x component.
 Operand temp(uint32_t index, uint32_t component = 0);
@@ -146,8 +188,14 @@ class Program {
   // Version 5.1 of the given program type.
   explicit Program(ProgramType type = ProgramType::Compute);
 
-  void emit(uint32_t opcode, const std::vector<Operand>& operands, uint32_t controls = 0);
-  void emit(uint32_t opcode) { emit(opcode, {}); }
+  void emit(uint32_t opcode, std::initializer_list<Operand> operands, uint32_t controls = 0) {
+    emit(opcode, operands.begin(), operands.size(), controls);
+  }
+  void emit(uint32_t opcode, const std::vector<Operand>& operands, uint32_t controls = 0) {
+    emit(opcode, operands.data(), operands.size(), controls);
+  }
+  void emit(uint32_t opcode, const Operand* operands, size_t count, uint32_t controls);
+  void emit(uint32_t opcode) { emit(opcode, nullptr, 0, 0); }
 
   void dcl_global_flags(uint32_t flags);
   // An immediate constant buffer of `data` (padded to whole vectors; at most

@@ -127,6 +127,12 @@ The largest piece.
 - done: writes to physical pages through the title's views, watched by page protection of those views (the host
   allows it there, measured; the GPU's own views of the pages carry the heaps). The sample title checks a texel
   written through its view of a physical page.
+- done: native pipelines' render targets from their format list (dword 3 is not a count: a quarter of a title's
+  pipelines had no target or only the first), the second layout of their render state (477 pipelines read at the
+  wrong offsets: target 0 never written), and their depth state (variants by depth target format). Draws without
+  indices pass their first vertex in s2 (they fetched from the buffer's start). The sample title checks a draw from
+  vertex 3 and a depth test with native programs and descriptions; each check fails without its fix.
+- next: the stencil state of native pipelines.
 - next: GPU writes into title memory under textures (copies and translated programs writing texture memory).
 - done: GPU heaps over title memory are released before the title frees the memory (they kept it charged:
   measured 1 GiB over 16 rounds of 64 MiB); an end-to-end check measures it.

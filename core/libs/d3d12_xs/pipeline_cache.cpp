@@ -651,13 +651,15 @@ HRESULT create_from_recipe(Device* device, std::shared_ptr<Recipe> recipe, const
 }  // namespace
 
 HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream, std::vector<ProgramRef> programs,
-                                 bool translated, const lib::VtableInfo* info, void* const* vtable, void** pipeline) {
+                                 bool translated, const lib::VtableInfo* info, void* const* vtable, void** pipeline,
+                                 uint32_t depth_control) {
   if (!pipeline) return E_POINTER;
   *pipeline = nullptr;
   auto recipe = std::make_shared<Recipe>();
   recipe->stream = std::move(stream);
   recipe->programs = std::move(programs);
   recipe->translated = translated;
+  recipe->depth_control = depth_control;
   for (const ProgramRef& program : recipe->programs) {
     if (!program) return E_INVALIDARG;
   }
@@ -857,6 +859,54 @@ ID3D12PipelineState* pipeline_host_rectangles(const void* object) {
       }
     }
     variant = pipeline->rectangles;
+  }
+  return variant ? host_state(variant.get()) : nullptr;
+}
+
+ID3D12PipelineState* pipeline_host_depth(const void* object, DXGI_FORMAT format) {
+  Pipeline* pipeline = as_pipeline(object);
+  if (!pipeline || !pipeline->recipe || !pipeline->shared || format == DXGI_FORMAT_UNKNOWN) return nullptr;
+  const uint32_t control = pipeline->recipe->depth_control;
+  const bool test = (control >> 1) & 1, write = (control >> 2) & 1;
+  if (!test && !write) return nullptr;
+  std::shared_ptr<HostPipeline> variant;
+  {
+    std::lock_guard<std::mutex> guard(g_variant_lock);
+    for (const auto& [made_for, made] : pipeline->depth_variants) {
+      if (made_for == format) return made ? host_state(made.get()) : nullptr;
+    }
+    // DB_DEPTH_CONTROL: Z_ENABLE bit 1, Z_WRITE_ENABLE bit 2, ZFUNC bits 4-6
+    // (never, less, equal, less or equal, greater, not equal, greater or
+    // equal, always: the desktop's comparison functions less one).
+    // Partial: the stencil test (STENCIL_ENABLE bit 0) is not applied (the
+    // registers of its operations and masks are not established).
+    D3D12_DEPTH_STENCIL_DESC depth{};
+    depth.DepthEnable = TRUE;  // writes need the test on on the host (always passing when only writing)
+    depth.DepthWriteMask = write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    depth.DepthFunc = test ? static_cast<D3D12_COMPARISON_FUNC>(((control >> 4) & 7) + 1) : D3D12_COMPARISON_FUNC_ALWAYS;
+    depth.StencilReadMask = depth.StencilWriteMask = 0xFF;
+    const D3D12_DEPTH_STENCILOP_DESC keep{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                          D3D12_COMPARISON_FUNC_ALWAYS};
+    depth.FrontFace = depth.BackFace = keep;
+    auto recipe = std::make_shared<Recipe>(*pipeline->recipe);
+    bool has_depth = false, has_format = false;
+    walk(recipe->stream, [&](uint32_t type, size_t inner, size_t size) {
+      if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL && size >= sizeof(depth)) {
+        std::memcpy(recipe->stream.data() + inner, &depth, sizeof(depth));
+        has_depth = true;
+      } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT && size >= sizeof(format)) {
+        std::memcpy(recipe->stream.data() + inner, &format, sizeof(format));
+        has_format = true;
+      }
+    });
+    if (!has_depth) stream_append(&recipe->stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &depth, sizeof(depth));
+    if (!has_format) {
+      stream_append(&recipe->stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &format, sizeof(format));
+    }
+    std::vector<uint8_t> content = content_of(*recipe);
+    recipe->key = fnv(content);
+    variant = host_pipeline_for(pipeline->shared->device, recipe, std::move(content));
+    pipeline->depth_variants.emplace_back(format, variant);
   }
   return variant ? host_state(variant.get()) : nullptr;
 }

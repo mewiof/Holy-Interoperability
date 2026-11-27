@@ -111,7 +111,8 @@ bool draw_ngg(CommandList* list, const NggPipeline& ngg, uint32_t vertices, uint
   const NggInfo& info = ngg.info;
   if (!info.group || !info.stride || !vertices || !instances) return true;
   ID3D12PipelineState* compute = pipeline_host(ngg.compute);
-  ID3D12PipelineState* graphics = pipeline_host(list->pipeline);
+  ID3D12PipelineState* graphics = pipeline_host_depth(list->pipeline, list->depth_format);
+  if (!graphics) graphics = pipeline_host(list->pipeline);
   if (!compute || !graphics || !list->host7) return false;
   const uint64_t groups = (static_cast<uint64_t>(vertices) + info.group - 1) / info.group;
   const uint64_t slots = groups * instances * info.group;

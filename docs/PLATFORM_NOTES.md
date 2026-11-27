@@ -359,8 +359,13 @@ Notes describe the platform, never a title.
   pipelines), the later layout holding the same registers 0x15 dwords further on: the target mask (four bits a
   target) after the constant, the mode control (`PA_SU_SC_MODE_CNTL`) at 0x28, `DB_DEPTH_CONTROL` at 0x2E (values
   such as 0x7007F0: depth off; 0x7007E2: depth test GEQUAL; 0x7007A2: EQUAL; 0x7007E7: written, with stencil) and
-  the blend controls from 0x34 (offsets for the first layout). Other layouts are refused. Implementation: the
-  depth state is not applied yet (no field names the depth format; the host needs it in the pipeline).
+  the blend controls from 0x34 (offsets for the first layout). Other layouts are refused. No field names the depth
+  format, which the host needs in the pipeline: draws with a depth target bound use a variant of the pipeline with
+  the depth test, writes and function of `DB_DEPTH_CONTROL` and the target's format (made at first such draw).
+  Partial: the stencil test is not applied (the registers of its operations and masks are not established).
+- *measured* host behaviour: the host's vertex index (`SV_VertexID`) does not include a draw's first vertex (a point
+  drawn from vertex 5 has index 0). *observed*: native vertex programs add s2 to their vertex index; draws without
+  indices pass the first vertex there (indexed draws: the base vertex).
 - *observed*: device slot 108 is `GetResourceAllocationInfo1`; titles retry without a small alignment when the
   alignment returned differs and treat sizes of 4 GiB or more as fatal.
 - *observed*: titles set texture layout 0x105 on 3D textures (a console swizzle mode, *assumed*); console layouts

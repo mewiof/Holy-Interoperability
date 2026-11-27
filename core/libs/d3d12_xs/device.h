@@ -81,6 +81,7 @@ struct CommandList {
   // The runtime's own heap of memory slot views is bound on the host (the
   // title bound no CBV/SRV/UAV heap; bindings.cpp).
   bool memory_heap_bound = false;
+  DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;  // of the bound depth target (none: unknown)
   RootBinding graphics, compute;
   const void* pipeline = nullptr;  // the title's current pipeline (a Wrapper)
   bool translated = false;         // it runs translated native code

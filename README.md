@@ -17,7 +17,7 @@ _Last updated: 2026-11-27._ The goal is a reference title running as smoothly as
 picture, sound and input at a stable 30 frames a second or better. The percentages are rough estimates of how
 much of the work toward that goal each area has, not test coverage.
 
-**Overall: about 22%** `████░░░░░░░░░░░░░░░░`
+**Overall: about 24%** `█████░░░░░░░░░░░░░░░`
 
 ```mermaid
 flowchart LR
@@ -53,7 +53,7 @@ flowchart LR
 | Graphics: device, resources, command recording | `██████░░░░` 55% (one memory map for translated programs; heaps released with title memory) |
 | Graphics: shader translation | `█████░░░░░` 45% (ray-intersection instructions open) |
 | Graphics: pipelines and caches | `███████░░░` 70% |
-| Graphics: correct output | `██░░░░░░░░` 15% (textures read with all four channels; texture copies follow the title's writes) |
+| Graphics: correct output | `███░░░░░░░` 25% (textures read with all four channels; texture copies follow the title's writes; native pipelines get their targets, depth tests and vertices right) |
 | Graphics: performance | `██░░░░░░░░` 15% (memory accesses: two page-table reads instead of a scan; no views written per draw) |
 | Input | `████░░░░░░` 40% |
 | Audio | `█░░░░░░░░░` 10% |

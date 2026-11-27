@@ -133,6 +133,7 @@ HRESULT STDMETHODCALLTYPE list_reset_x(CommandList* self, void* allocator, void*
   }
   self->heaps[0] = self->heaps[1] = nullptr;
   self->memory_heap_bound = false;
+  self->depth_format = DXGI_FORMAT_UNKNOWN;
   self->graphics = RootBinding{};
   self->compute = RootBinding{};
   self->pipeline = nullptr;
@@ -677,6 +678,7 @@ void STDMETHODCALLTYPE list_set_render_targets(CommandList* self, UINT count, co
   }
   D3D12_CPU_DESCRIPTOR_HANDLE host_depth{};
   if (depth) host_depth = host_cpu_handle(depth->ptr);
+  self->depth_format = depth ? depth_view_format(depth->ptr) : DXGI_FORMAT_UNKNOWN;
   if (frame_traced()) {
     for (UINT i = 0; i < n && targets; ++i) {
       HOLY_TRACE("list %u render target %u: %s", self->number, i, describe_target(targets[single ? 0 : i].ptr).c_str());
@@ -803,6 +805,7 @@ void bind_draw_pipeline(CommandList* self) {
       LIB_LOG(lib::kWarn, "d3d12", "rectangle lists drawn as triangle lists (half of each rectangle)");
     }
   }
+  if (!wanted) wanted = pipeline_host_depth(self->pipeline, self->depth_format);
   if (!wanted) wanted = pipeline_host(self->pipeline);
   if (wanted && wanted != self->bound) {
     self->host->SetPipelineState(wanted);
@@ -830,8 +833,11 @@ void STDMETHODCALLTYPE list_draw_instanced(CommandList* self, UINT vertices, UIN
   }
   bind_draw_pipeline(self);
   if (self->translated) {
-    // The host's vertex index already includes the first vertex.
-    if (!bind_translated_graphics(self, 0, first_instance)) return report_unbound("a draw");
+    // Measured: the host's vertex index (SV_VertexID) does not include the
+    // first vertex (a point drawn from vertex 5 has index 0). Native code adds
+    // s2 to its vertex index, as the console's draws without indices pass the
+    // first vertex there: so the first vertex goes in s2.
+    if (!bind_translated_graphics(self, first_vertex, first_instance)) return report_unbound("a draw");
   } else {
     bind_title_root(self, false);
   }

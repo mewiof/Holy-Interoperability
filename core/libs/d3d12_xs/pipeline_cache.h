@@ -71,6 +71,11 @@ struct Recipe {
   std::shared_ptr<std::vector<std::string>> names;
   bool translated = false;
   uint64_t key = 0;  // content key, the same across runs for the same content
+  // Native pipelines: their DB_DEPTH_CONTROL. The recipe's own stream has no
+  // depth test (no field names the depth format); draws with a depth target
+  // bound use a variant with this depth state and the target's format
+  // (pipeline_host_depth).
+  uint32_t depth_control = 0;
 };
 
 struct HostPipeline;
@@ -87,6 +92,8 @@ struct Pipeline : Wrapper {
   // rectangle's fourth corner; shader/geometry.h), made at first such draw.
   std::shared_ptr<HostPipeline> rectangles;
   bool rectangles_tried = false;
+  // The same pipeline with its depth state, by depth target format.
+  std::vector<std::pair<DXGI_FORMAT, std::shared_ptr<HostPipeline>>> depth_variants;
 };
 
 // The pipeline behind a title object, or null if it is not one.
@@ -99,7 +106,8 @@ void stream_append(std::vector<uint8_t>* stream, uint32_t type, const void* data
 // made from `programs` (in subobject order) and remembers how, so pipelines
 // can be derived from it.
 HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream, std::vector<ProgramRef> programs,
-                                 bool translated, const lib::VtableInfo* info, void* const* vtable, void** pipeline);
+                                 bool translated, const lib::VtableInfo* info, void* const* vtable, void** pipeline,
+                                 uint32_t depth_control = 0);
 
 // A title pipeline around a host pipeline made elsewhere (taking over the
 // reference); it cannot be derived from.
@@ -124,6 +132,12 @@ ID3D12PipelineState* pipeline_host(const void* pipeline);
 // Pipeline::rectangles); null if there cannot be one (the caller then draws
 // triangle lists).
 ID3D12PipelineState* pipeline_host_rectangles(const void* pipeline);
+
+// The host pipeline for drawing with a title pipeline whose depth state
+// tests or writes depth (Recipe::depth_control) into a depth target of
+// `format`; null when the base pipeline serves (no depth state, or no target
+// bound: the base has the test off).
+ID3D12PipelineState* pipeline_host_depth(const void* pipeline, DXGI_FORMAT format);
 
 // Releases a pipeline (vtable slot 2 of pipelines).
 ULONG STDMETHODCALLTYPE pipeline_release(Wrapper* self);

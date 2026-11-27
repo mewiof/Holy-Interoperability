@@ -92,6 +92,11 @@ struct TargetView {
 std::mutex g_targets_lock;
 std::unordered_map<SIZE_T, TargetView> g_targets;
 
+// Depth-stencil views' formats (pipelines' depth variants need them; views
+// are made rarely).
+std::mutex g_depth_lock;
+std::unordered_map<SIZE_T, DXGI_FORMAT> g_depth_formats;
+
 void note_target(SIZE_T dest, const void* resource, DXGI_FORMAT view_format) {
   if (!call_check_enabled()) return;
   TargetView view;
@@ -104,6 +109,12 @@ void note_target(SIZE_T dest, const void* resource, DXGI_FORMAT view_format) {
 }
 
 }  // namespace
+
+DXGI_FORMAT depth_view_format(SIZE_T handle) {
+  std::lock_guard<std::mutex> guard(g_depth_lock);
+  const auto it = g_depth_formats.find(handle);
+  return it == g_depth_formats.end() ? DXGI_FORMAT_UNKNOWN : it->second;
+}
 
 std::string describe_target(SIZE_T handle) {
   TargetView view;
@@ -325,6 +336,12 @@ void STDMETHODCALLTYPE create_depth_stencil_view(Device* self, void* resource,
   }
   self->host->CreateDepthStencilView(host_resource(resource), desc ? &host : nullptr, host_cpu_handle(dest));
   publish_descriptors(dest);
+  {
+    const auto* r = static_cast<const Resource*>(resource);
+    const DXGI_FORMAT format = desc ? host.Format : r ? desktop_format(r->desc.Format) : DXGI_FORMAT_UNKNOWN;
+    std::lock_guard<std::mutex> guard(g_depth_lock);
+    g_depth_formats[dest] = format;
+  }
   note_target(dest, resource, desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
 }
 

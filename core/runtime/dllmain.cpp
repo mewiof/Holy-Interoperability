@@ -80,6 +80,7 @@ void boot() {
   s.title_size = nt_headers(image_base)->OptionalHeader.SizeOfImage;
   s.trap_unimplemented = (g_boot.flags & kBootTrapUnimplemented) != 0;
   s.offline = (g_boot.flags & kBootOffline) != 0;
+  s.local_user = (g_boot.flags & kBootLocalUser) != 0;
   s.console_model = g_boot.console_model;
   s.runtime_dir = parent_dir(module_path(g_self));
   s.providers.libs_dir = join_path(s.runtime_dir, L"libs");
@@ -218,6 +219,10 @@ const wchar_t* HolyDataDir(void) {
 
 int HolyIsOffline(void) {
   return holy::rt::state().offline ? 1 : 0;
+}
+
+int HolyHasLocalUser(void) {
+  return holy::rt::state().local_user ? 1 : 0;
 }
 
 volatile int64_t* HolyCounter(const char* name) {

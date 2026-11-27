@@ -35,6 +35,10 @@ struct LaunchOptions {
   // Offline (default): the title sees a host without network connectivity.
   bool offline = true;
 
+  // A local user is present (a profile of this host, signed in to no
+  // service); off by default: nobody is present.
+  bool local_user = false;
+
   UnimplementedPolicy unimplemented = UnimplementedPolicy::Trap;
   ConsoleModel console_model = ConsoleModel::SeriesX;
   uint32_t timeout_ms = 0;  // 0 waits until the title exits

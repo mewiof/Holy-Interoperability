@@ -43,6 +43,9 @@ constexpr GUID kCore = {0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xe
 constexpr GUID kNetworkingProvider = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
 constexpr GUID kNetworking = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
 constexpr GUID kUser = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
+constexpr GUID kUserGamertag = {0xcef4fac0, 0x7676, 0x4a94, {0xa1, 0x19, 0x4c, 0x43, 0xf9, 0xeb, 0x5b, 0x74}};
+constexpr GUID kGameSaveProvider = {0x704c3f58, 0xe629, 0x4cc2, {0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2}};
+constexpr GUID kGameSave = {0x1bfff3af, 0xf14a, 0x40a3, {0x8e, 0x35, 0x9a, 0xda, 0x90, 0x65, 0x93, 0xf9}};
 constexpr GUID kAnalytics = {0xb884675d, 0xb738, 0x4a9c, {0x81, 0x5d, 0x9a, 0x9a, 0x1e, 0x0c, 0x6c, 0x9b}};
 constexpr GUID kIdentityProvider = {0xe349bd1a, 0xfc20, 0x4e40, {0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f}};
 constexpr GUID kIdentity = {0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}};
@@ -214,7 +217,168 @@ void test_networking() {
   release(networking);
 }
 
+// Game saves of the local user: a container written, enumerated and read
+// back synchronously and asynchronously, a blob deleted, the container
+// deleted (documented XGameSave calls, slots in XGameSave.h order).
+void test_game_saves(void* user_handle) {
+  void* saves = query(kGameSaveProvider, kGameSave);
+  check(saves != nullptr, "the game save service is available");
+  if (!saves) return;
+  void* provider = nullptr;
+  HRESULT hr = call<HRESULT>(saves, 3, user_handle, "sample-configuration", false, &provider);
+  check(hr == S_OK && provider, "a game save provider opens for the local user");
+  if (!provider) return release(saves);
+  call<HRESULT>(saves, 10, provider, "Sample/Container A");  // what an earlier run left
+  void* container = nullptr;
+  hr = call<HRESULT>(saves, 16, provider, "Sample/Container A", &container);
+  void* update = nullptr;
+  if (container) hr = call<HRESULT>(saves, 23, container, "Sample save", &update);
+  const uint8_t first[5] = {1, 2, 3, 4, 5};
+  const char second[] = "the second blob";
+  if (update) {
+    call<HRESULT>(saves, 25, update, "first", first, sizeof(first));
+    call<HRESULT>(saves, 25, update, "Second", reinterpret_cast<const uint8_t*>(second), sizeof(second));
+    hr = call<HRESULT>(saves, 27, update);
+    call<void>(saves, 24, update);
+  }
+  check(container && update && hr == S_OK, "an update writing two blobs is submitted");
+  struct BlobInfo {
+    const char* name;
+    uint32_t size;
+  };
+  struct Blob {
+    BlobInfo info;
+    uint8_t* data;
+  };
+  struct Seen {
+    int count = 0;
+    uint32_t sizes = 0;
+  } seen;
+  using BlobCallback = bool(CALLBACK*)(const BlobInfo*, void*);
+  const BlobCallback count_blob = [](const BlobInfo* info, void* context) {
+    auto* s = static_cast<Seen*>(context);
+    ++s->count;
+    s->sizes += info->size;
+    return true;
+  };
+  if (container) call<HRESULT>(saves, 18, container, &seen, count_blob);
+  check(seen.count == 2 && seen.sizes == sizeof(first) + sizeof(second), "the container's blobs are enumerated");
+  struct ContainerInfo {
+    const char* name;
+    const char* display_name;
+    uint32_t blob_count;
+    uint64_t total_size;
+    int64_t last_modified;
+    bool needs_sync;
+  };
+  struct Found {
+    bool found = false;
+    uint32_t blobs = 0;
+    bool named = false;
+  } found;
+  using ContainerCallback = bool(CALLBACK*)(const ContainerInfo*, void*);
+  const ContainerCallback note = [](const ContainerInfo* info, void* context) {
+    auto* f = static_cast<Found*>(context);
+    f->found = true;
+    f->blobs = info->blob_count;
+    f->named = std::strcmp(info->name, "Sample/Container A") == 0 && std::strcmp(info->display_name, "Sample save") == 0;
+    return true;
+  };
+  call<HRESULT>(saves, 13, provider, "Sample/Container A", &found, note);
+  check(found.found && found.blobs == 2 && found.named, "the container's information names it and counts its blobs");
+  // Both blobs, read synchronously: the documented layout fits the sizes
+  // titles compute (the blob array, then each blob's data and name).
+  const char* names[2] = {"first", "Second"};
+  uint8_t buffer[2 * sizeof(Blob) + sizeof(first) + 6 + sizeof(second) + 7] = {};
+  uint32_t count = 2;
+  hr = container ? call<HRESULT>(saves, 20, container, names, &count, sizeof(buffer), reinterpret_cast<Blob*>(buffer))
+                 : E_FAIL;
+  const auto* blobs = reinterpret_cast<const Blob*>(buffer);
+  check(hr == S_OK && count == 2 && blobs[0].info.size == sizeof(first) &&
+            std::memcmp(blobs[0].data, first, sizeof(first)) == 0 && std::strcmp(blobs[1].info.name, "Second") == 0 &&
+            std::memcmp(blobs[1].data, second, sizeof(second)) == 0,
+        "blobs are read back as written");
+  // The second again, asynchronously.
+  AsyncBlock read{};
+  const char* one[1] = {"Second"};
+  uint8_t again[sizeof(Blob) + sizeof(second) + 7] = {};
+  uint32_t got = 0;
+  if (container) {
+    call<HRESULT>(saves, 21, container, one, 1u, &read);
+    call<HRESULT>(g_core, kAsyncGetStatus, &read, true);
+    hr = call<HRESULT>(saves, 22, &read, sizeof(again), reinterpret_cast<Blob*>(again), &got);
+  }
+  const auto* async_blob = reinterpret_cast<const Blob*>(again);
+  check(hr == S_OK && got == 1 && std::memcmp(async_blob->data, second, sizeof(second)) == 0 &&
+            std::strcmp(async_blob->info.name, "Second") == 0,
+        "a blob is read back asynchronously");
+  // A missing blob, a deleted blob, a deleted container.
+  const char* missing[1] = {"missing"};
+  count = 1;
+  hr = container ? call<HRESULT>(saves, 20, container, missing, &count, sizeof(buffer), reinterpret_cast<Blob*>(buffer))
+                 : E_FAIL;
+  check(hr == static_cast<HRESULT>(0x80830008), "reading a missing blob reports that it is not found");
+  update = nullptr;
+  if (container) call<HRESULT>(saves, 23, container, "Sample save", &update);
+  if (update) {
+    call<HRESULT>(saves, 26, update, "first");
+    AsyncBlock submit{};
+    call<HRESULT>(saves, 28, update, &submit);
+    call<HRESULT>(g_core, kAsyncGetStatus, &submit, true);
+    hr = call<HRESULT>(saves, 29, &submit);
+    call<void>(saves, 24, update);
+  }
+  seen = Seen{};
+  if (container) call<HRESULT>(saves, 18, container, &seen, count_blob);
+  check(hr == S_OK && seen.count == 1, "an update deleting a blob is submitted asynchronously");
+  if (container) call<void>(saves, 17, container);
+  AsyncBlock removal{};
+  call<HRESULT>(saves, 11, provider, "Sample/Container A", &removal);
+  call<HRESULT>(g_core, kAsyncGetStatus, &removal, true);
+  hr = call<HRESULT>(saves, 12, &removal);
+  found = Found{};
+  call<HRESULT>(saves, 14, provider, &found, note);
+  check(hr == S_OK && !found.found, "a deleted container is gone");
+  call<void>(saves, 6, provider);
+  release(saves);
+}
+
+void test_local_user() {
+  void* user = query(kUser, kUser);
+  check(user != nullptr, "the user service is available");
+  if (!user) return;
+  AsyncBlock block{};
+  call<HRESULT>(user, 7, 1u, &block);  // AddDefaultUserSilently
+  call<HRESULT>(g_core, kAsyncGetStatus, &block, true);
+  void* handle = nullptr;
+  HRESULT hr = call<HRESULT>(user, 8, &block, &handle);
+  check(hr == S_OK && handle, "with a local user, adding the default user silently gives it");
+  if (!handle) return release(user);
+  uint64_t local_id = 0, id = 0;
+  bool guest = true;
+  uint32_t state = 7;
+  call<HRESULT>(user, 9, handle, &local_id);
+  call<HRESULT>(user, 11, handle, &id);
+  call<HRESULT>(user, 13, handle, &guest);
+  call<HRESULT>(user, 14, handle, &state);
+  check(local_id != 0 && id != 0 && !guest && state == 0, "the local user has ids, is no guest, and is signed in");
+  void* gamertag = query(kUser, kUserGamertag);
+  char name[16] = {};
+  size_t used = 0;
+  hr = gamertag ? call<HRESULT>(gamertag, 3, handle, 0u, sizeof(name), name, &used) : E_FAIL;
+  check(hr == S_OK && std::strcmp(name, "Player") == 0 && used == 7, "the local user's gamertag is Player");
+  release(gamertag);
+  bool has = true;
+  uint32_t reasons = 0;
+  hr = call<HRESULT>(user, 20, handle, 0u, 254u, &has, &reasons);  // multiplayer
+  check(hr == S_OK && !has && reasons != 0, "the local user has no privileges of online services");
+  test_game_saves(handle);
+  call<void>(user, 4, handle);
+  release(user);
+}
+
 void test_user() {
+  if (g_expect_local_user) return test_local_user();
   void* user = query(kUser, kUser);
   check(user != nullptr, "the user service is available");
   if (!user) return;

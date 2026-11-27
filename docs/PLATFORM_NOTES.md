@@ -618,9 +618,25 @@ Notes describe the platform, never a title.
   levels 3 and 4 as online and wait for `networkInitialized`). Offline: initialised, level 1 (none). With the
   host network: the host's `GetNetworkConnectivityHint`, whose enumerations have the same values. Change
   notifications register and never fire.
-- Users: nobody is signed in. `AddDefaultUserSilently` completes with the documented
+- Users: by default nobody is signed in. `AddDefaultUserSilently` completes with the documented
   `E_GAMEUSER_NO_DEFAULT_USER` (`0x89245106`); a request that would show the account picker completes with
-  `E_ABORT`, the result of a dismissed picker (*assumed* closest answer: there is no picker).
+  `E_ABORT`, the result of a dismissed picker (*assumed* closest answer: there is no picker). *Observed*: titles
+  then wait at their account prompt (a console always has a user). With `holy run --user local` one local user is
+  present: a profile of this host, signed in to no service, the default user and the one the picker picks; not a
+  guest, an adult, named `Player`, with an id stable per host and title that identifies neither (a hash, like the
+  device ids). Privileges (all of them online services') are denied as restricted; no tokens are issued.
+- *observed*: the gamertag comes from a second interface of the user provider,
+  `cef4fac0-7676-4a94-a119-4c43f9eb5b74` slot 3, with the documented arguments of `XUserGetGamertag` with a
+  component (its only thunk passes the handle, a 32-bit component, a size, a buffer and the size used).
+- *observed*: game saves are interface `1bfff3af-f14a-40a3-8e35-9ada906593f9` (provider
+  `704c3f58-e629-4cc2-b197-30511b996fe2`), slots in the order of the documented `XGameSave.h` declarations from
+  3 (`XGameSaveInitializeProvider`) to 29 (`XGameSaveSubmitUpdateResult`): every slot the reference title calls
+  has a thunk whose argument count and widths match the declaration (slot 21's blob count is 32 bits, slot 4's
+  flag 8). Titles open a provider with their service configuration id right after the user appears.
+  Implementation: saves are files in the data directory, `saves\<user id>\<configuration>\<container>\<blob>`
+  (names encoded so any name is a file name and case stays distinct); an update's writes go to temporary files
+  that replace the blobs when submitted; reads lay blobs out as documented (the `XGameSaveBlob` array, then each
+  blob's data and name). Nothing is synchronised; the quota is 256 MiB (*assumed*).
 - System: analytics info reports the host's Windows version for both versions and family `Windows.Xbox`,
   form `Xbox Series X` or `Xbox Series S` per `--console` (*assumed* spellings, after documented examples).
   The title id is the manifest's `TitleId`. The sandbox is `RETAIL`. Device ids are stable per host and

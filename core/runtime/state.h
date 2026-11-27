@@ -15,6 +15,7 @@ struct State {
   uint32_t title_size = 0;
   bool trap_unimplemented = true;
   bool offline = true;  // network switch: offline unless the launcher allows the host network
+  bool local_user = false;  // a local user is present (signed in to no service)
   uint32_t console_model = 0;  // holy::ConsoleModel value reported to the title
   std::wstring runtime_dir;
   ProviderContext providers;

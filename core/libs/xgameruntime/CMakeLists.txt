@@ -5,6 +5,7 @@ holy_add_system_library(holy_lib_xgameruntime
   SOURCES
     core_interface.cpp
     display.cpp
+    game_save.cpp
     local_storage.cpp
     networking.cpp
     package.cpp

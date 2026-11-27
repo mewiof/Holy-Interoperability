@@ -39,6 +39,7 @@ holy run <package-dir> [options] [-- <title arguments>]
 | `--no-sandbox` | do not lower the title's integrity level |
 | `--console <series-x\|series-s>` | console model reported to the title; default `series-x` |
 | `--network <offline\|host>` | `offline` (default): the title sees a disconnected network; `host`: it may use the host's |
+| `--user <none\|local>` | `none` (default): nobody is signed in; `local`: a local user is present, a profile of this host signed in to no service (titles wait at their account prompt without one). Its game saves are kept in the data directory's `saves` folder |
 | `--unimplemented <trap\|continue>` | what a call into an unimplemented import does; default `trap` |
 | `--trace <patterns>` | comma separated import-library patterns to trace, e.g. `xmem.dll,d3d12*` |
 | `--log-level <level>` | `trace`, `debug`, `info` (default), `warn`, `error` |

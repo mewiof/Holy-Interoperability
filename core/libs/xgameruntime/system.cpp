@@ -110,8 +110,10 @@ HRESULT STDMETHODCALLTYPE get_xbox_title_id(Object*, uint32_t* title_id) {
   return S_OK;
 }
 
-// SHA-256 of the host's machine id and the title id.
-bool device_digest(uint8_t (&digest)[32]) {
+}  // namespace
+
+// SHA-256 of `purpose`, the host's machine id and the title id.
+bool host_title_digest(const char* purpose, uint8_t (&digest)[32]) {
   wchar_t machine[64] = {};
   DWORD size = sizeof(machine);
   if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography", L"MachineGuid", RRF_RT_REG_SZ, nullptr,
@@ -119,12 +121,18 @@ bool device_digest(uint8_t (&digest)[32]) {
     return false;
   }
   const package::Manifest* m = manifest();
-  std::string input = "holy-interop-device-id:";
+  std::string input = purpose;
   for (const wchar_t* c = machine; *c; ++c) input += static_cast<char>(*c);
   input += ':';
   if (m) input += m->title_id;
   return BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, reinterpret_cast<PUCHAR>(input.data()),
                     static_cast<ULONG>(input.size()), digest, sizeof(digest)) >= 0;
+}
+
+namespace {
+
+bool device_digest(uint8_t (&digest)[32]) {
+  return host_title_digest("holy-interop-device-id:", digest);
 }
 
 HRESULT copy_string(const std::string& value, size_t size, char* buffer, size_t* used) {

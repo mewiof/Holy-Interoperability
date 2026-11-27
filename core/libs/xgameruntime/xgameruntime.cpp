@@ -119,6 +119,7 @@ void register_services() {
   register_speech();
   register_system();
   register_user();
+  register_game_save();
 }
 
 }  // namespace holy::xgr

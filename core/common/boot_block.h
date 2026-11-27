@@ -33,6 +33,7 @@ enum BootFlags : uint32_t {
   kBootTrapUnimplemented = 1u << 0,  // terminate on the first call to an unimplemented import
   kBootSandboxed = 1u << 1,          // informational: the process runs at low integrity
   kBootOffline = 1u << 2,            // the title sees a host without network connectivity
+  kBootLocalUser = 1u << 3,          // a local user is present, signed in to no service
 };
 
 struct BootBlock {

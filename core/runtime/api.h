@@ -87,6 +87,10 @@ HOLYRT_API const wchar_t* HolyDataDir(void);
 // network connectivity.
 HOLYRT_API int HolyIsOffline(void);
 
+// Non-zero when a local user is present: a profile of this host that is
+// signed in to no service (holy run --user local).
+HOLYRT_API int HolyHasLocalUser(void);
+
 // Named process-wide counters for measurement and leak checks (live objects,
 // bytes held, events), reported with the process's memory at a fixed interval
 // and when the process ends. Returns the stable cell for `name` ("component.what"),

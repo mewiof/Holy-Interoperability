@@ -54,7 +54,8 @@ provider interfaces obtained from `QueryApiImpl`.
   change events, system analytics info and device identity, title id, package identity and installation
   state, persistent local storage, HDR mode, speech synthesis (the host's speech engine; it refuses to speak in
   the low-integrity sandbox, so synthesis there returns the host's error).
-- open: the rest of the user service, game saves, store queries.
+- done: a local user (holy run --user local) and game saves in the data directory.
+- open: store queries.
 - Policy for services with no local equivalent: the runtime does not sign users in to anything, does not
   emulate online services, and never reports ownership of add-on content.
 

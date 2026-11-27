@@ -45,6 +45,8 @@ void print_usage() {
       "      --console <model>     console model reported to the title: series-x (default), series-s\n"
       "      --network <mode>      offline (default): the title sees a disconnected host;\n"
       "                            host: the title may use the host's network\n"
+      "      --user <none|local>   none (default): nobody is present; local: a local user, signed\n"
+      "                            in to no service, is present\n"
       "      --unimplemented <trap|continue>\n"
       "                            what a call into an unimplemented import does (default: trap)\n"
       "      --trace <patterns>    comma separated import library patterns to trace, e.g. xmem.dll,d3d12*\n"
@@ -257,6 +259,16 @@ int cmd_run(const std::vector<std::wstring>& args) {
         options.offline = false;
       else {
         std::fprintf(stderr, "--network expects offline or host\n");
+        return kUsage;
+      }
+    } else if (arg == L"--user") {
+      if (!value(L"--user", text)) return kUsage;
+      if (text == L"none")
+        options.local_user = false;
+      else if (text == L"local")
+        options.local_user = true;
+      else {
+        std::fprintf(stderr, "--user expects none or local\n");
         return kUsage;
       }
     } else if (arg == L"--console") {

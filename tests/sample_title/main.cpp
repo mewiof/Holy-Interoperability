@@ -59,6 +59,7 @@ int g_failures = 0;
 }  // namespace
 
 bool g_expect_online = false;
+bool g_expect_local_user = false;
 
 void check(bool ok, const char* what) {
   std::printf("  [%s] %s\n", ok ? "ok" : "FAILED", what);
@@ -708,6 +709,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR command_line, int) {
   test_console_identity();
   test_virtual_memory();
   g_expect_online = command_line && std::strstr(command_line, "--expect-online");
+  g_expect_local_user = command_line && std::strstr(command_line, "--expect-local-user");
   test_game_runtime();
   test_input();
   test_physical_pages();

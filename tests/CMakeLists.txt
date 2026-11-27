@@ -102,6 +102,9 @@ set_tests_properties(e2e.run_unsandboxed PROPERTIES PASS_REGULAR_EXPRESSION "SAM
 add_test(NAME e2e.run_online COMMAND holy run "${HOLY_SAMPLE_DIR}" --network host --timeout 60 -- --expect-online)
 set_tests_properties(e2e.run_online PROPERTIES PASS_REGULAR_EXPRESSION "SAMPLE TITLE: PASS")
 
+add_test(NAME e2e.run_local_user COMMAND holy run "${HOLY_SAMPLE_DIR}" --user local --timeout 60 -- --expect-local-user)
+set_tests_properties(e2e.run_local_user PROPERTIES PASS_REGULAR_EXPRESSION "SAMPLE TITLE: PASS")
+
 add_test(NAME e2e.unimplemented_traps COMMAND holy run "${HOLY_SAMPLE_DIR}" --timeout 60 -- --call-missing)
 set_tests_properties(e2e.unimplemented_traps PROPERTIES
   PASS_REGULAR_EXPRESSION "unimplemented import holy_sample_missing.dll!HolySampleMissingFunction")

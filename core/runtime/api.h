@@ -41,6 +41,9 @@ HOLYRT_API void HolyDescribeAddress(const void* address, char* buffer, size_t si
 // cannot commit a title's memory pool up front.
 HOLYRT_API void HolyCommitOnDemand(void* base, size_t size, uint32_t protect);
 
+// The range at `base` (registered with HolyCommitOnDemand) was released.
+HOLYRT_API void HolyCommitOnDemandReleased(void* base, size_t size);
+
 // Commits the on-demand parts of a buffer before it is handed to the kernel.
 // Returns non-zero on success.
 HOLYRT_API int HolyEnsureCommitted(const void* address, size_t size);
@@ -64,6 +67,15 @@ HOLYRT_API const wchar_t* HolyDataDir(void);
 // Non-zero while the offline switch is on: the title must see a host without
 // network connectivity.
 HOLYRT_API int HolyIsOffline(void);
+
+// Named process-wide counters for measurement and leak checks (live objects,
+// bytes held, events), reported with the process's memory at a fixed interval
+// and when the process ends. Returns the stable cell for `name` ("component.what"),
+// created at zero on first use; update it with interlocked operations.
+HOLYRT_API volatile int64_t* HolyCounter(const char* name);
+
+// Logs the statistics report now.
+HOLYRT_API void HolyLogStats(const char* reason);
 
 // Non-zero if the runtime interposes `symbol` when a title imports it from a
 // host system library. Lets tools predict binding without running anything.

@@ -115,9 +115,15 @@ void* allocate_pages(SIZE_T size, SIZE_T alignment) {
 
 bool free_pages(void* address) {
   AcquireSRWLockExclusive(&g_lock);
-  const bool known = page_allocations().erase(address) != 0;
+  auto found = page_allocations().find(address);
+  const bool known = found != page_allocations().end();
+  const SIZE_T size = known ? found->second : 0;
+  if (known) page_allocations().erase(found);
   ReleaseSRWLockExclusive(&g_lock);
-  if (known) VirtualFree(address, 0, MEM_RELEASE);
+  if (known) {
+    VirtualFree(address, 0, MEM_RELEASE);
+    HolyCommitOnDemandReleased(address, size);
+  }
   return known;
 }
 

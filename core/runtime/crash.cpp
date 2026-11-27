@@ -1,4 +1,5 @@
 #include "core/runtime/crash.h"
+#include "core/runtime/stats.h"
 
 #include <atomic>
 
@@ -105,6 +106,7 @@ LONG WINAPI unhandled_filter(EXCEPTION_POINTERS* info) {
   log_exception("unhandled", info);
   log_registers(info->ContextRecord);
   walk_stack(info->ContextRecord);
+  log_stats("at the unhandled exception");
   if (const LPTOP_LEVEL_EXCEPTION_FILTER title_filter = g_title_filter.load()) {
     LOG_ERROR(kComponent, "passing the exception to the title's own filter");
     return title_filter(info);
@@ -130,6 +132,7 @@ void log_title_exit(const char* how, unsigned code) {
   CONTEXT context{};
   RtlCaptureContext(&context);
   walk_stack(&context);
+  log_stats("at exit");
   SetLastError(saved_error);
 }
 

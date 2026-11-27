@@ -14,6 +14,7 @@
 #include "core/runtime/hooks.h"
 #include "core/runtime/memory.h"
 #include "core/runtime/state.h"
+#include "core/runtime/stats.h"
 
 namespace holy::rt {
 namespace {
@@ -99,6 +100,7 @@ void boot() {
 
   install_crash_handlers();
   install_commit_on_demand();
+  start_stats_reports(10000);
   install_cpu_compatibility();
   bind_title_imports(image_base, s.title_size, {g_boot.original_import_rva, g_boot.original_import_size});
   restore_directories(image_base, g_boot);
@@ -163,6 +165,10 @@ void HolyCommitOnDemand(void* base, size_t size, uint32_t protect) {
   holy::rt::register_commit_on_demand(base, size, protect);
 }
 
+void HolyCommitOnDemandReleased(void* base, size_t size) {
+  holy::rt::note_release(base, size);
+}
+
 void HolySetBackingHook(HolyBackingHook hook) {
   holy::rt::set_backing_hook(hook);
 }
@@ -188,6 +194,14 @@ const wchar_t* HolyDataDir(void) {
 
 int HolyIsOffline(void) {
   return holy::rt::state().offline ? 1 : 0;
+}
+
+volatile int64_t* HolyCounter(const char* name) {
+  return holy::rt::counter(name);
+}
+
+void HolyLogStats(const char* reason) {
+  holy::rt::log_stats(reason ? reason : "requested");
 }
 
 int HolyHasOverride(const char* library, const char* symbol) {

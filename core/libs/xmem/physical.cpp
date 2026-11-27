@@ -54,6 +54,29 @@ namespace {
 constexpr ULONG_PTR kPage = 0x10000;
 constexpr uint64_t kChunk = 1ull << 30;
 
+// Statistics (the runtime's report): storage the sections hold (committed or
+// only reserved), pages handed out, pages with storage, granules with a view.
+const holy::lib::Counter& c_section_committed() {
+  static const holy::lib::Counter c("xmem.physical_committed_bytes");
+  return c;
+}
+const holy::lib::Counter& c_section_reserved() {
+  static const holy::lib::Counter c("xmem.physical_reserved_bytes");
+  return c;
+}
+const holy::lib::Counter& c_pages_live() {
+  static const holy::lib::Counter c("xmem.physical_pages");
+  return c;
+}
+const holy::lib::Counter& c_pages_stored() {
+  static const holy::lib::Counter c("xmem.physical_pages_stored");
+  return c;
+}
+const holy::lib::Counter& c_granules_backed() {
+  static const holy::lib::Counter c("xmem.physical_views");
+  return c;
+}
+
 struct Section {
   HANDLE handle = nullptr;
   bool committed = false;
@@ -165,6 +188,7 @@ int32_t create_section(uint64_t bytes) {
   }
   section.owner.assign(static_cast<size_t>(bytes / kPage), 0);
   section.used.assign(static_cast<size_t>(bytes / kPage), false);
+  (section.committed ? c_section_committed() : c_section_reserved()).add(static_cast<int64_t>(bytes));
   sections().push_back(std::move(section));
   return static_cast<int32_t>(sections().size() - 1);
 }
@@ -210,6 +234,7 @@ bool materialize(ULONG_PTR id, uintptr_t granule) {
         page.section = region->chunks[chunk];
         page.index = slot;
         page.committed = section.committed;
+        c_pages_stored().add(1);
         return true;
       }
     }
@@ -223,6 +248,7 @@ bool materialize(ULONG_PTR id, uintptr_t granule) {
   page.section = own;
   page.index = 0;
   page.committed = sections()[own].committed;
+  c_pages_stored().add(1);
   return true;
 }
 
@@ -297,6 +323,7 @@ void release_if_unused(Page& page) {
   if (page.live || page.maps != 0 || page.section < 0) return;
   sections()[page.section].owner[page.index] = 0;
   page.section = -1;
+  c_pages_stored().add(-1);
 }
 
 void unmap_granule(uintptr_t granule) {
@@ -311,6 +338,7 @@ void unmap_granule(uintptr_t granule) {
     mapped().erase(found);
     return;
   }
+  c_granules_backed().add(-1);
   const auto unmap = kernelbase<UnmapViewOfFile2Fn>("UnmapViewOfFile2");
   if (unmap) unmap(GetCurrentProcess(), reinterpret_cast<void*>(granule), kMemPreservePlaceholder);
   mapped().erase(found);
@@ -374,6 +402,7 @@ bool back_granule(uintptr_t granule, ULONG_PTR id) {
     }
   }
   mapped()[granule] = id;
+  c_granules_backed().add(1);
   return true;
 }
 
@@ -487,6 +516,7 @@ HOLY_EXPORT BOOL XMemAllocatePhysicalPages(uint64_t attributes, ULONG_PTR* count
   const ULONG_PTR first = pages().size() + 1;  // ids start at 1
   pages().resize(pages().size() + requested, Page{-1, 0, true, false});
   unlock();
+  c_pages_live().add(static_cast<int64_t>(requested));
   for (ULONG_PTR i = 0; i < requested; ++i) page_array[i] = to_frame(first + i);
   LIB_LOG(holy::lib::kDebug, "xmem", "allocated %llu physical pages (attributes 0x%llx)",
           static_cast<unsigned long long>(requested), static_cast<unsigned long long>(attributes));
@@ -548,6 +578,7 @@ HOLY_EXPORT BOOL XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* page_array) {
     if (id == 0 || id > pages().size() || !pages()[id - 1].live) continue;
     Page& page = pages()[id - 1];
     page.live = false;
+    c_pages_live().add(-1);
     // The storage becomes free for a fresh page once no mapping shows it.
     release_if_unused(page);
   }

@@ -205,7 +205,34 @@ BOOL WINAPI hook_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, 
   const DWORD error = GetLastError();
   ensure_committed(buffer, size);
   SetLastError(error);
+  const BOOL ok = ReadFile(file, buffer, size, read, overlapped);
+  if (ok || GetLastError() != ERROR_NOACCESS) return ok;
+  // Memory remembered as committed that is not (decommitted some way this
+  // runtime did not see): asked again, then read again.
+  ensure_committed(buffer, size, true);
+  SetLastError(error);
   return ReadFile(file, buffer, size, read, overlapped);
+}
+
+// The title frees memory: what commit on demand remembers of it is
+// forgotten.
+BOOL WINAPI hook_VirtualFree(LPVOID address, SIZE_T size, DWORD type) {
+  SIZE_T extent = size;
+  if ((type & MEM_RELEASE) && size == 0 && address) {
+    // The whole allocation goes: its extent, before it does.
+    MEMORY_BASIC_INFORMATION info;
+    auto at = static_cast<uint8_t*>(address);
+    while (VirtualQuery(at, &info, sizeof(info)) && info.AllocationBase == address && info.State != MEM_FREE) {
+      at = static_cast<uint8_t*>(info.BaseAddress) + info.RegionSize;
+    }
+    extent = static_cast<SIZE_T>(at - static_cast<uint8_t*>(address));
+  }
+  const BOOL ok = VirtualFree(address, size, type);
+  const DWORD error = GetLastError();
+  if (ok && (type & MEM_DECOMMIT)) note_decommit(address, size);
+  if (ok && (type & MEM_RELEASE)) note_release(address, extent);
+  SetLastError(error);
+  return ok;
 }
 
 BOOL WINAPI hook_GetDiskFreeSpaceExW(LPCWSTR directory, PULARGE_INTEGER available, PULARGE_INTEGER total,
@@ -440,6 +467,7 @@ const Override kOverrides[] = {
     HOLY_OVERRIDE(MoveFileExW),
     HOLY_OVERRIDE(GetDiskFreeSpaceExW),
     HOLY_OVERRIDE(ReadFile),
+    HOLY_OVERRIDE(VirtualFree),
     HOLY_OVERRIDE(fopen),
     HOLY_OVERRIDE(_wfopen),
     HOLY_OVERRIDE(_wstat64),

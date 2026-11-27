@@ -20,8 +20,15 @@ namespace holy::rt {
 void install_commit_on_demand();
 void register_commit_on_demand(void* base, size_t size, DWORD protect);
 // Commits the parts of [address, address + size) that are registered and not
-// yet committed. Returns false if the host refused to commit them.
-bool ensure_committed(const void* address, size_t size);
+// yet committed. Returns false if the host refused to commit them. Which
+// chunks are committed is remembered; `verify` asks the host again (after a
+// kernel call reported an access to the buffer as an error anyway).
+bool ensure_committed(const void* address, size_t size, bool verify = false);
+
+// The title decommitted or released [address, address + size): what was
+// committed there is forgotten (and released ranges unregistered).
+void note_decommit(const void* address, size_t size);
+void note_release(const void* address, size_t size);
 
 // A library's hook that backs lazily mapped memory (see HolySetBackingHook);
 // ensure_committed calls it first.

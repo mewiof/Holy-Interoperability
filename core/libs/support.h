@@ -1,6 +1,8 @@
 // Shared helpers for the console library implementations.
 #pragma once
 
+#include <intrin.h>
+
 #include <cstdint>
 
 #include "core/runtime/api.h"
@@ -14,6 +16,26 @@ inline constexpr uint32_t kDebug = 1;
 inline constexpr uint32_t kInfo = 2;
 inline constexpr uint32_t kWarn = 3;
 inline constexpr uint32_t kError = 4;
+}  // namespace holy::lib
+
+namespace holy::lib {
+// A named counter of the runtime's statistics report (HolyCounter): live
+// objects, bytes held or events. Cheap enough for every call site; keep one
+// per name in a static.
+class Counter {
+ public:
+  explicit Counter(const char* name) : cell_(HolyCounter(name)) {}
+  void add(int64_t delta) const {
+    if (cell_) _InterlockedExchangeAdd64(cell_, delta);
+  }
+  void set(int64_t value) const {
+    if (cell_) _InterlockedExchange64(cell_, value);
+  }
+  int64_t value() const { return cell_ ? *cell_ : 0; }
+
+ private:
+  volatile int64_t* cell_;
+};
 }  // namespace holy::lib
 
 #define LIB_LOG(level, component, ...)                                 \

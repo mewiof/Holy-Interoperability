@@ -335,6 +335,25 @@ void test_deferred_commit() {
   const bool zero = pool[0] == 0 && pool[(256ull << 20) - 1] == 0;
   pool[(128ull << 20) + 7] = 0x42;
   check(zero && pool[(128ull << 20) + 7] == 0x42, "large commits read as zero and accept writes");
+  // File reads into untouched memory of the pool, and into memory the title
+  // decommitted after the runtime committed it (the kernel does not fault
+  // such memory in; the runtime commits it first).
+  {
+    wchar_t self[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    const HANDLE file = CreateFileW(self, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    unsigned char* target = pool + (220ull << 20) + 0x1000;
+    DWORD got = 0;
+    const bool first = file != INVALID_HANDLE_VALUE && ReadFile(file, target, 0x30000, &got, nullptr) && got > 2 &&
+                       target[0] == 'M' && target[1] == 'Z';
+    check(first, "file reads into memory committed on first touch succeed");
+    const bool decommitted = VirtualFree(pool + (220ull << 20), 0x20000, MEM_DECOMMIT) != FALSE;
+    SetFilePointer(file, 0, nullptr, FILE_BEGIN);
+    got = 0;
+    const bool second = decommitted && ReadFile(file, target, 0x30000, &got, nullptr) && got > 2 && target[0] == 'M';
+    check(second, "file reads into on-demand memory the title decommitted succeed");
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+  }
   // A page array in untouched memory of the pool.
   auto* ids = reinterpret_cast<ULONG_PTR*>(pool + (200ull << 20));
   ULONG_PTR count = 1;

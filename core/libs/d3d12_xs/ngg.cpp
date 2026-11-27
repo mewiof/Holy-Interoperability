@@ -8,17 +8,11 @@
 #include "core/libs/d3d12_xs/bindings.h"
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/forward.h"
-#include "core/libs/d3d12_xs/pipeline_stream.h"
+#include "core/libs/d3d12_xs/pipeline_cache.h"
 #include "core/libs/support.h"
 
 namespace holy::d3d12 {
 namespace {
-
-std::mutex g_lock;
-std::map<const void*, NggPipeline>& pipelines() {
-  static auto* map = new std::map<const void*, NggPipeline>();
-  return *map;
-}
 
 // Scratch memory: GPU buffers handed to host lists in blocks; a list's blocks
 // return to the pool when the list is reset (its submissions done).
@@ -98,16 +92,11 @@ uint64_t scratch(Device* device, HostList* host, uint64_t bytes) {
 
 }  // namespace
 
-void register_ngg_pipeline(const void* graphics, void* compute, const NggInfo& info) {
-  std::lock_guard<std::mutex> guard(g_lock);
-  pipelines()[graphics] = NggPipeline{compute, info};
-}
-
-const NggPipeline* ngg_pipeline(const void* graphics) {
-  if (!graphics) return nullptr;
-  std::lock_guard<std::mutex> guard(g_lock);
-  auto found = pipelines().find(graphics);
-  return found == pipelines().end() ? nullptr : &found->second;
+bool ngg_pipeline(const void* graphics, NggPipeline* out) {
+  const Pipeline* pipeline = as_pipeline(graphics);
+  if (!pipeline || !pipeline->ngg_compute) return false;
+  *out = NggPipeline{pipeline->ngg_compute, pipeline->ngg};
+  return true;
 }
 
 void release_ngg_scratch(HostList* host) {

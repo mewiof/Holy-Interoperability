@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "core/libs/d3d12_xs/forward.h"
+#include "core/libs/d3d12_xs/pipeline_cache.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/d3d12_xs/shader_container.h"
 #include "core/libs/d3d12_xs/shader_dump.h"
@@ -90,8 +91,7 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
   *pipeline = nullptr;
   const auto* stream = static_cast<const uint8_t*>(desc->pPipelineStateSubobjectStream);
   std::vector<uint8_t> copy(stream, stream + desc->SizeInBytes);
-  std::vector<std::vector<uint8_t>> shaders;  // rebuilt containers kept alive until creation
-  shaders.reserve(8);
+  std::vector<ProgramRef> shaders;  // in subobject order
   std::string summary;
   // Native-only shaders found: subobject type, where its description sits.
   std::vector<std::pair<uint32_t, size_t>> native;
@@ -161,8 +161,8 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
           continue;
         }
         desktop_shader = true;
-        shaders.push_back(std::move(rebuilt));
-        const D3D12_SHADER_BYTECODE host{shaders.back().data(), shaders.back().size()};
+        const D3D12_SHADER_BYTECODE host{nullptr, rebuilt.size()};  // the program is patched in when compiling
+        shaders.push_back(intern_program(std::move(rebuilt)));
         std::memcpy(copy.data() + inner, &host, sizeof(host));
       }
     }
@@ -171,7 +171,7 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
   bool translated = false;
   if (!native.empty()) {
     // Vertex and pixel shaders with native code only are translated.
-    std::vector<uint8_t> vs, ps;
+    ProgramRef vs, ps;
     ShaderInterface vs_link, ps_link;
     bool have_vs = false, have_ps = false;
     for (const auto& [type, inner] : native) {
@@ -208,7 +208,7 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
                 static_cast<unsigned long long>(shader_hash(bytecode.pShaderBytecode, bytecode.BytecodeLength)));
         return E_INVALIDARG;
       }
-      std::vector<uint8_t>& out = vertex ? vs : ps;
+      ProgramRef& out = vertex ? vs : ps;
       if (!native_program(bytecode.pShaderBytecode, bytecode.BytecodeLength, &program) ||
           !translate_graphics_cached(program.block.data() + program.code_offset, program.block.size() - program.code_offset,
                               vertex ? GraphicsStage::Vertex : GraphicsStage::Pixel, &out,
@@ -232,9 +232,9 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
       return E_INVALIDARG;
     }
     for (const auto& [type, inner] : native) {
-      std::vector<uint8_t>& out = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ? vs : ps;
+      ProgramRef& out = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ? vs : ps;
+      const D3D12_SHADER_BYTECODE host{nullptr, out->size()};  // patched in when compiling
       shaders.push_back(std::move(out));
-      const D3D12_SHADER_BYTECODE host{shaders.back().data(), shaders.back().size()};
       std::memcpy(copy.data() + inner, &host, sizeof(host));
     }
     ID3D12RootSignature* root = translated_root_signature(device);
@@ -252,315 +252,12 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
   return hr;
 }
 
-// --- recipes: how graphics pipelines were made, to derive others from them ---
-
-namespace {
-
-struct Recipe {
-  std::vector<uint8_t> stream;  // the host stream (host root signature, host bytecode)
-  // What the stream points at, shared by recipes derived from this one.
-  std::shared_ptr<std::vector<std::vector<uint8_t>>> blobs;
-  std::shared_ptr<std::vector<D3D12_INPUT_ELEMENT_DESC>> elements;
-  std::shared_ptr<std::vector<std::string>> names;
-  bool translated = false;
-};
-
-std::mutex g_recipe_lock;
-std::map<const void*, std::shared_ptr<Recipe>>& recipes() {
-  static auto* map = new std::map<const void*, std::shared_ptr<Recipe>>();
-  return *map;
-}
-
-// Calls `visit(type, inner offset, size)` for each subobject; false if the
-// stream holds a type that is not a desktop one.
-template <typename Visit>
-bool walk(const std::vector<uint8_t>& stream, Visit visit) {
-  for (size_t at = 0; at + 4 <= stream.size();) {
-    uint32_t type;
-    std::memcpy(&type, stream.data() + at, 4);
-    SubobjectLayout layout;
-    if (!layout_of(type, &layout)) return false;
-    const size_t inner = align_up(at + 4, layout.align);
-    if (inner + layout.size > stream.size()) return false;
-    visit(type, inner, layout.size);
-    at = align_up(inner + layout.size, sizeof(void*));
-  }
-  return true;
-}
-
-// Takes copies of what the stream points at in title memory (the input
-// layout); false if it points at title memory the recipe cannot copy
-// (stream output, view instancing).
-bool own_pointers(Recipe* recipe) {
-  bool ok = true;
-  recipe->elements = std::make_shared<std::vector<D3D12_INPUT_ELEMENT_DESC>>();
-  recipe->names = std::make_shared<std::vector<std::string>>();
-  walk(recipe->stream, [&](uint32_t type, size_t inner, size_t) {
-    if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
-      D3D12_INPUT_LAYOUT_DESC layout;
-      std::memcpy(&layout, recipe->stream.data() + inner, sizeof(layout));
-      if (!layout.NumElements || !layout.pInputElementDescs) return;
-      recipe->names->reserve(layout.NumElements);
-      for (UINT i = 0; i < layout.NumElements; ++i) {
-        recipe->names->push_back(layout.pInputElementDescs[i].SemanticName ? layout.pInputElementDescs[i].SemanticName
-                                                                           : "");
-      }
-      for (UINT i = 0; i < layout.NumElements; ++i) {
-        D3D12_INPUT_ELEMENT_DESC e = layout.pInputElementDescs[i];
-        e.SemanticName = (*recipe->names)[i].c_str();
-        recipe->elements->push_back(e);
-      }
-      layout.pInputElementDescs = recipe->elements->data();
-      std::memcpy(recipe->stream.data() + inner, &layout, sizeof(layout));
-    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT) {
-      D3D12_STREAM_OUTPUT_DESC so;
-      std::memcpy(&so, recipe->stream.data() + inner, sizeof(so));
-      if (so.NumEntries) ok = false;
-    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING) {
-      D3D12_VIEW_INSTANCING_DESC vi;
-      std::memcpy(&vi, recipe->stream.data() + inner, sizeof(vi));
-      if (vi.ViewInstanceCount) ok = false;
-    }
-  });
-  return ok;
-}
-
-// --- host compilation in the background ---------------------------------------------
-//
-// Observed: titles create hundreds of pipelines on worker threads during
-// start-up from program data that stays valid only for a while, relying on
-// creation being as quick as on the console; created slowly, later pipelines
-// are built from data that has already been replaced. So creation returns
-// once its inputs are copied and translated (translations are kept by code
-// hash), and the host compile runs on a small thread pool; uses of the
-// pipeline go through pipeline_host, which waits for it. A compile the host
-// refuses is reported when it happens; the pipeline then has no host object
-// and its draws are dropped and reported.
-
-struct Compile {
-  Device* device;
-  std::shared_ptr<Recipe> recipe;
-  Wrapper* wrapper;
-  HANDLE done;
-};
-
-std::mutex g_compile_lock;
-std::map<const Wrapper*, HANDLE>& compiles() {
-  static auto* map = new std::map<const Wrapper*, HANDLE>();
-  return *map;
-}
-
-// Observed host behaviour: compiling several very large translated programs
-// at once makes the host driver refuse some with E_OUTOFMEMORY. Programs
-// above kHeavyProgram bytes compile one at a time, and a refusal for lack of
-// memory is retried once that way.
-constexpr size_t kHeavyProgram = 256 * 1024;
-std::mutex g_heavy_compile;
-
-void CALLBACK compile_pipeline(PTP_CALLBACK_INSTANCE, void* context) {
-  auto* job = static_cast<Compile*>(context);
-  ID3D12Device2* device2 = nullptr;
-  ID3D12PipelineState* state = nullptr;
-  HRESULT hr = job->device->host->QueryInterface(IID_PPV_ARGS(&device2));
-  if (SUCCEEDED(hr)) {
-    size_t program_bytes = 0;
-    if (job->recipe->blobs) {
-      for (const auto& blob : *job->recipe->blobs) program_bytes += blob.size();
-    }
-    const D3D12_PIPELINE_STATE_STREAM_DESC host_desc{job->recipe->stream.size(), job->recipe->stream.data()};
-    if (program_bytes > kHeavyProgram) {
-      std::lock_guard<std::mutex> guard(g_heavy_compile);
-      hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
-    } else {
-      hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
-      if (hr == E_OUTOFMEMORY) {
-        std::lock_guard<std::mutex> guard(g_heavy_compile);
-        hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
-      }
-    }
-    device2->Release();
-  }
-  if (FAILED(hr) || !state) {
-    discard_host_caches_after_run(hr);
-    LIB_LOG(lib::kError, "d3d12", "the host refused pipeline %p (0x%08lX)", static_cast<void*>(job->wrapper),
-            static_cast<unsigned long>(hr));
-  }
-  InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&job->wrapper->host), state);
-  SetEvent(job->done);
-  // The job's reference.
-  reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(Wrapper*)>(job->wrapper->vtable[2])(job->wrapper);
-  delete job;
-}
-
-HRESULT create_from_recipe(Device* device, std::shared_ptr<Recipe> recipe, const lib::VtableInfo* info,
-                           void* const* vtable, void** pipeline) {
-  Wrapper* wrapper = wrap(nullptr, info, vtable);
-  if (recipe->translated) wrapper->flags = kTranslatedPipeline;
-  wrapper->refs.fetch_add(1);  // held by the compile job
-  const HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  {
-    std::lock_guard<std::mutex> guard(g_compile_lock);
-    compiles()[wrapper] = done;
-  }
-  auto* job = new Compile{device, recipe, wrapper, done};
-  {
-    std::lock_guard<std::mutex> guard(g_recipe_lock);
-    recipes()[wrapper] = std::move(recipe);
-  }
-  static PTP_CALLBACK_ENVIRON environment = [] {
-    // A third of the host's processors: compiles must not take the
-    // processor from the title's own start-up work, but titles create
-    // pipelines by the thousand while loading.
-    auto* env = new TP_CALLBACK_ENVIRON();
-    InitializeThreadpoolEnvironment(env);
-    PTP_POOL pool = CreateThreadpool(nullptr);
-    if (!pool) return static_cast<PTP_CALLBACK_ENVIRON>(nullptr);
-    SYSTEM_INFO system{};
-    GetSystemInfo(&system);
-    const DWORD threads = system.dwNumberOfProcessors / 3 > 3 ? system.dwNumberOfProcessors / 3 : 3;
-    SetThreadpoolThreadMaximum(pool, threads);
-    SetThreadpoolThreadMinimum(pool, 1);
-    SetThreadpoolCallbackPool(env, pool);
-    return env;
-  }();
-  if (!environment || !TrySubmitThreadpoolCallback(&compile_pipeline, job, environment)) compile_pipeline(nullptr, job);
-  if (HolyLogEnabled(lib::kDebug)) {
-    std::shared_ptr<Recipe> kept;
-    {
-      std::lock_guard<std::mutex> guard(g_recipe_lock);
-      kept = recipes()[wrapper];
-    }
-    if (kept && kept->blobs) label_pipeline(wrapper, *kept->blobs);
-  }
-  *pipeline = wrapper;
-  return S_OK;
-}
-
-}  // namespace
-
-void stream_append(std::vector<uint8_t>* stream, uint32_t type, const void* data, size_t size) {
-  SubobjectLayout layout{size, 4};
-  layout_of(type, &layout);
-  stream->resize(align_up(stream->size(), sizeof(void*)), 0);
-  const size_t at = stream->size();
-  const size_t inner = align_up(at + 4, layout.align);
-  stream->resize(align_up(inner + layout.size, sizeof(void*)), 0);
-  std::memcpy(stream->data() + at, &type, 4);
-  std::memcpy(stream->data() + inner, data, size < layout.size ? size : layout.size);
-}
-
-HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream,
-                                 std::vector<std::vector<uint8_t>> blobs, bool translated,
-                                 const lib::VtableInfo* info, void* const* vtable, void** pipeline) {
-  auto recipe = std::make_shared<Recipe>();
-  recipe->stream = std::move(stream);
-  recipe->blobs = std::make_shared<std::vector<std::vector<uint8_t>>>(std::move(blobs));
-  recipe->translated = translated;
-  if (!own_pointers(recipe.get())) {
-    // Not derivable; created all the same.
-    ID3D12Device2* device2 = nullptr;
-    if (FAILED(device->host->QueryInterface(IID_PPV_ARGS(&device2)))) return E_NOINTERFACE;
-    const D3D12_PIPELINE_STATE_STREAM_DESC host_desc{recipe->stream.size(), recipe->stream.data()};
-    ID3D12PipelineState* state = nullptr;
-    const HRESULT hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
-    device2->Release();
-    if (FAILED(hr)) return hr;
-    Wrapper* wrapper = wrap(state, info, vtable);
-    if (translated) wrapper->flags = kTranslatedPipeline;
-    if (HolyLogEnabled(lib::kDebug)) label_pipeline(wrapper, *recipe->blobs);
-    *pipeline = wrapper;
-    return S_OK;
-  }
-  return create_from_recipe(device, std::move(recipe), info, vtable, pipeline);
-}
-
-// Observed: device slot 55 takes (base pipeline, count, entries, interface
-// id, out) and returns an HRESULT. Entries are 0x14C bytes: a type dword and
-// a desktop description: 0 D3D12_DEPTH_STENCIL_DESC, 1 D3D12_RASTERIZER_DESC,
-// 2 D3D12_BLEND_DESC (field for field from how titles fill them). Type 5 is
-// written next to a depth-stencil entry with zero depth fields and the same
-// stencil masks; its meaning is not established and it is not applied.
-// The result is the base pipeline with those parts replaced.
-HRESULT create_derived_pipeline(Device* device, const void* base, uint32_t count, const uint8_t* entries,
-                                const lib::VtableInfo* info, void* const* vtable, void** pipeline,
-                                const void* caller) {
-  if (!pipeline) return E_POINTER;
-  *pipeline = nullptr;
-  std::shared_ptr<Recipe> from;
-  {
-    std::lock_guard<std::mutex> guard(g_recipe_lock);
-    auto found = recipes().find(base);
-    if (found != recipes().end()) from = found->second;
-  }
-  if (!from) {
-    LIB_LOG(lib::kError, "d3d12", "derived pipeline from %p, whose making was not recorded", base);
-    HolyUnimplementedFrom(kLibrary, "pipeline derived from an unrecorded pipeline", caller);
-    return E_NOTIMPL;
-  }
-  auto recipe = std::make_shared<Recipe>(*from);
-  constexpr size_t kEntryBytes = 0x14C;
-  for (uint32_t i = 0; i < count; ++i) {
-    const uint8_t* entry = entries + i * kEntryBytes;
-    uint32_t kind;
-    std::memcpy(&kind, entry, 4);
-    uint32_t types[2] = {0, 0};
-    size_t size = 0;
-    switch (kind) {
-      case 0:
-        types[0] = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
-        types[1] = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;
-        size = sizeof(D3D12_DEPTH_STENCIL_DESC);
-        break;
-      case 1:
-        types[0] = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
-        size = sizeof(D3D12_RASTERIZER_DESC);
-        break;
-      case 2:
-        types[0] = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND;
-        size = sizeof(D3D12_BLEND_DESC);
-        break;
-      default:
-        LIB_LOG(lib::kDebug, "d3d12", "derived pipeline entry of type %u not applied", kind);
-        continue;
-    }
-    bool replaced = false;
-    walk(recipe->stream, [&](uint32_t type, size_t inner, size_t) {
-      if (type == types[0] || (types[1] && type == types[1])) {
-        std::memcpy(recipe->stream.data() + inner, entry + 4, size);
-        replaced = true;
-      }
-    });
-    if (!replaced) stream_append(&recipe->stream, types[0], entry + 4, size);
-  }
-  const HRESULT hr = create_from_recipe(device, recipe, info, vtable, pipeline);
-  LIB_LOG(FAILED(hr) ? lib::kError : lib::kDebug, "d3d12", "derived pipeline from %p with %u entries -> 0x%08lX",
-          base, count, static_cast<unsigned long>(hr));
-  return hr;
-}
-
-ID3D12PipelineState* pipeline_host(const void* pipeline) {
-  if (!pipeline) return nullptr;
-  auto* wrapper = static_cast<const Wrapper*>(pipeline);
-  void* host = InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(const_cast<IUnknown**>(&wrapper->host)),
-                                                 nullptr, nullptr);
-  if (host) return static_cast<ID3D12PipelineState*>(host);
-  HANDLE done = nullptr;
-  {
-    std::lock_guard<std::mutex> guard(g_compile_lock);
-    auto found = compiles().find(wrapper);
-    if (found != compiles().end()) done = found->second;
-  }
-  if (!done) return nullptr;
-  WaitForSingleObject(done, INFINITE);
-  return static_cast<ID3D12PipelineState*>(
-      InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(const_cast<IUnknown**>(&wrapper->host)),
-                                        nullptr, nullptr));
-}
-
-bool translate_graphics_cached(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,
+bool translate_graphics_cached(const uint8_t* code, size_t size, GraphicsStage stage, ProgramRef* program,
                                ShaderInterface* link, std::string* error, const ShaderInterface* consumer) {
+  // Translations by native code hash, stage and consumer; the programs
+  // themselves are held by the pipelines using them (pipeline_cache.h).
   struct Entry {
-    std::vector<uint8_t> dxbc;
+    std::weak_ptr<const Program> program;
     ShaderInterface link;
   };
   static std::mutex lock;
@@ -571,48 +268,30 @@ bool translate_graphics_cached(const uint8_t* code, size_t size, GraphicsStage s
     std::lock_guard<std::mutex> guard(lock);
     auto found = cache->find(key);
     if (found != cache->end()) {
-      *dxbc = found->second.dxbc;
-      *link = found->second.link;
-      return true;
+      if (ProgramRef held = found->second.program.lock()) {
+        *program = std::move(held);
+        *link = found->second.link;
+        return true;
+      }
     }
   }
+  std::vector<uint8_t> dxbc;
   const uint64_t disk_key = graphics_translation_key(code, size, stage, consumer).value();
-  if (!load_translation(disk_key, dxbc, link)) {
-    if (!translate_graphics(code, size, stage, dxbc, link, error, consumer)) return false;
-    store_translation(disk_key, *dxbc, link);
+  bool on_disk = load_translation(disk_key, &dxbc, link);
+  if (!on_disk) {
+    if (!translate_graphics(code, size, stage, &dxbc, link, error, consumer)) return false;
+    on_disk = store_translation(disk_key, dxbc, link);
   }
-  if (HolyLogEnabled(lib::kDebug)) dump_shader(code, size, stage == GraphicsStage::Vertex ? "vertex" : "pixel");
-  LIB_LOG(lib::kDebug, "d3d12", "native %s program %016llx -> host %016llx",
-          stage == GraphicsStage::Vertex ? "vertex" : "pixel", static_cast<unsigned long long>(std::get<0>(key)),
-          static_cast<unsigned long long>(shader_hash(dxbc->data(), dxbc->size())));
+  if (HolyLogEnabled(lib::kDebug)) {
+    dump_shader(code, size, stage == GraphicsStage::Vertex ? "vertex" : "pixel");
+    LIB_LOG(lib::kDebug, "d3d12", "native %s program %016llx -> host %016llx",
+            stage == GraphicsStage::Vertex ? "vertex" : "pixel", static_cast<unsigned long long>(std::get<0>(key)),
+            static_cast<unsigned long long>(shader_hash(dxbc.data(), dxbc.size())));
+  }
+  *program = intern_program(std::move(dxbc), on_disk ? disk_key : 0);
   std::lock_guard<std::mutex> guard(lock);
-  (*cache)[key] = Entry{*dxbc, *link};
+  (*cache)[key] = Entry{*program, *link};
   return true;
-}
-
-namespace {
-std::mutex g_label_lock;
-std::unordered_map<const void*, std::wstring>& labels() {
-  static auto* map = new std::unordered_map<const void*, std::wstring>();
-  return *map;
-}
-}  // namespace
-
-void label_pipeline(const void* pipeline, const std::vector<std::vector<uint8_t>>& host_programs) {
-  std::wstring label = L"host";
-  for (const auto& program : host_programs) {
-    wchar_t text[24];
-    std::swprintf(text, 24, L" %016llx", static_cast<unsigned long long>(shader_hash(program.data(), program.size())));
-    label += text;
-  }
-  std::lock_guard<std::mutex> guard(g_label_lock);
-  labels()[pipeline] = std::move(label);
-}
-
-std::wstring pipeline_label(const void* pipeline) {
-  std::lock_guard<std::mutex> guard(g_label_lock);
-  auto found = labels().find(pipeline);
-  return found == labels().end() ? std::wstring() : found->second;
 }
 
 }  // namespace holy::d3d12

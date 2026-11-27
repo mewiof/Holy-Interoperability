@@ -41,6 +41,67 @@
 #include "core/libs/support.h"
 
 namespace holy::d3d12 {
+
+namespace {
+
+// Frame statistics for the runtime's report: presents (their rate is the
+// frame rate), the longest gap between presents in the last ten seconds,
+// gaps longer than two display periods at 30 frames a second, and the host
+// GPU's memory use.
+void count_present(ID3D12Device* device) {
+  static const lib::Counter presents("d3d12.presents");
+  static const lib::Counter slowest("d3d12.frame_gap_max_ms");
+  static const lib::Counter hitches("d3d12.frame_gaps_over_50ms");
+  static const lib::Counter local("d3d12.vram_local_mb");
+  static const lib::Counter non_local("d3d12.vram_non_local_mb");
+  static LARGE_INTEGER frequency = [] {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return f;
+  }();
+  static LARGE_INTEGER last{}, window{};
+  static int64_t window_max = 0;
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  presents.add(1);
+  if (last.QuadPart) {
+    const int64_t gap_ms = (now.QuadPart - last.QuadPart) * 1000 / frequency.QuadPart;
+    if (gap_ms > 50) hitches.add(1);
+    if (now.QuadPart - window.QuadPart > frequency.QuadPart * 10) {
+      window = now;
+      window_max = 0;
+    }
+    if (gap_ms > window_max) {
+      window_max = gap_ms;
+      slowest.set(gap_ms);
+    }
+  } else {
+    window = now;
+  }
+  last = now;
+  static IDXGIAdapter3* adapter = [device] {
+    IDXGIAdapter3* found = nullptr;
+    IDXGIFactory4* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+      factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&found));
+      factory->Release();
+    }
+    return found;
+  }();
+  static uint64_t queried = 0;
+  if (adapter && presents.value() - static_cast<int64_t>(queried) >= 30) {
+    queried = static_cast<uint64_t>(presents.value());
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+      local.set(static_cast<int64_t>(info.CurrentUsage >> 20));
+    }
+    if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) {
+      non_local.set(static_cast<int64_t>(info.CurrentUsage >> 20));
+    }
+  }
+}
+
+}  // namespace
 namespace {
 
 constexpr UINT kBuffers = 3;
@@ -420,6 +481,7 @@ HRESULT present_x(CommandQueue* queue, uint32_t plane_count, const PresentPlane*
   }
   Presenter* p = g_presenter;
   ++p->presents;
+  count_present(queue->device->host);
   const uint64_t token = planes[0].token;
   if (ensure_swap_chain(p, format, width, height)) {
     LIB_LOG(lib::kDebug, "d3d12", "present %llu: window %p%s%s", static_cast<unsigned long long>(p->presents),

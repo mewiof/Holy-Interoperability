@@ -453,6 +453,7 @@ HRESULT STDMETHODCALLTYPE create_root_signature(Device* self, UINT, const void* 
     return hr;
   }
   Wrapper* wrapper = wrap(host, &kRootSignatureInfo, kRootSignatureVtable.data());
+  register_root_signature_hash(host, shader_hash(blob, size));
   ID3D12VersionedRootSignatureDeserializer* reader = nullptr;
   if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&reader)))) {
     const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
@@ -649,9 +650,8 @@ HRESULT STDMETHODCALLTYPE pipeline_set_private_data_interface(Wrapper* self, REF
   ID3D12PipelineState* host = pipeline_host(self);
   return host ? host->SetPrivateDataInterface(guid, data) : E_FAIL;
 }
-HRESULT STDMETHODCALLTYPE pipeline_set_name(Wrapper* self, LPCWSTR name) {
-  ID3D12PipelineState* host = pipeline_host(self);
-  return host ? host->SetName(name) : E_FAIL;
+HRESULT STDMETHODCALLTYPE pipeline_set_name_x(Wrapper* self, LPCWSTR name) {
+  return pipeline_set_name(self, name);
 }
 HRESULT STDMETHODCALLTYPE pipeline_get_cached_blob(Wrapper* self, ID3DBlob** blob) {
   ID3D12PipelineState* host = pipeline_host(self);
@@ -660,10 +660,11 @@ HRESULT STDMETHODCALLTYPE pipeline_get_cached_blob(Wrapper* self, ID3DBlob** blo
 
 const auto kPipelineVtable = [] {
   auto table = make_forwarding_vtable(3);
+  table[2] = reinterpret_cast<void*>(&pipeline_release);
   table[3] = reinterpret_cast<void*>(&pipeline_get_private_data);
   table[4] = reinterpret_cast<void*>(&pipeline_set_private_data);
   table[5] = reinterpret_cast<void*>(&pipeline_set_private_data_interface);
-  table[6] = reinterpret_cast<void*>(&pipeline_set_name);
+  table[6] = reinterpret_cast<void*>(&pipeline_set_name_x);
   table[7] = reinterpret_cast<void*>(&get_device_of_child);
   table[8] = reinterpret_cast<void*>(&pipeline_get_cached_blob);
   return table;
@@ -711,6 +712,10 @@ ID3D12RootSignature* translated_root_signature(Device* device) {
     hr = device->host->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
                                            IID_PPV_ARGS(&device->translated_root));
   }
+  if (SUCCEEDED(hr)) {
+    register_root_signature_hash(device->translated_root,
+                                 shader_hash(blob->GetBufferPointer(), blob->GetBufferSize()));
+  }
   if (FAILED(hr)) {
     LIB_LOG(lib::kError, "d3d12", "root signature for translated pipelines: 0x%08lX", static_cast<unsigned long>(hr));
   }
@@ -732,7 +737,7 @@ HRESULT create_compute_pipeline_from_code(Device* self, const uint8_t* code, siz
   const uint64_t key = compute_translation_key(code, size, info).value();
   const bool cached = load_translation(key, &bytecode, nullptr);
   const bool translated = cached || translate_compute(code, size, info, &bytecode, &error);
-  if (translated && !cached) store_translation(key, bytecode, nullptr);
+  const bool on_disk = cached || (translated && store_translation(key, bytecode, nullptr));
   if (!translated) {
     dump_shader(dump, dump_size, "compute");
     LIB_LOG(lib::kError, "d3d12", "native compute shader not translatable: %s", error.c_str());
@@ -751,13 +756,12 @@ HRESULT create_compute_pipeline_from_code(Device* self, const uint8_t* code, siz
   }
   // The host compile runs in the background, as for graphics pipelines
   // (pipeline_stream.cpp): titles create pipelines by the thousand.
-  std::vector<std::vector<uint8_t>> blobs;
-  blobs.push_back(std::move(bytecode));
   std::vector<uint8_t> stream;
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, sizeof(root));
-  const D3D12_SHADER_BYTECODE cs{blobs[0].data(), blobs[0].size()};
+  const D3D12_SHADER_BYTECODE cs{nullptr, bytecode.size()};  // patched in when compiling
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &cs, sizeof(cs));
-  return create_recorded_pipeline(self, std::move(stream), std::move(blobs), true, &kPipelineInfo,
+  std::vector<ProgramRef> programs{intern_program(std::move(bytecode), on_disk ? key : 0)};
+  return create_recorded_pipeline(self, std::move(stream), std::move(programs), true, &kPipelineInfo,
                                   kPipelineVtable.data(), pipeline);
 }
 
@@ -825,7 +829,7 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline_state_x(Device* self, const D3
     dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
     return hr;
   }
-  *pipeline = wrap(state, &kPipelineInfo, kPipelineVtable.data());
+  *pipeline = wrap_host_pipeline(state, false, &kPipelineInfo, kPipelineVtable.data());
   return S_OK;
 }
 
@@ -948,9 +952,9 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
     HolyUnimplementedFrom(kLibrary, ("graphics pipeline from native code: " + error).c_str(), _ReturnAddress());
     return E_NOTIMPL;
   }
-  std::vector<uint8_t> vs, ps;
+  ProgramRef vs, ps;
   ShaderInterface vs_link, ps_link;
-  auto translate = [&](const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* bytecode,
+  auto translate = [&](const uint8_t* code, size_t size, GraphicsStage stage, ProgramRef* bytecode,
                        ShaderInterface* link, const ShaderInterface* consumer = nullptr) {
     if (translate_graphics_cached(code, size, stage, bytecode, link, &error, consumer)) return true;
     dump_shader(code, size, "native graphics");
@@ -964,11 +968,12 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   // (ngg.h).
   const bool ngg = native_ngg_program(native.vertex_code, native.vertex_size);
   NggInfo ngg_info;
-  void* ngg_compute = nullptr;
+  ProgramRef ngg_program;  // the compute pass's program
   if (ngg) {
     std::vector<uint8_t> cs;
     const uint64_t key = ngg_translation_key(native.vertex_code, native.vertex_size).value();
-    if (!load_translation(key, &cs, &vs_link, &ngg_info)) {
+    bool on_disk = load_translation(key, &cs, &vs_link, &ngg_info);
+    if (!on_disk) {
       if (!translate_ngg(native.vertex_code, native.vertex_size, &cs, &vs_link, &ngg_info, &error)) {
         dump_shader(native.vertex_code, native.vertex_size, "native graphics");
         LIB_LOG(lib::kError, "d3d12", "native NGG program %016llx not translatable: %s",
@@ -976,20 +981,11 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
         HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), _ReturnAddress());
         return E_NOTIMPL;
       }
-      store_translation(key, cs, &vs_link, &ngg_info);
+      on_disk = store_translation(key, cs, &vs_link, &ngg_info);
     }
-    ID3D12RootSignature* root = translated_root_signature(self);
-    if (!root) return E_FAIL;
-    std::vector<std::vector<uint8_t>> blobs;
-    blobs.push_back(std::move(cs));
-    std::vector<uint8_t> stream;
-    stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, sizeof(root));
-    const D3D12_SHADER_BYTECODE program{blobs[0].data(), blobs[0].size()};
-    stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &program, sizeof(program));
-    const HRESULT made = create_recorded_pipeline(self, std::move(stream), std::move(blobs), true, &kPipelineInfo,
-                                                  kPipelineVtable.data(), &ngg_compute);
-    if (FAILED(made)) return made;
-    // Written once the pixel program's attributes are known.
+    ngg_program = intern_program(std::move(cs), on_disk ? key : 0);
+    // The vertex program is written once the pixel program's attributes are
+    // known.
   } else if (!translate(native.vertex_code, native.vertex_size, GraphicsStage::Vertex, &vs, &vs_link)) {
     return E_NOTIMPL;
   }
@@ -1004,7 +1000,7 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
               ps_link.params, ps_link.half_params, vs_link.params);
       return E_INVALIDARG;
     }
-    vs = ngg_vertex_program(ngg_info.stride, ps.empty() ? 0 : ps_link.params, ps.empty() ? 0 : ps_link.half_params);
+    vs = intern_program(ngg_vertex_program(ngg_info.stride, ps ? ps_link.params : 0, ps ? ps_link.half_params : 0));
   } else if (ps_link.half_params) {
     // The vertex program again, outputting what the pixel program reads (its
     // half attributes unpacked).
@@ -1026,8 +1022,8 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   if (!root) return E_FAIL;
   D3D12_GRAPHICS_PIPELINE_STATE_DESC host{};
   host.pRootSignature = root;
-  host.VS = {vs.data(), vs.size()};
-  if (!ps.empty()) host.PS = {ps.data(), ps.size()};
+  host.VS = {nullptr, vs->size()};  // programs are patched in when compiling
+  if (ps) host.PS = {nullptr, ps->size()};
   host.BlendState.IndependentBlendEnable = TRUE;
   for (uint32_t i = 0; i < 8; ++i) {
     const uint32_t b = native.blend[i];
@@ -1064,7 +1060,7 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   std::vector<uint8_t> stream;
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &host.pRootSignature, sizeof(void*));
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &host.VS, sizeof(host.VS));
-  if (!ps.empty()) stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &host.PS, sizeof(host.PS));
+  if (ps) stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &host.PS, sizeof(host.PS));
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &host.BlendState, sizeof(host.BlendState));
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &host.SampleMask, sizeof(UINT));
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &host.RasterizerState,
@@ -1078,12 +1074,28 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   for (uint32_t i = 0; i < 8; ++i) formats.RTFormats[i] = host.RTVFormats[i];
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &formats, sizeof(formats));
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &host.SampleDesc, sizeof(host.SampleDesc));
-  std::vector<std::vector<uint8_t>> blobs;
-  blobs.push_back(std::move(vs));
-  if (!ps.empty()) blobs.push_back(std::move(ps));
-  const HRESULT hr = create_recorded_pipeline(self, std::move(stream), std::move(blobs), true, &kPipelineInfo,
+  void* ngg_compute = nullptr;
+  if (ngg) {
+    std::vector<uint8_t> compute;
+    stream_append(&compute, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, sizeof(root));
+    const D3D12_SHADER_BYTECODE program{nullptr, ngg_program->size()};  // patched in when compiling
+    stream_append(&compute, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &program, sizeof(program));
+    const HRESULT made = create_recorded_pipeline(self, std::move(compute), {ngg_program}, true, &kPipelineInfo,
+                                                  kPipelineVtable.data(), &ngg_compute);
+    if (FAILED(made)) return made;
+  }
+  std::vector<ProgramRef> programs{vs};
+  if (ps) programs.push_back(ps);
+  const HRESULT hr = create_recorded_pipeline(self, std::move(stream), std::move(programs), true, &kPipelineInfo,
                                               kPipelineVtable.data(), out);
-  if (SUCCEEDED(hr) && ngg) register_ngg_pipeline(*out, ngg_compute, ngg_info);
+  if (SUCCEEDED(hr) && ngg) {
+    // The graphics pipeline holds the compute pass's reference.
+    Pipeline* graphics = as_pipeline(*out);
+    graphics->ngg_compute = as_pipeline(ngg_compute);
+    graphics->ngg = ngg_info;
+  } else if (ngg_compute) {
+    pipeline_release(static_cast<Wrapper*>(ngg_compute));
+  }
   LIB_LOG(lib::kDebug, "d3d12",
           "native graphics pipeline: target format %u, blend 0x%08X, mode 0x%08X, vertex exports 0x%x, pixel reads "
           "0x%x -> 0x%08lX",

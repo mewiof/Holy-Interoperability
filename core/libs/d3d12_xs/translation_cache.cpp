@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cwchar>
 #include <string>
+#include <vector>
 
 #include "core/libs/support.h"
 
@@ -35,10 +36,85 @@ uint64_t library_stamp() {
   return stamp;
 }
 
-std::wstring directory() {
+std::wstring root_directory() {
   const wchar_t* data_dir = HolyDataDir();
   if (!data_dir || !*data_dir) return {};
   return std::wstring(data_dir) + L"\\translated";
+}
+
+// Deletes everything in `dir` (files and directories), then `dir` itself
+// unless it is the root.
+void remove_tree(const std::wstring& dir, bool remove_self) {
+  WIN32_FIND_DATAW entry;
+  const HANDLE find = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &entry, FindExSearchNameMatch,
+                                       nullptr, FIND_FIRST_EX_LARGE_FETCH);
+  if (find != INVALID_HANDLE_VALUE) {
+    do {
+      const std::wstring name = entry.cFileName;
+      if (name == L"." || name == L"..") continue;
+      const std::wstring path = dir + L"\\" + name;
+      if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        remove_tree(path, true);
+      } else {
+        DeleteFileW(path.c_str());
+      }
+    } while (FindNextFileW(find, &entry));
+    FindClose(find);
+  }
+  if (remove_self) RemoveDirectoryW(dir.c_str());
+}
+
+// Translations live in a directory per translator build: a rebuilt
+// translator misses every older entry, so the directories of other builds
+// (and files of the older flat layout) are deleted in the background once
+// per run.
+DWORD WINAPI remove_stale_translations(void* context) {
+  const auto* keep = static_cast<std::wstring*>(context);
+  const std::wstring root = root_directory();
+  WIN32_FIND_DATAW entry;
+  const HANDLE find = FindFirstFileExW((root + L"\\*").c_str(), FindExInfoBasic, &entry, FindExSearchNameMatch,
+                                       nullptr, FIND_FIRST_EX_LARGE_FETCH);
+  uint64_t removed = 0;
+  std::vector<std::wstring> stale_dirs;
+  if (find != INVALID_HANDLE_VALUE) {
+    do {
+      const std::wstring name = entry.cFileName;
+      if (name == L"." || name == L".." || name == *keep) continue;
+      const std::wstring path = root + L"\\" + name;
+      if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        stale_dirs.push_back(path);
+      } else if (DeleteFileW(path.c_str())) {
+        ++removed;
+      }
+    } while (FindNextFileW(find, &entry));
+    FindClose(find);
+  }
+  for (const std::wstring& dir : stale_dirs) remove_tree(dir, true);
+  if (removed || !stale_dirs.empty()) {
+    LIB_LOG(lib::kInfo, "d3d12", "removed translations of other translator builds (%llu files, %zu directories)",
+            static_cast<unsigned long long>(removed), stale_dirs.size());
+  }
+  delete keep;
+  return 0;
+}
+
+std::wstring directory() {
+  static const std::wstring dir = [] {
+    const std::wstring root = root_directory();
+    if (root.empty()) return std::wstring();
+    wchar_t name[24];
+    std::swprintf(name, 24, L"%016llx", static_cast<unsigned long long>(library_stamp()));
+    CreateDirectoryW(root.c_str(), nullptr);
+    const std::wstring mine = root + L"\\" + name;
+    CreateDirectoryW(mine.c_str(), nullptr);
+    HANDLE thread = CreateThread(nullptr, 0, &remove_stale_translations, new std::wstring(name), 0, nullptr);
+    if (thread) {
+      SetThreadPriority(thread, THREAD_PRIORITY_IDLE);
+      CloseHandle(thread);
+    }
+    return mine;
+  }();
+  return dir;
 }
 
 std::wstring path_of(uint64_t key) {
@@ -133,11 +209,10 @@ bool load_translation(uint64_t key, std::vector<uint8_t>* bytecode, ShaderInterf
   return true;
 }
 
-void store_translation(uint64_t key, const std::vector<uint8_t>& bytecode, const ShaderInterface* link,
+bool store_translation(uint64_t key, const std::vector<uint8_t>& bytecode, const ShaderInterface* link,
                        const NggInfo* ngg) {
   const std::wstring dir = directory();
-  if (dir.empty() || bytecode.empty()) return;
-  CreateDirectoryW(dir.c_str(), nullptr);
+  if (dir.empty() || bytecode.empty()) return false;
   Header header{kMagic, kVersion, key, static_cast<uint32_t>(bytecode.size()), link ? 1u : 0u, {}, {}};
   if (ngg) {
     header.ngg[0] = ngg->group;
@@ -156,7 +231,7 @@ void store_translation(uint64_t key, const std::vector<uint8_t>& bytecode, const
   const std::wstring final_path = path_of(key);
   const std::wstring temporary = final_path + L"." + std::to_wstring(GetCurrentThreadId()) + L".tmp";
   const HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-  if (file == INVALID_HANDLE_VALUE) return;
+  if (file == INVALID_HANDLE_VALUE) return false;
   DWORD written = 0;
   const bool ok = WriteFile(file, &header, sizeof(header), &written, nullptr) && written == sizeof(header) &&
                   WriteFile(file, bytecode.data(), static_cast<DWORD>(bytecode.size()), &written, nullptr) &&
@@ -164,7 +239,9 @@ void store_translation(uint64_t key, const std::vector<uint8_t>& bytecode, const
   CloseHandle(file);
   if (!ok || !MoveFileExW(temporary.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
     DeleteFileW(temporary.c_str());
+    return false;
   }
+  return true;
 }
 
 }  // namespace holy::d3d12

@@ -679,9 +679,10 @@ void STDMETHODCALLTYPE list_draw_instanced(CommandList* self, UINT vertices, UIN
   }
   g_work.draws.fetch_add(1, std::memory_order_relaxed);
   mark_work(self);
-  if (const NggPipeline* ngg = self->translated ? ngg_pipeline(self->pipeline) : nullptr) {
+  NggPipeline ngg;
+  if (self->translated && ngg_pipeline(self->pipeline, &ngg)) {
     g_work.ngg.fetch_add(1, std::memory_order_relaxed);
-    if (!draw_ngg(self, *ngg, vertices, instances, first_vertex, first_instance)) report_unbound("an NGG draw");
+    if (!draw_ngg(self, ngg, vertices, instances, first_vertex, first_instance)) report_unbound("an NGG draw");
     return;
   }
   if (self->translated) {
@@ -701,7 +702,8 @@ void STDMETHODCALLTYPE list_draw_indexed_instanced(CommandList* self, UINT indic
   }
   g_work.indexed.fetch_add(1, std::memory_order_relaxed);
   mark_work(self);
-  if (self->translated && ngg_pipeline(self->pipeline)) {
+  NggPipeline ngg;
+  if (self->translated && ngg_pipeline(self->pipeline, &ngg)) {
     static std::atomic<int> logged{0};
     if (logged.fetch_add(1) < 4) LIB_LOG(lib::kError, "d3d12", "indexed draw with an NGG pipeline: not drawn");
     return;

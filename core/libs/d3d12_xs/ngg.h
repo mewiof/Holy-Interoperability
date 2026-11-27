@@ -26,10 +26,9 @@ struct NggPipeline {
   NggInfo info;
 };
 
-// Records that `graphics` (a pipeline Wrapper) draws through `compute`.
-void register_ngg_pipeline(const void* graphics, void* compute, const NggInfo& info);
-// The NGG part of a pipeline, or null.
-const NggPipeline* ngg_pipeline(const void* graphics);
+// The NGG part of a pipeline (pipeline_cache.h, Pipeline::ngg_compute);
+// false if it has none.
+bool ngg_pipeline(const void* graphics, NggPipeline* out);
 
 // A draw of `vertices` vertex ids per instance with the list's current NGG
 // pipeline. False (logged) when it cannot be drawn.

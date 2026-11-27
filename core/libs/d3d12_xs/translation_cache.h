@@ -1,5 +1,7 @@
 // Translated programs kept on disk in the title's data directory
-// (translated/<key>.bin), so that later runs skip translating them.
+// (translated/<translator build>/<key>.bin), so that later runs skip
+// translating them. Directories of other translator builds are deleted in the
+// background when a run first uses the cache.
 //
 // A key hashes the native code, the parameters it was translated with and
 // the translator's build (translator_build): a rebuilt translator misses
@@ -32,7 +34,8 @@ TranslationKey ngg_translation_key(const uint8_t* code, size_t size);
 // The bytecode (and, for graphics stages, the stage interface) stored under
 // `key`, or false.
 bool load_translation(uint64_t key, std::vector<uint8_t>* bytecode, ShaderInterface* link, NggInfo* ngg = nullptr);
-void store_translation(uint64_t key, const std::vector<uint8_t>& bytecode, const ShaderInterface* link,
+// True once the bytecode is stored (it can be loaded again).
+bool store_translation(uint64_t key, const std::vector<uint8_t>& bytecode, const ShaderInterface* link,
                        const NggInfo* ngg = nullptr);
 
 }  // namespace holy::d3d12

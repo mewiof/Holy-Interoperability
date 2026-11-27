@@ -16,6 +16,7 @@
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/present.h"
+#include "core/libs/d3d12_xs/texture_upload.h"
 #include "core/libs/support.h"
 
 namespace holy::d3d12 {
@@ -67,6 +68,7 @@ void STDMETHODCALLTYPE queue_execute_command_lists_x(CommandQueue* self, UINT co
     }
     LIB_LOG(lib::kDebug, "d3d12", "queue type %d executes title lists%s", self->type, numbers.c_str());
   }
+  refresh_textures(self->device, self->host);
   submit_command_lists(self, count, lists);
 }
 

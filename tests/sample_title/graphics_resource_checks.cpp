@@ -630,11 +630,13 @@ void test_released_memory(void* device) {
 // all four channels, through the descriptor in the bound heap, and writes them
 // to an address passed as root constants, in memory a buffer is placed in
 // (the memory map): the whole path of translated work, from recording to the
-// GPU.
+// GPU. `after`: the texel is written after the view was made, into memory from
+// XMemVirtualAlloc, and the work is submitted a frame later (the host copy of
+// the texture follows the write).
 // The command list interface titles ask for.
 constexpr GUID kListIid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
 
-void test_compute_reads_a_texture_view(void* device, void* queue) {
+void test_compute_reads_a_texture_view(void* device, void* queue, bool after) {
   void* allocator = nullptr;
   void* list = nullptr;
   void* fence = nullptr;
@@ -679,16 +681,22 @@ void test_compute_reads_a_texture_view(void* device, void* queue) {
   pso.CS = {container.data(), container.size()};
   call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
                 __uuidof(ID3D12PipelineState), &pipeline);
-  auto* memory = static_cast<volatile uint8_t*>(VirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  auto* memory = static_cast<volatile uint8_t*>(
+      after ? XMemVirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, 0x23, PAGE_READWRITE)
+            : VirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
   if (!list || !fence || !heap || !signature || !pipeline || !memory) {
     check(false, "the objects for a compute program reading a texture view exist");
     return;
   }
   for (uint32_t i = 0; i < 0x4000; ++i) memory[i] = 0x40;
-  memory[0] = 0x10;
-  memory[1] = 0x20;
-  memory[2] = 0x30;
-  memory[3] = 0xFF;
+  // Other texels when written after the view (the address may be the one an
+  // earlier texture of the same shape had: only a fresh copy shows these).
+  const uint8_t texel_bytes[4] = {static_cast<uint8_t>(after ? 0x50 : 0x10), static_cast<uint8_t>(after ? 0x60 : 0x20),
+                                  static_cast<uint8_t>(after ? 0x70 : 0x30), static_cast<uint8_t>(after ? 0x80 : 0xFF)};
+  auto write_texel = [memory, &texel_bytes] {
+    for (int i = 0; i < 4; ++i) memory[i] = texel_bytes[i];
+  };
+  if (!after) write_texel();
   auto* output = reinterpret_cast<volatile float*>(memory + 0x10000);
   const uint64_t output_address = reinterpret_cast<uint64_t>(output);
   D3D12_RESOURCE_DESC buffer{};
@@ -719,6 +727,10 @@ void test_compute_reads_a_texture_view(void* device, void* queue) {
   view.srv.Texture2D.MipLevels = 1;
   view.address = reinterpret_cast<uint64_t>(memory);
   call<void>(device, 70, &texture, &view, call<uint64_t>(heap, 9));
+  if (after) {
+    write_texel();
+    Sleep(40);
+  }
   const uint64_t table = call<uint64_t>(heap, 10);
   const uint32_t constants[2] = {static_cast<uint32_t>(output_address), static_cast<uint32_t>(output_address >> 32)};
   void* heaps[] = {heap};
@@ -738,9 +750,11 @@ void test_compute_reads_a_texture_view(void* device, void* queue) {
   auto close_to = [](float a, float b) { return a > b - 0.002f && a < b + 0.002f; };
   const float texel[4] = {output[0], output[1], output[2], output[3]};
   std::printf("    (texel read on the GPU: %.3f %.3f %.3f %.3f)\n", texel[0], texel[1], texel[2], texel[3]);
-  check(recorded && value && *value == 1 && close_to(texel[0], 16 / 255.0f) && close_to(texel[1], 32 / 255.0f) &&
-            close_to(texel[2], 48 / 255.0f) && close_to(texel[3], 1.0f),
-        "a native compute program reads all four channels of a texture viewed in title memory");
+  check(recorded && value && *value == 1 && close_to(texel[0], texel_bytes[0] / 255.0f) &&
+            close_to(texel[1], texel_bytes[1] / 255.0f) && close_to(texel[2], texel_bytes[2] / 255.0f) &&
+            close_to(texel[3], texel_bytes[3] / 255.0f),
+        after ? "a texture written after its view shows the new texels to the GPU"
+              : "a native compute program reads all four channels of a texture viewed in title memory");
 
   if (placed) call<ULONG>(placed, 2);
   call<ULONG>(pipeline, 2);
@@ -755,7 +769,8 @@ void test_compute_reads_a_texture_view(void* device, void* queue) {
 void test_graphics_resources(void* device, void* queue) {
   test_page_mapping_update(device);
   test_released_memory(device);
-  if (queue) test_compute_reads_a_texture_view(device, queue);
+  if (queue) test_compute_reads_a_texture_view(device, queue, false);
+  if (queue) test_compute_reads_a_texture_view(device, queue, true);
   test_allocation_hooks();
   test_placeholders();
   test_descriptor_heap(device);

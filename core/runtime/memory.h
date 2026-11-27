@@ -35,6 +35,9 @@ void note_release(const void* address, size_t size);
 // The release hook (HolySetReleaseHook) and calling it.
 void set_release_hook(void (*hook)(const void* address, size_t size));
 void before_release(const void* address, size_t size);
+// The write hook (HolySetWriteHook) and calling it.
+void set_write_hook(void (*hook)(const void* address, size_t size));
+void before_write(const void* address, size_t size);
 void set_backing_hook(int (*hook)(const void* address, size_t size));
 
 }  // namespace holy::rt

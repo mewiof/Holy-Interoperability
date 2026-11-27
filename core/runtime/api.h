@@ -66,6 +66,13 @@ typedef void (*HolyReleaseHook)(const void* address, size_t size);
 HOLYRT_API void HolySetReleaseHook(HolyReleaseHook hook);
 HOLYRT_API void HolyBeforeRelease(const void* address, size_t size);
 
+// Lets a library that keeps copies of title memory (the graphics library's
+// textures) hear of writes the host does not track for it: the kernel's into
+// the title's buffers (ReadFile) and libraries' own (HolyBeforeWrite).
+typedef void (*HolyWriteHook)(const void* address, size_t size);
+HOLYRT_API void HolySetWriteHook(HolyWriteHook hook);
+HOLYRT_API void HolyBeforeWrite(const void* address, size_t size);
+
 // Translates a path as the title sees it (mounted drives, package-relative
 // paths) into a host path. Returns the length written, or 0 if `count` is too
 // small.

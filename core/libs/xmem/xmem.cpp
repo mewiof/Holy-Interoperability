@@ -43,6 +43,11 @@ constexpr SIZE_T kAllocationGranularity = 0x10000;
 // and committed on first touch (see core/runtime/memory.h): commit charge
 // follows use. Fresh pages read as zero either way.
 constexpr SIZE_T kDeferredCommit = 64ull << 20;
+// Title memory is reserved with write tracking (MEM_WRITE_WATCH): the
+// graphics library keeps host copies of textures in it current by asking
+// which pages were written (GetWriteWatch; measured: CPU and kernel writes
+// are reported, also under a GPU heap opened over the memory).
+constexpr DWORD kWriteWatch = MEM_WRITE_WATCH;
 bool commit_exhausted(DWORD error) {
   return error == ERROR_COMMITMENT_LIMIT || error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY ||
          error == ERROR_COMMITMENT_MINIMUM;
@@ -89,9 +94,9 @@ void* allocate_pages(SIZE_T size, SIZE_T alignment) {
   void* block = nullptr;
   const bool defer = size >= kDeferredCommit;
   if (alignment <= kAllocationGranularity) {
-    block = defer ? nullptr : VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    block = defer ? nullptr : VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT | kWriteWatch, PAGE_READWRITE);
     if (!block && (defer || commit_exhausted(GetLastError()))) {
-      block = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
+      block = VirtualAlloc(nullptr, size, MEM_RESERVE | kWriteWatch, PAGE_NOACCESS);
       if (block) defer_commit(block, size, PAGE_READWRITE);
     }
   } else {
@@ -103,9 +108,10 @@ void* allocate_pages(SIZE_T size, SIZE_T alignment) {
           (reinterpret_cast<uintptr_t>(probe) + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
       VirtualFree(probe, 0, MEM_RELEASE);
       block = defer ? nullptr
-                    : VirtualAlloc(reinterpret_cast<void*>(aligned), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                    : VirtualAlloc(reinterpret_cast<void*>(aligned), size, MEM_RESERVE | MEM_COMMIT | kWriteWatch,
+                                   PAGE_READWRITE);
       if (!block && (defer || commit_exhausted(GetLastError()))) {
-        block = VirtualAlloc(reinterpret_cast<void*>(aligned), size, MEM_RESERVE, PAGE_NOACCESS);
+        block = VirtualAlloc(reinterpret_cast<void*>(aligned), size, MEM_RESERVE | kWriteWatch, PAGE_NOACCESS);
         if (block) defer_commit(block, size, PAGE_READWRITE);
       }
     }
@@ -247,7 +253,7 @@ void* reserve_aligned(SIZE_T size, SIZE_T alignment, DWORD type, DWORD protect) 
 
 HOLY_EXPORT void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, uint64_t allocator_id,
                                    DWORD protect) {
-  const DWORD host_type = allocation_type & ~kConsolePageFlags;
+  DWORD host_type = allocation_type & ~kConsolePageFlags;
   DWORD host_protect = protect & ~kGraphicsProtectMask;
   if ((host_protect & 0xFF) == 0) host_protect |= PAGE_NOACCESS;
 
@@ -273,6 +279,7 @@ HOLY_EXPORT void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_
   }
 
   void* result = nullptr;
+  if (host_type & MEM_RESERVE) host_type |= kWriteWatch;
   const bool aligned_reservation = !address && (allocation_type & MEM_RESERVE) && (allocation_type & kMem4MbPages);
   const bool defer = (host_type & MEM_COMMIT) && size >= kDeferredCommit;
   if (defer) {

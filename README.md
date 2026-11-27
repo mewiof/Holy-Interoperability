@@ -53,7 +53,7 @@ flowchart LR
 | Graphics: device, resources, command recording | `██████░░░░` 55% (one memory map for translated programs; heaps released with title memory) |
 | Graphics: shader translation | `█████░░░░░` 45% (ray-intersection instructions open) |
 | Graphics: pipelines and caches | `███████░░░` 70% |
-| Graphics: correct output | `█░░░░░░░░░` 8% |
+| Graphics: correct output | `██░░░░░░░░` 15% (textures read with all four channels; texture copies follow the title's writes) |
 | Graphics: performance | `██░░░░░░░░` 15% (memory accesses: two page-table reads instead of a scan; no views written per draw) |
 | Input | `████░░░░░░` 40% |
 | Audio | `█░░░░░░░░░` 10% |

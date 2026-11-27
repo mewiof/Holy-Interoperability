@@ -204,6 +204,7 @@ BOOL WINAPI hook_MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
 BOOL WINAPI hook_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
   const DWORD error = GetLastError();
   ensure_committed(buffer, size);
+  before_write(buffer, size);  // copies of the memory go stale (memory the host does not track for them)
   SetLastError(error);
   const BOOL ok = ReadFile(file, buffer, size, read, overlapped);
   if (ok || GetLastError() != ERROR_NOACCESS) return ok;

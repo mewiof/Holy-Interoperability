@@ -430,6 +430,12 @@ Notes describe the platform, never a title.
 - *measured* host behaviour (development host): memory a heap was opened over (`OpenExistingHeapFromAddress`)
   refuses protection changes (`VirtualProtect` fails with error 87), and a heap cannot be opened over read-only
   memory (`E_INVALIDARG`): write tracking of title memory by page protection does not work where the GPU reaches it.
+  Write watching does: a heap opens over memory reserved with `MEM_WRITE_WATCH`, and `GetWriteWatch` reports the
+  CPU's and the kernel's (`ReadFile`) writes to it, heap or not (measured). xmem reserves title memory with write
+  watching; host copies of textures in it are copied again before a submission when their pages were written
+  (asked at most every 16 ms), and remapped physical pages, released memory and writes libraries announce mark them
+  too. Partial: CPU writes to memory without write watching (mapped views of physical pages, memory titles reserve
+  themselves) and GPU writes under a texture are not seen.
 - *measured* host behaviour: a buffer placed in a heap takes whole 64 KiB units of it, so title memory of less
   than 64 KiB cannot be reached by the GPU at all; `XMemAlloc` therefore takes whole 64 KiB units for page
   allocations (the title sees the size it asked for). Memory a title's own allocation hooks hand out is as the

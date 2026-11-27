@@ -12,8 +12,19 @@
 // and row-major textures only), and textures the GPU writes are only ever
 // read through views, which then find the same host texture.
 //
-// Partial: memory written after the host texture was filled is not copied
-// again; the CPU never sees what the GPU wrote into a placed texture.
+// Host textures filled from title memory are kept current: the host tracks
+// writes to title memory xmem reserved (MEM_WRITE_WATCH: CPU and kernel
+// writes), and remapped physical pages, released memory and writes libraries
+// announce (HolyBeforeWrite) are reported (texture_memory_changed). Before a
+// submission, textures over memory written since are copied again and the
+// queue waits for the copies. Tracked writes are asked about at most every
+// 16 ms, so a texture written just before a submission may show its new
+// contents a frame later. HOLY_TEXTURE_TRACKING=0 turns this off.
+//
+// Partial: the CPU's writes to memory the host does not track (mapped views
+// of physical pages, memory titles reserve without xmem) are not seen; what
+// the GPU writes into title memory under a texture is not seen; the CPU never
+// sees what the GPU wrote into a placed texture.
 #pragma once
 
 #include <d3d12.h>
@@ -42,6 +53,15 @@ void register_texture(const D3D12_RESOURCE_DESC& desc, uint64_t address, ID3D12R
 // The title released the resource: its registration goes if it is still the
 // one for that address and shape.
 void unregister_texture(const D3D12_RESOURCE_DESC& desc, uint64_t address, ID3D12Resource* texture);
+
+// [address, address + size) changed in a way the host does not track (pages
+// remapped, memory released, a library's or the kernel's write announced).
+// Safe to call under other libraries' locks.
+void texture_memory_changed(uint64_t address, uint64_t size);
+
+// Copies again the host textures whose title memory was written since they
+// were filled, and makes `queue` wait for the copies before its next work.
+void refresh_textures(Device* device, ID3D12CommandQueue* queue);
 
 // How many host textures there are and their bytes in title memory, for the log.
 void host_texture_totals(uint64_t* count, uint64_t* bytes);

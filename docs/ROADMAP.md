@@ -120,9 +120,12 @@ The largest piece.
   the first was written: textures read as their red channel). The sample title now runs a native compute program
   through the console interfaces end to end (a texture view in title memory, root tables, the memory map) and
   checks the texel it stores.
-- next: host copies of textures in title memory follow later writes. Page protection cannot watch them:
-  measured, the host refuses protection changes on memory a heap was opened over (error 87), and a heap cannot be
-  opened over read-only memory.
+- done: host copies of textures in title memory follow later writes: xmem reserves title memory with write
+  watching (page protection cannot be used: measured, the host refuses protection changes on memory a heap was
+  opened over), and textures over written pages, remapped pages and released memory are copied again before the
+  next submission. The sample title checks a texel written after its view (and fails without the tracking).
+- next: writes to physical pages through the title's views (no write watching for mapped views) and GPU writes
+  under textures.
 - done: GPU heaps over title memory are released before the title frees the memory (they kept it charged:
   measured 1 GiB over 16 rounds of 64 MiB); an end-to-end check measures it.
 - done: the page table follows the title's physical page mappings (xmem reports pages getting storage and being

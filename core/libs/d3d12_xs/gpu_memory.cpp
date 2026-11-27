@@ -13,6 +13,7 @@
 #include "core/libs/d3d12_xs/descriptors.h"
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
+#include "core/libs/d3d12_xs/texture_upload.h"
 #include "core/libs/support.h"
 
 namespace holy::d3d12 {
@@ -215,6 +216,7 @@ void observe_mapping(void*, uintptr_t granule, HANDLE section, uint64_t offset) 
   g_events.push_back({granule, section, offset});
   g_events_pending.store(true, std::memory_order_release);
   g_generation.fetch_add(1, std::memory_order_acq_rel);
+  texture_memory_changed(granule, 0x10000);  // other storage shows there now
 }
 
 using ObserveFn = void (*)(void (*)(void*, uintptr_t, HANDLE, uint64_t), void*);
@@ -303,6 +305,7 @@ const lib::Counter& c_heaps_released() {
 void release_title_memory(const void* address, size_t size) {
   const auto begin = reinterpret_cast<uintptr_t>(address);
   const uintptr_t end = begin + size;
+  texture_memory_changed(begin, size);
   std::vector<HeapRecord> retired;
   {
     std::lock_guard<std::mutex> lock(g_lock);

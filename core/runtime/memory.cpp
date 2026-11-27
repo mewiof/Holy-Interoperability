@@ -234,7 +234,17 @@ void note_release(const void* address, size_t size) {
 namespace {
 std::atomic<int (*)(const void*, size_t)> g_backing_hook{nullptr};
 std::atomic<void (*)(const void*, size_t)> g_release_hook{nullptr};
+std::atomic<void (*)(const void*, size_t)> g_write_hook{nullptr};
 }  // namespace
+
+void set_write_hook(void (*hook)(const void* address, size_t size)) {
+  g_write_hook.store(hook);
+}
+
+void before_write(const void* address, size_t size) {
+  if (!address || !size) return;
+  if (const auto hook = g_write_hook.load()) hook(address, size);
+}
 
 void set_release_hook(void (*hook)(const void* address, size_t size)) {
   g_release_hook.store(hook);

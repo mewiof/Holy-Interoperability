@@ -218,6 +218,7 @@ HRESULT read_into(File* file, uint64_t offset, void* destination, uint32_t size)
   overlapped.hEvent = event;
   ResetEvent(event);
   HolyEnsureCommitted(destination, size);
+  HolyBeforeWrite(destination, size);
   DWORD got = 0;
   BOOL ok = ReadFile(file->handle, destination, size, nullptr, &overlapped);
   if (!ok && GetLastError() == ERROR_IO_PENDING) ok = TRUE;
@@ -281,6 +282,7 @@ HRESULT enqueue_request_body(const uint8_t* request) {
     }
     if (SUCCEEDED(hr)) {
       HolyEnsureCommitted(reinterpret_cast<void*>(destination), destination_size);
+      HolyBeforeWrite(reinterpret_cast<void*>(destination), destination_size);
       size_t produced = 0;
       if (!holy::lib::zlib_inflate_into(stream, source_size, reinterpret_cast<uint8_t*>(destination), destination_size,
                                         &produced)) {

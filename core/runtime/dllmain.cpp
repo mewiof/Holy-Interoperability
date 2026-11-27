@@ -189,6 +189,14 @@ void HolyBeforeRelease(const void* address, size_t size) {
   holy::rt::before_release(address, size);
 }
 
+void HolySetWriteHook(HolyWriteHook hook) {
+  holy::rt::set_write_hook(hook);
+}
+
+void HolyBeforeWrite(const void* address, size_t size) {
+  holy::rt::before_write(address, size);
+}
+
 int HolyEnsureCommitted(const void* address, size_t size) {
   return holy::rt::ensure_committed(address, size) ? 1 : 0;
 }

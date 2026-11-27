@@ -181,6 +181,14 @@ void HolySetBackingHook(HolyBackingHook hook) {
   holy::rt::set_backing_hook(hook);
 }
 
+void HolySetReleaseHook(HolyReleaseHook hook) {
+  holy::rt::set_release_hook(hook);
+}
+
+void HolyBeforeRelease(const void* address, size_t size) {
+  holy::rt::before_release(address, size);
+}
+
 int HolyEnsureCommitted(const void* address, size_t size) {
   return holy::rt::ensure_committed(address, size) ? 1 : 0;
 }

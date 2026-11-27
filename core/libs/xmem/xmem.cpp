@@ -126,6 +126,7 @@ bool free_pages(void* address) {
   if (known) page_allocations().erase(found);
   ReleaseSRWLockExclusive(&g_lock);
   if (known) {
+    HolyBeforeRelease(address, size);
     VirtualFree(address, 0, MEM_RELEASE);
     HolyCommitOnDemandReleased(address, size);
   }

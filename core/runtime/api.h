@@ -58,6 +58,14 @@ HOLYRT_API int HolyEnsureCommitted(const void* address, size_t size);
 typedef int (*HolyBackingHook)(const void* address, size_t size);
 HOLYRT_API void HolySetBackingHook(HolyBackingHook hook);
 
+// Lets a library that keeps host objects over title memory (the graphics
+// library's heaps) let go of them before the memory is released or
+// decommitted: the title's VirtualFree, and libraries releasing title memory
+// themselves (HolyBeforeRelease), call the hook first.
+typedef void (*HolyReleaseHook)(const void* address, size_t size);
+HOLYRT_API void HolySetReleaseHook(HolyReleaseHook hook);
+HOLYRT_API void HolyBeforeRelease(const void* address, size_t size);
+
 // Translates a path as the title sees it (mounted drives, package-relative
 // paths) into a host path. Returns the length written, or 0 if `count` is too
 // small.

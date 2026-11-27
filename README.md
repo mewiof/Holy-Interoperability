@@ -38,7 +38,7 @@ flowchart LR
 | Start-up in seconds, memory within the host's means | ✅ first frame after 3 s; about 5 GiB of commit at the first frames (was 17 GiB) |
 | Frames presented at the title's pace | ✅ 30 a second, measured |
 | Runs for minutes without crashing | 🟡 five stops in the title's first seconds fixed; runs on the development host now end within 2-30 s because its system commit is exhausted (about 60 GiB still pinned by a host graphics driver leak that older builds triggered; current builds measurably do not leak, and a host restart frees it). The "invalid call" device removals in those runs follow the exhausted commit (`HOLY_D3D_CHECK` finds no call that causes them) |
-| No memory leaks (RAM, VRAM, system commit) | 🟡 live-object counters in every run; host heaps no longer leak system commit after exit, released textures free their host copies |
+| No memory leaks (RAM, VRAM, system commit) | 🟡 live-object counters in every run; host heaps no longer leak system commit after exit; released textures free their host copies; title memory the GPU used is given back when the title frees it (it stayed charged: 1 GiB over 16 rounds of 64 MiB, now none; an end-to-end check) |
 | A correct picture | ⬜ frames are black: the loading screen's three draws a frame reach no render target (every texture reads zero). Translated programs used to read zero from memory reached through pointers (a per-draw table of at most 64 pieces of memory); they now reach all title memory the runtime knows through a page table, not yet tried on the title. A per-frame call trace (`HOLY_D3D_TRACE`) is ready for what remains |
 | Menus and input | 🟡 a gamepad from the host controller or keyboard; menus not reached yet |
 | Sound | ⬜ silent audio device |

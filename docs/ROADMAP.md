@@ -116,6 +116,8 @@ The largest piece.
   at its own check when one cannot be placed; seen with the host's commit exhausted, when sections can only be
   reserved). Tiled host buffers over the pages are not possible (the host refuses tile mappings into heaps over
   existing memory, measured); translated programs already reach such pages one by one through the page table.
+- done: GPU heaps over title memory are released before the title frees the memory (they kept it charged:
+  measured 1 GiB over 16 rounds of 64 MiB); an end-to-end check measures it.
 - done: the page table follows the title's physical page mappings (xmem reports pages getting storage and being
   unmapped; a heap opened over section storage enters every title address showing it).
 - next: open heaps for physical storage the title maps before anything locates it, within the commit the host

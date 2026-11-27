@@ -422,6 +422,11 @@ Notes describe the platform, never a title.
   as the title maps and unmaps pages); descriptor heaps' GPU ranges when the heaps are made; buffers the bound tables, root views and vertex buffers name are located before the call if their page
   is not in the table yet. Partial: memory nothing has located (reached only through pointers held in memory)
   reads as zero; the ring is not fenced.
+- *measured* host behaviour (development host): memory a heap was opened over stays charged to the process after
+  the title releases it, for as long as the heap lives (16 rounds of 64 MiB placed, released and freed left
+  1,026 MiB charged). The runtime therefore lets go of heaps over title memory before the title's `VirtualFree`
+  and `XMemFree` release it (`HolySetReleaseHook`); measured: no growth over the same rounds. Titles release memory
+  once the GPU is done with it, as on the console.
 - *measured* host behaviour: a buffer placed in a heap takes whole 64 KiB units of it, so title memory of less
   than 64 KiB cannot be reached by the GPU at all; `XMemAlloc` therefore takes whole 64 KiB units for page
   allocations (the title sees the size it asked for). Memory a title's own allocation hooks hand out is as the

@@ -227,6 +227,8 @@ BOOL WINAPI hook_VirtualFree(LPVOID address, SIZE_T size, DWORD type) {
     }
     extent = static_cast<SIZE_T>(at - static_cast<uint8_t*>(address));
   }
+  // Host objects over the memory (GPU heaps) go first.
+  if (type & (MEM_RELEASE | MEM_DECOMMIT)) before_release(address, extent);
   const BOOL ok = VirtualFree(address, size, type);
   const DWORD error = GetLastError();
   if (ok && (type & MEM_DECOMMIT)) note_decommit(address, size);

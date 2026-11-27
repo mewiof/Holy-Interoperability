@@ -46,7 +46,9 @@ struct MemoryMap {
   uint32_t tables = 0;       // level 2 tables handed out
   bool failed = false;
   std::vector<Slot> slots = std::vector<Slot>(1);  // slot 0: the null view
+  std::vector<uint32_t> free_slots;                 // of released heaps, for heaps of one slot
   std::vector<DescriptorHeap*> heaps;               // shader-visible heaps holding the views
+  Device* device = nullptr;
 };
 MemoryMap g_map;  // under g_lock
 std::atomic<const uint8_t*> g_table{nullptr};
@@ -80,8 +82,16 @@ void write_slot_view(Device* device, const DescriptorHeap* heap, uint32_t slot) 
 
 // The slots of a heap's buffer (g_lock held); 0 when there are no more.
 uint32_t add_slots(Device* device, const HeapRecord& record) {
-  const uint32_t first = static_cast<uint32_t>(g_map.slots.size());
   const uint64_t count = slot_count(record.size);
+  if (count == 1 && !g_map.free_slots.empty()) {
+    const uint32_t slot = g_map.free_slots.back();
+    g_map.free_slots.pop_back();
+    g_map.slots[slot] = Slot{record.whole, 0, record.size};
+    for (const DescriptorHeap* heap : g_map.heaps) write_slot_view(device, heap, slot);
+    c_slots().add(1);
+    return slot;
+  }
+  const uint32_t first = static_cast<uint32_t>(g_map.slots.size());
   if (first + count > kMemoryViews) {
     static bool logged = false;
     if (!logged) {
@@ -274,6 +284,49 @@ const lib::Counter& c_block_commit() {
   return c;
 }
 
+const lib::Counter& c_heaps_released() {
+  static const lib::Counter c("d3d12.gpu_heaps_released");
+  return c;
+}
+
+// The title releases or decommits [address, address + size) (the runtime's
+// release hook): heaps opened over committed memory there are let go of
+// first, as the host requires, their pages leaving the page table and their
+// slots becoming null views for reuse. Titles release memory once the GPU is
+// done with it, as on the console.
+void release_title_memory(const void* address, size_t size) {
+  const auto begin = reinterpret_cast<uintptr_t>(address);
+  const uintptr_t end = begin + size;
+  std::vector<HeapRecord> retired;
+  {
+    std::lock_guard<std::mutex> lock(g_lock);
+    auto it = region_heaps().upper_bound(begin);
+    while (it != region_heaps().end() && it->second.first < end) {
+      const uintptr_t base = it->second.first;
+      const HeapRecord record = it->second.second;
+      const uint64_t slots = record.slot ? slot_count(record.size) : 0;
+      for (uint64_t page = base & ~0xFFFFull; page < base + record.size; page += 0x10000) {
+        volatile uint32_t* entry = page_entry(page, false);
+        if (entry && entry[0] >= record.slot && entry[0] < record.slot + slots) entry[0] = 0;
+      }
+      for (uint64_t i = 0; i < slots; ++i) {
+        const auto slot = static_cast<uint32_t>(record.slot + i);
+        g_map.slots[slot] = Slot{};
+        for (const DescriptorHeap* heap : g_map.heaps) write_slot_view(g_map.device, heap, slot);
+        g_map.free_slots.push_back(slot);
+      }
+      c_slots().add(-static_cast<int64_t>(slots));
+      retired.push_back(record);
+      it = region_heaps().erase(it);
+    }
+  }
+  for (const HeapRecord& record : retired) {
+    record.whole->Release();
+    record.heap->Release();
+  }
+  if (!retired.empty()) c_heaps_released().add(static_cast<int64_t>(retired.size()));
+}
+
 // The page table (g_lock held), made on first use: process memory the GPU
 // reads through a heap opened over it, as title memory, so the CPU's entries
 // are seen by work submitted after them. Returns its host GPU address.
@@ -295,6 +348,8 @@ uint64_t ensure_page_table(Device* device) {
   g_map.host_va = record.host_gpu_va;
   g_table.store(memory, std::memory_order_release);
   g_table_va.store(record.host_gpu_va, std::memory_order_release);
+  g_map.device = device;
+  HolySetReleaseHook(&release_title_memory);
   if (const auto observe = reinterpret_cast<ObserveFn>(
           GetProcAddress(GetModuleHandleW(L"xmem.dll"), "HolyXMemObserveMappings"))) {
     observe(&observe_mapping, nullptr);

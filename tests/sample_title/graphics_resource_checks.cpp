@@ -4,9 +4,11 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <windows.h>
+#include <psapi.h>
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -580,8 +582,53 @@ void test_page_mapping_update(void* device) {
 
 }  // namespace
 
+// Committed title memory the GPU used goes back to the host when the title
+// releases it: the runtime lets go of its GPU heap over the memory first.
+void test_released_memory(void* device) {
+  constexpr SIZE_T kBytes = 64ull << 20;
+  constexpr int kRounds = 16;
+  PROCESS_MEMORY_COUNTERS_EX before{}, after{};
+  PERFORMANCE_INFORMATION system_before{}, system_after{};
+  K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&before), sizeof(before));
+  K32GetPerformanceInfo(&system_before, sizeof(system_before));
+  int placed = 0;
+  for (int i = 0; i < kRounds; ++i) {
+    void* memory = VirtualAlloc(nullptr, kBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!memory) break;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = kBytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* buffer = nullptr;
+    if (call<HRESULT>(device, 133, reinterpret_cast<uint64_t>(memory), &desc, static_cast<UINT>(0xFFFFFFFF),
+                      static_cast<const void*>(nullptr), __uuidof(ID3D12Resource), &buffer) == S_OK &&
+        buffer) {
+      ++placed;
+      call<ULONG>(buffer, 2);
+    }
+    VirtualFree(memory, 0, MEM_RELEASE);
+  }
+  K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&after), sizeof(after));
+  K32GetPerformanceInfo(&system_after, sizeof(system_after));
+  check(placed == kRounds, "buffers are placed in committed title memory, round after round");
+  const int64_t process_growth = static_cast<int64_t>(after.PrivateUsage) - static_cast<int64_t>(before.PrivateUsage);
+  const int64_t system_growth = (static_cast<int64_t>(system_after.CommitTotal) -
+                                 static_cast<int64_t>(system_before.CommitTotal)) *
+                                static_cast<int64_t>(system_after.PageSize);
+  std::printf("    (released memory: process commit %+lld MiB, system commit %+lld MiB over %d rounds of %llu MiB)\n",
+              static_cast<long long>(process_growth >> 20), static_cast<long long>(system_growth >> 20), kRounds,
+              static_cast<unsigned long long>(kBytes >> 20));
+  check(process_growth < static_cast<int64_t>(4 * kBytes) && system_growth < static_cast<int64_t>(4 * kBytes),
+        "committed title memory the GPU used goes back to the host when released");
+}
+
 void test_graphics_resources(void* device) {
   test_page_mapping_update(device);
+  test_released_memory(device);
   test_allocation_hooks();
   test_placeholders();
   test_descriptor_heap(device);

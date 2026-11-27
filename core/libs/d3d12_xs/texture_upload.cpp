@@ -1,3 +1,4 @@
+#include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/texture_upload.h"
 
 #include <windows.h>
@@ -268,6 +269,7 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   ID3D12CommandList* lists[] = {up->list};
   up->queue->ExecuteCommandLists(1, lists);
   up->queue->Signal(up->fence, ++up->value);
+  check_point("texture upload");
   up->fence->SetEventOnCompletion(up->value, up->event);
   WaitForSingleObject(up->event, INFINITE);
   if (staging) staging->Release();

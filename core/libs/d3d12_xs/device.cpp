@@ -37,6 +37,7 @@
 #include "core/libs/d3d12_xs/shader_container.h"
 #include "core/libs/d3d12_xs/shader_dump.h"
 #include "core/libs/d3d12_xs/translation_cache.h"
+#include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/views.h"
 #include "core/libs/support.h"
 
@@ -44,8 +45,8 @@ namespace holy::d3d12 {
 namespace {
 
 // The title's call into a device method wrapped for exploration (`explored`
-// below), so reports name the title's code rather than the wrapper.
-thread_local const void* t_api_caller = nullptr;
+// below) or checking (call_check.h), so reports name the title's code rather
+// than the wrapper.
 #define CALLER() (t_api_caller ? t_api_caller : _ReturnAddress())
 
 const lib::VtableInfo kDeviceInfo{kLibrary, "ID3D12DeviceX"};
@@ -1146,9 +1147,10 @@ struct explored;
 template <typename... Args, HRESULT(STDMETHODCALLTYPE* Create)(Device*, Args...)>
 struct explored<Create> {
   static HRESULT STDMETHODCALLTYPE call(Device* self, Args... args) {
-    t_api_caller = _ReturnAddress();
+    const void* outer = t_api_caller;
+    if (!outer) t_api_caller = _ReturnAddress();
     const HRESULT hr = Create(self, args...);
-    t_api_caller = nullptr;
+    t_api_caller = outer;
     if (hr != E_NOTIMPL || HolyTrapsUnimplemented()) return hr;
     void** out = std::get<sizeof...(Args) - 1>(std::forward_as_tuple(args...));
     if (!out) return hr;
@@ -1159,45 +1161,45 @@ struct explored<Create> {
 
 const auto kDeviceVtable = [] {
   auto table = lib::make_reporting_vtable<kDeviceSlots>();
-  table[0] = reinterpret_cast<void*>(&device_query_interface);
-  table[1] = reinterpret_cast<void*>(&device_add_ref);
-  table[2] = reinterpret_cast<void*>(&device_release);
-  table[8] = reinterpret_cast<void*>(&create_queue);
-  table[9] = reinterpret_cast<void*>(&create_command_allocator);
-  table[14] = reinterpret_cast<void*>(&create_descriptor_heap_x);
-  table[15] = reinterpret_cast<void*>(&get_descriptor_handle_increment_size);
-  table[16] = reinterpret_cast<void*>(&create_root_signature);
-  table[17] = reinterpret_cast<void*>(&create_constant_buffer_view);
-  table[18] = reinterpret_cast<void*>(&create_shader_resource_view);
-  table[19] = reinterpret_cast<void*>(&create_unordered_access_view);
-  table[20] = reinterpret_cast<void*>(&create_render_target_view);
-  table[21] = reinterpret_cast<void*>(&create_depth_stencil_view);
-  table[22] = reinterpret_cast<void*>(&create_sampler);
-  table[23] = reinterpret_cast<void*>(&copy_descriptors);
-  table[24] = reinterpret_cast<void*>(&copy_descriptors_simple);
-  table[25] = reinterpret_cast<void*>(&get_resource_allocation_info);
-  table[26] = reinterpret_cast<void*>(&get_custom_heap_properties);
-  table[27] = reinterpret_cast<void*>(&create_committed_resource_desktop);
-  table[36] = reinterpret_cast<void*>(&create_fence);
-  table[80] = reinterpret_cast<void*>(&wait_frame_event_x);
-  table[81] = reinterpret_cast<void*>(&get_frame_statistics_x);
-  table[39] = reinterpret_cast<void*>(&create_query_heap);
-  table[41] = reinterpret_cast<void*>(&create_command_signature);
-  table[48] = reinterpret_cast<void*>(&create_queue_x);
-  table[55] = reinterpret_cast<void*>(&explored<&create_derived_pipeline_x>::call);
-  table[57] = reinterpret_cast<void*>(&explored<&create_native_graphics_pipeline>::call);
-  table[61] = reinterpret_cast<void*>(&create_sampler_x);
-  table[62] = reinterpret_cast<void*>(&explored<&create_compute_pipeline_state_x>::call);
-  table[67] = reinterpret_cast<void*>(&explored<&create_native_pipeline>::call);
-  table[70] = reinterpret_cast<void*>(&create_shader_resource_view_at);
-  table[73] = reinterpret_cast<void*>(&create_command_list_x);
-  table[74] = reinterpret_cast<void*>(&create_heap_over_memory);
-  table[86] = reinterpret_cast<void*>(&explored<&create_pipeline_state>::call);
-  table[78] = reinterpret_cast<void*>(&set_frame_interval_x);
-  table[79] = reinterpret_cast<void*>(&schedule_frame_event_x);
-  table[108] = reinterpret_cast<void*>(&get_resource_allocation_info1);
-  table[127] = reinterpret_cast<void*>(&create_committed_resource_x);
-  table[133] = reinterpret_cast<void*>(&create_placed_resource);
+  HOLY_D3D_SLOT(table, kDeviceObject, 0, device_query_interface);
+  HOLY_D3D_SLOT(table, kDeviceObject, 1, device_add_ref);
+  HOLY_D3D_SLOT(table, kDeviceObject, 2, device_release);
+  HOLY_D3D_SLOT(table, kDeviceObject, 8, create_queue);
+  HOLY_D3D_SLOT(table, kDeviceObject, 9, create_command_allocator);
+  HOLY_D3D_SLOT(table, kDeviceObject, 14, create_descriptor_heap_x);
+  HOLY_D3D_SLOT(table, kDeviceObject, 15, get_descriptor_handle_increment_size);
+  HOLY_D3D_SLOT(table, kDeviceObject, 16, create_root_signature);
+  HOLY_D3D_SLOT(table, kDeviceObject, 17, create_constant_buffer_view);
+  HOLY_D3D_SLOT(table, kDeviceObject, 18, create_shader_resource_view);
+  HOLY_D3D_SLOT(table, kDeviceObject, 19, create_unordered_access_view);
+  HOLY_D3D_SLOT(table, kDeviceObject, 20, create_render_target_view);
+  HOLY_D3D_SLOT(table, kDeviceObject, 21, create_depth_stencil_view);
+  HOLY_D3D_SLOT(table, kDeviceObject, 22, create_sampler);
+  HOLY_D3D_SLOT(table, kDeviceObject, 23, copy_descriptors);
+  HOLY_D3D_SLOT(table, kDeviceObject, 24, copy_descriptors_simple);
+  HOLY_D3D_SLOT(table, kDeviceObject, 25, get_resource_allocation_info);
+  HOLY_D3D_SLOT(table, kDeviceObject, 26, get_custom_heap_properties);
+  HOLY_D3D_SLOT(table, kDeviceObject, 27, create_committed_resource_desktop);
+  HOLY_D3D_SLOT(table, kDeviceObject, 36, create_fence);
+  HOLY_D3D_SLOT(table, kDeviceObject, 80, wait_frame_event_x);
+  HOLY_D3D_SLOT(table, kDeviceObject, 81, get_frame_statistics_x);
+  HOLY_D3D_SLOT(table, kDeviceObject, 39, create_query_heap);
+  HOLY_D3D_SLOT(table, kDeviceObject, 41, create_command_signature);
+  HOLY_D3D_SLOT(table, kDeviceObject, 48, create_queue_x);
+  HOLY_D3D_SLOT(table, kDeviceObject, 55, explored<&create_derived_pipeline_x>::call);
+  HOLY_D3D_SLOT(table, kDeviceObject, 57, explored<&create_native_graphics_pipeline>::call);
+  HOLY_D3D_SLOT(table, kDeviceObject, 61, create_sampler_x);
+  HOLY_D3D_SLOT(table, kDeviceObject, 62, explored<&create_compute_pipeline_state_x>::call);
+  HOLY_D3D_SLOT(table, kDeviceObject, 67, explored<&create_native_pipeline>::call);
+  HOLY_D3D_SLOT(table, kDeviceObject, 70, create_shader_resource_view_at);
+  HOLY_D3D_SLOT(table, kDeviceObject, 73, create_command_list_x);
+  HOLY_D3D_SLOT(table, kDeviceObject, 74, create_heap_over_memory);
+  HOLY_D3D_SLOT(table, kDeviceObject, 86, explored<&create_pipeline_state>::call);
+  HOLY_D3D_SLOT(table, kDeviceObject, 78, set_frame_interval_x);
+  HOLY_D3D_SLOT(table, kDeviceObject, 79, schedule_frame_event_x);
+  HOLY_D3D_SLOT(table, kDeviceObject, 108, get_resource_allocation_info1);
+  HOLY_D3D_SLOT(table, kDeviceObject, 127, create_committed_resource_x);
+  HOLY_D3D_SLOT(table, kDeviceObject, 133, create_placed_resource);
   return table;
 }();
 
@@ -1215,12 +1217,17 @@ Device* create_device(const void* parameters) {
   // checks every call and device removal records what the GPU was doing (the
   // documented device-removed extended data).
   const bool host_debug = HolyLogEnabled(lib::kDebug) || GetEnvironmentVariableW(L"HOLY_D3D_DEBUG", nullptr, 0) > 0;
+  // HOLY_D3D_DRED=1: only the device-removed data (what the GPU was doing,
+  // page faults), without the debug layer's checks and their cost.
+  const bool dred_only = GetEnvironmentVariableW(L"HOLY_D3D_DRED", nullptr, 0) > 0;
   if (host_debug) {
     ID3D12Debug* layer = nullptr;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&layer)))) {
       layer->EnableDebugLayer();
       layer->Release();
     }
+  }
+  if (host_debug || dred_only) {
     ID3D12DeviceRemovedExtendedDataSettings* dred = nullptr;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
       dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);

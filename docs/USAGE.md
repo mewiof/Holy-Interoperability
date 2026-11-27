@@ -62,6 +62,9 @@ Debugging aids, set in the environment:
 | Variable | Effect |
 | --- | --- |
 | `HOLY_D3D_DEBUG=1` | the host's Direct3D 12 debug layer and device-removed data, its errors in the runtime log (also on with `--log-level debug`) |
+| `HOLY_D3D_DRED=1` | only the device-removed data (what the GPU was doing, page faults), without the debug layer's checks and their cost |
+| `HOLY_D3D_CHECK=1` | after every call into the device, its queues and command lists (and the runtime's own host calls), the host device is checked; the first call after which it was removed is logged with the 32 calls before it |
+| `HOLY_D3D_TRACE=<n>` | every call between presents `n-1` and `n` is logged, with what draws, clears, barriers, pipelines, render targets and viewports were given: an account of one frame |
 | `HOLY_CAPTURE_EVERY=<n>` | besides presents 1, 30 and 300, write every `n`th presented frame to `<data>/frames/present-<n>.bmp` |
 | `HOLY_DUMP_TARGETS=<n>` | at present `n`, every live texture of the title is written to `<data>/frames/textures-<n>/` and its per-channel minimum and maximum logged |
 | `HOLY_WATCH=at=<offset>;if=<reg>+<off>:<value>;watch=<reg>+<off>` | hardware watchpoints: when the title executes `title+<offset>` (and the 32-bit value at `<reg>+<off>` matches), writes to the 8 bytes at the `watch` address (`*<reg>+<off>`: at the address stored there) are logged with their stacks, in every thread, for the three latest such addresses |

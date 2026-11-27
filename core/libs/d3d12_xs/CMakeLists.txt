@@ -3,6 +3,8 @@ holy_add_system_library(holy_lib_d3d12_xs
   SOURCES
     bindings.cpp
     bindings.h
+    call_check.cpp
+    call_check.h
     command_list.cpp
     d3d12_xs.cpp
     descriptor_memory.cpp

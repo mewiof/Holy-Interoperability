@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/present.h"
@@ -155,14 +156,14 @@ HRESULT STDMETHODCALLTYPE queue_update_page_mappings_x(CommandQueue*, uint32_t c
 
 const auto kQueueVtable = [] {
   auto table = lib::make_reporting_vtable<kQueueSlots>();
-  table[0] = reinterpret_cast<void*>(&queue_query_interface);
-  table[1] = reinterpret_cast<void*>(&queue_add_ref);
-  table[2] = reinterpret_cast<void*>(&queue_release);
-  table[16] = reinterpret_cast<void*>(&queue_signal);
-  table[18] = reinterpret_cast<void*>(&queue_get_timestamp_frequency);
-  table[31] = reinterpret_cast<void*>(&queue_update_page_mappings_x);
-  table[32] = reinterpret_cast<void*>(&queue_present_x);
-  table[35] = reinterpret_cast<void*>(&queue_execute_command_lists_x);
+  HOLY_D3D_SLOT(table, kQueueObject, 0, queue_query_interface);
+  HOLY_D3D_SLOT(table, kQueueObject, 1, queue_add_ref);
+  HOLY_D3D_SLOT(table, kQueueObject, 2, queue_release);
+  HOLY_D3D_SLOT(table, kQueueObject, 16, queue_signal);
+  HOLY_D3D_SLOT(table, kQueueObject, 18, queue_get_timestamp_frequency);
+  HOLY_D3D_SLOT(table, kQueueObject, 31, queue_update_page_mappings_x);
+  HOLY_D3D_SLOT(table, kQueueObject, 32, queue_present_x);
+  HOLY_D3D_SLOT(table, kQueueObject, 35, queue_execute_command_lists_x);
   return table;
 }();
 

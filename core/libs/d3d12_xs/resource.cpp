@@ -364,10 +364,19 @@ void make_depth_twin(Device* device, Resource* resource) {
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   // The same format family as the depth texture, so copies go both ways.
+  // Only the depth-only families have formats with unordered access: depth
+  // with stencil gets no twin. Measured: creating one anyway (the 32/8/24
+  // family with unordered access) is an invalid call for which the host
+  // removes the device.
   switch (desc.Format) {
-    case DXGI_FORMAT_D16_UNORM: desc.Format = DXGI_FORMAT_R16_TYPELESS; break;
-    case DXGI_FORMAT_D32_FLOAT: desc.Format = DXGI_FORMAT_R32_TYPELESS; break;
-    default: break;
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_TYPELESS: desc.Format = DXGI_FORMAT_R16_TYPELESS; break;
+    case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R32_TYPELESS: desc.Format = DXGI_FORMAT_R32_TYPELESS; break;
+    default:
+      LIB_LOG(lib::kWarn, "d3d12", "depth texture of format %u asks for unordered access: no twin (not supported)",
+              static_cast<unsigned>(desc.Format));
+      return;
   }
   D3D12_HEAP_PROPERTIES heap{};
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;

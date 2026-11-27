@@ -1,3 +1,4 @@
+#include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/pipeline_cache.h"
 
 #include <windows.h>
@@ -453,6 +454,7 @@ HRESULT compile_now(HostPipeline* p, ID3D12PipelineState** out) {
     }
   }
   device2->Release();
+  check_point("pipeline compile");
   c_compiles().add(1);
   c_compile_ms().add(static_cast<int64_t>(GetTickCount64() - start));
   return hr;
@@ -680,6 +682,7 @@ HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream, st
     ID3D12PipelineState* state = nullptr;
     const HRESULT hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
     device2->Release();
+    check_point("native pipeline compile");
     if (FAILED(hr)) return hr;
     *pipeline = wrap_host_pipeline(state, translated, info, vtable);
     return S_OK;

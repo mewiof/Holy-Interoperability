@@ -19,6 +19,7 @@
 // Captured frames: presents 1, 30, 300 and every 1800th after that are also
 // read back and written to <data directory>/frames/present-<n>.bmp, so a run
 // leaves evidence of what the title drew.
+#include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/present.h"
 
 #include <dxgi1_4.h>
@@ -490,6 +491,9 @@ HRESULT present_x(CommandQueue* queue, uint32_t plane_count, const PresentPlane*
   Presenter* p = g_presenter;
   ++p->presents;
   count_present(queue->device->host);
+  HOLY_TRACE("present %llu of %llx: %ux%u format %u", static_cast<unsigned long long>(p->presents),
+             static_cast<unsigned long long>(title_resource->title_va), width, height, static_cast<unsigned>(format));
+  trace_present(p->presents);
   const uint64_t token = planes[0].token;
   if (ensure_swap_chain(p, format, width, height)) {
     LIB_LOG(lib::kDebug, "d3d12", "present %llu: window %p%s%s", static_cast<unsigned long long>(p->presents),
@@ -519,7 +523,9 @@ HRESULT present_x(CommandQueue* queue, uint32_t plane_count, const PresentPlane*
     // Sync interval 0: titles pace their frames with frame events (device
     // slot 80), so presenting does not wait for the display's refresh as
     // well. A windowed flip-model swap chain does not tear either way.
+    check_point("present copy");
     const HRESULT hr = p->swap_chain->Present(0, 0);
+    check_point("present");
     if (FAILED(hr)) {
       LIB_LOG(lib::kError, "d3d12", "host present failed: 0x%08lX", static_cast<unsigned long>(hr));
       report_device_removal(queue->device);

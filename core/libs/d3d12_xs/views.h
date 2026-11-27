@@ -1,6 +1,7 @@
 // Descriptor creation and copies (device slots 17-24, see views.cpp).
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "core/libs/d3d12_xs/device.h"
@@ -25,6 +26,10 @@ void STDMETHODCALLTYPE create_sampler_x(Device* self, const uint32_t* desc, SIZE
 void STDMETHODCALLTYPE copy_descriptors(Device* self, UINT dest_ranges, const SIZE_T* dest_starts,
                                         const UINT* dest_sizes, UINT source_ranges, const SIZE_T* source_starts,
                                         const UINT* source_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type);
+// For traces (HOLY_D3D_TRACE): the texture a render-target or depth-stencil
+// descriptor views, as its title address, size and formats.
+std::string describe_target(SIZE_T handle);
+
 void STDMETHODCALLTYPE copy_descriptors_simple(Device* self, UINT count, SIZE_T dest, SIZE_T source,
                                                D3D12_DESCRIPTOR_HEAP_TYPE type);
 

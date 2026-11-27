@@ -359,7 +359,15 @@ Notes describe the platform, never a title.
   so the first are made without unordered access, with a twin texture of the same format family that has it
   (unordered-access views are of the twin; a barrier into the unordered-access layout copies the depth texture into
   the twin, one out of it copies the twin back), and the second as `R8G8B8A8_UNORM` textures with matching views
-  when the host GPU does not support them for the usage asked.
+  when the host GPU does not support them for the usage asked. Only the depth-only families (16 and 32 bits) have
+  formats with unordered access; depth textures with stencil get no twin (logged). *measured* host behaviour:
+  creating a texture of the 32/8/24 family with unordered access is an invalid call for which the host removes
+  the device.
+- *observed* host behaviour (development host): with the system's commit exhausted (about 0.1 GiB left), the host
+  removes the device (`DXGI_ERROR_INVALID_CALL`) while titles create placed resources and the runtime opens heaps
+  over title memory, with no command list in flight (device-removed data lists none) and after no particular call
+  (`HOLY_D3D_CHECK`). Seen in three runs, each at the moment the system's commit ran out; not reproduced in
+  isolation. Device removals in runs where the system's commit is nearly used up say nothing about the runtime.
 - *observed*: the initial state titles pass to `CreatePlacedResourceX` for textures and to slot 127 is a barrier
   layout (3 and 6 seen, then named as the layout before the first barrier). Implementation: host textures are
   created in that layout (`CreateCommittedResource3`); each placement gets its own host texture.

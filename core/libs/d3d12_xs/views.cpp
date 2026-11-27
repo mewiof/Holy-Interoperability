@@ -15,6 +15,8 @@
 // copies copy that memory too.
 #include "core/libs/d3d12_xs/views.h"
 
+#include "core/libs/d3d12_xs/call_check.h"
+
 #include "core/libs/d3d12_xs/descriptor_memory.h"
 #include "core/libs/d3d12_xs/descriptors.h"
 #include "core/libs/d3d12_xs/shader/descriptor_layout.h"
@@ -26,7 +28,10 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 namespace holy::d3d12 {
 namespace {
@@ -75,7 +80,44 @@ UINT64 slack_elements(uint64_t slack, UINT stride) {
   return slack / stride;
 }
 
+// Render-target and depth-stencil descriptors and what they view, kept only
+// while calls are wrapped (call_check.h), for traces.
+struct TargetView {
+  uint64_t va = 0;
+  uint64_t width = 0;
+  uint32_t height = 0;
+  uint32_t format = 0;
+  uint32_t view_format = 0;
+};
+std::mutex g_targets_lock;
+std::unordered_map<SIZE_T, TargetView> g_targets;
+
+void note_target(SIZE_T dest, const void* resource, DXGI_FORMAT view_format) {
+  if (!call_check_enabled()) return;
+  TargetView view;
+  if (const auto* r = static_cast<const Resource*>(resource)) {
+    view = {r->title_va, r->desc.Width, r->desc.Height, static_cast<uint32_t>(r->desc.Format),
+            static_cast<uint32_t>(view_format)};
+  }
+  std::lock_guard<std::mutex> guard(g_targets_lock);
+  g_targets[dest] = view;
+}
+
 }  // namespace
+
+std::string describe_target(SIZE_T handle) {
+  TargetView view;
+  {
+    std::lock_guard<std::mutex> guard(g_targets_lock);
+    const auto it = g_targets.find(handle);
+    if (it == g_targets.end()) return "(unknown view)";
+    view = it->second;
+  }
+  char text[128];
+  std::snprintf(text, sizeof(text), "%llx: %llux%u format %u (view %u)", static_cast<unsigned long long>(view.va),
+                static_cast<unsigned long long>(view.width), view.height, view.format, view.view_format);
+  return text;
+}
 
 // Observed (device slot 70): a shader resource view made from a resource
 // description and an address rather than a resource object:
@@ -271,6 +313,7 @@ void STDMETHODCALLTYPE create_render_target_view(Device* self, void* resource,
   }
   self->host->CreateRenderTargetView(host_resource(resource), desc ? &host : nullptr, host_cpu_handle(dest));
   publish_descriptors(dest);
+  note_target(dest, resource, desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
 }
 
 void STDMETHODCALLTYPE create_depth_stencil_view(Device* self, void* resource,
@@ -282,6 +325,7 @@ void STDMETHODCALLTYPE create_depth_stencil_view(Device* self, void* resource,
   }
   self->host->CreateDepthStencilView(host_resource(resource), desc ? &host : nullptr, host_cpu_handle(dest));
   publish_descriptors(dest);
+  note_target(dest, resource, desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
 }
 
 void STDMETHODCALLTYPE create_sampler(Device* self, const D3D12_SAMPLER_DESC* desc, SIZE_T dest) {

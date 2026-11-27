@@ -20,11 +20,13 @@
 
 #include "core/libs/d3d12_xs/bindings.h"
 #include "core/libs/d3d12_xs/descriptors.h"
+#include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
 #include "core/libs/d3d12_xs/ngg.h"
 #include "core/libs/d3d12_xs/texture_dump.h"
+#include "core/libs/d3d12_xs/views.h"
 #include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/support.h"
 
@@ -204,6 +206,9 @@ void STDMETHODCALLTYPE list_clear_render_target_view(CommandList* self, SIZE_T h
     return;
   }
   g_work.clears.fetch_add(1, std::memory_order_relaxed);
+  HOLY_TRACE("list %u clears %s to %g %g %g %g (%u rects)", self->number, describe_target(handle).c_str(),
+             colour ? colour[0] : 0.0f, colour ? colour[1] : 0.0f, colour ? colour[2] : 0.0f,
+             colour ? colour[3] : 0.0f, rect_count);
   if (colour && (colour[0] != 0 || colour[1] != 0 || colour[2] != 0)) {
     g_work.nonblack_clears.fetch_add(1, std::memory_order_relaxed);
   }
@@ -369,6 +374,11 @@ void STDMETHODCALLTYPE list_barrier(CommandList* self, UINT32 count, const D3D12
                   b.SyncBefore, b.SyncAfter, b.AccessBefore, b.AccessAfter, b.LayoutBefore, b.LayoutAfter, b.Flags);
         }
         const auto* title = static_cast<const Resource*>(static_cast<const void*>(b.pResource));
+        HOLY_TRACE("list %u texture barrier %llx (%llux%u format %u) layout %u->%u sync 0x%x->0x%x access 0x%x->0x%x",
+                   self->number, title ? static_cast<unsigned long long>(title->title_va) : 0ull,
+                   title ? static_cast<unsigned long long>(title->desc.Width) : 0ull, title ? title->desc.Height : 0u,
+                   title ? static_cast<unsigned>(title->desc.Format) : 0u, b.LayoutBefore, b.LayoutAfter, b.SyncBefore,
+                   b.SyncAfter, b.AccessBefore, b.AccessAfter);
         b.pResource = title ? title->host : nullptr;
         b.LayoutBefore = host_texture_layout(title, host_layout(b.LayoutBefore));
         b.LayoutAfter = host_texture_layout(title, host_layout(b.LayoutAfter));
@@ -434,6 +444,7 @@ void STDMETHODCALLTYPE list_set_primitive_topology(CommandList* self, D3D12_PRIM
     return;
   }
   self->topology = topology;
+  HOLY_TRACE("list %u topology %d%s", self->number, static_cast<int>(topology), self->rectangles ? " (rectangles)" : "");
   self->host->IASetPrimitiveTopology(topology);
 }
 
@@ -497,6 +508,10 @@ bool is_translated(const void* pipeline) {
 void STDMETHODCALLTYPE list_set_pipeline_state(CommandList* self, void* pipeline) {
   self->pipeline = pipeline;
   self->translated = is_translated(pipeline);
+  if (frame_traced()) {
+    HOLY_TRACE("list %u pipeline %p%s: %ls", self->number, pipeline, self->translated ? " (translated)" : "",
+               pipeline_label(pipeline).c_str());
+  }
   if (auto* host = pipeline_host(pipeline)) {
     self->host->SetPipelineState(host);
     self->bound = host;
@@ -658,6 +673,12 @@ void STDMETHODCALLTYPE list_set_render_targets(CommandList* self, UINT count, co
   }
   D3D12_CPU_DESCRIPTOR_HANDLE host_depth{};
   if (depth) host_depth = host_cpu_handle(depth->ptr);
+  if (frame_traced()) {
+    for (UINT i = 0; i < n && targets; ++i) {
+      HOLY_TRACE("list %u render target %u: %s", self->number, i, describe_target(targets[single ? 0 : i].ptr).c_str());
+    }
+    if (depth) HOLY_TRACE("list %u depth target: %s", self->number, describe_target(depth->ptr).c_str());
+  }
   self->host->OMSetRenderTargets(n, targets ? host : nullptr, single, depth ? &host_depth : nullptr);
 }
 
@@ -667,13 +688,24 @@ void STDMETHODCALLTYPE list_clear_depth_stencil_view(CommandList* self, SIZE_T h
   const D3D12_CPU_DESCRIPTOR_HANDLE host = host_cpu_handle(handle);
   if (!host.ptr) return;
   g_work.depth_clears.fetch_add(1, std::memory_order_relaxed);
+  HOLY_TRACE("list %u clears depth %s to %g / %u (flags 0x%x)", self->number, describe_target(handle).c_str(), depth,
+             stencil, flags);
   self->host->ClearDepthStencilView(host, flags, depth, stencil, rect_count, rects);
 }
 
 void STDMETHODCALLTYPE list_set_viewports(CommandList* self, UINT count, const D3D12_VIEWPORT* viewports) {
+  if (count && viewports) {
+    HOLY_TRACE("list %u viewport %g %g %g x %g depth %g-%g (%u viewports)", self->number, viewports[0].TopLeftX,
+               viewports[0].TopLeftY, viewports[0].Width, viewports[0].Height, viewports[0].MinDepth,
+               viewports[0].MaxDepth, count);
+  }
   self->host->RSSetViewports(count, viewports);
 }
 void STDMETHODCALLTYPE list_set_scissors(CommandList* self, UINT count, const D3D12_RECT* rects) {
+  if (count && rects) {
+    HOLY_TRACE("list %u scissor %ld %ld %ld %ld", self->number, rects[0].left, rects[0].top, rects[0].right,
+               rects[0].bottom);
+  }
   self->host->RSSetScissorRects(count, rects);
 }
 void STDMETHODCALLTYPE list_set_blend_factor(CommandList* self, const FLOAT* factor) {
@@ -754,6 +786,8 @@ void STDMETHODCALLTYPE list_draw_instanced(CommandList* self, UINT vertices, UIN
     return;
   }
   g_work.draws.fetch_add(1, std::memory_order_relaxed);
+  HOLY_TRACE("list %u draws %u vertices x %u from %u / %u", self->number, vertices, instances, first_vertex,
+             first_instance);
   mark_work(self);
   NggPipeline ngg;
   if (self->translated && ngg_pipeline(self->pipeline, &ngg)) {
@@ -779,6 +813,8 @@ void STDMETHODCALLTYPE list_draw_indexed_instanced(CommandList* self, UINT indic
     return;
   }
   g_work.indexed.fetch_add(1, std::memory_order_relaxed);
+  HOLY_TRACE("list %u draws %u indices x %u from %u, base %d / %u", self->number, indices, instances, first_index,
+             base_vertex, first_instance);
   mark_work(self);
   NggPipeline ngg;
   if (self->translated && ngg_pipeline(self->pipeline, &ngg)) {
@@ -805,6 +841,7 @@ void STDMETHODCALLTYPE list_dispatch(CommandList* self, UINT x, UINT y, UINT z) 
     return;
   }
   g_work.dispatches.fetch_add(1, std::memory_order_relaxed);
+  HOLY_TRACE("list %u dispatches %u x %u x %u", self->number, x, y, z);
   mark_work(self);
   if (self->translated) {
     if (!bind_translated_compute(self)) return report_unbound("a dispatch");
@@ -816,50 +853,50 @@ void STDMETHODCALLTYPE list_dispatch(CommandList* self, UINT x, UINT y, UINT z) 
 
 const auto kListVtable = [] {
   auto table = lib::make_reporting_vtable<kCommandListSlots>();
-  table[0] = reinterpret_cast<void*>(&list_query_interface);
-  table[1] = reinterpret_cast<void*>(&list_add_ref);
-  table[2] = reinterpret_cast<void*>(&list_release);
-  table[9] = reinterpret_cast<void*>(&list_close);
-  table[12] = reinterpret_cast<void*>(&list_draw_instanced);
-  table[13] = reinterpret_cast<void*>(&list_draw_indexed_instanced);
-  table[14] = reinterpret_cast<void*>(&list_dispatch);
-  table[20] = reinterpret_cast<void*>(&list_set_primitive_topology);
-  table[21] = reinterpret_cast<void*>(&list_set_viewports);
-  table[22] = reinterpret_cast<void*>(&list_set_scissors);
-  table[23] = reinterpret_cast<void*>(&list_set_blend_factor);
-  table[24] = reinterpret_cast<void*>(&list_set_stencil_ref);
-  table[25] = reinterpret_cast<void*>(&list_set_pipeline_state);
-  table[33] = reinterpret_cast<void*>(&list_set_compute_root_signature);
-  table[34] = reinterpret_cast<void*>(&list_set_graphics_root_signature);
-  table[35] = reinterpret_cast<void*>(&list_set_compute_root_table);
-  table[36] = reinterpret_cast<void*>(&list_set_graphics_root_table);
-  table[37] = reinterpret_cast<void*>(&list_set_compute_root_constant);
-  table[38] = reinterpret_cast<void*>(&list_set_graphics_root_constant);
-  table[39] = reinterpret_cast<void*>(&list_set_compute_root_constants);
-  table[40] = reinterpret_cast<void*>(&list_set_graphics_root_constants);
-  table[41] = reinterpret_cast<void*>(&list_set_compute_root_cbv);
-  table[42] = reinterpret_cast<void*>(&list_set_graphics_root_cbv);
-  table[43] = reinterpret_cast<void*>(&list_set_compute_root_srv);
-  table[44] = reinterpret_cast<void*>(&list_set_graphics_root_srv);
-  table[45] = reinterpret_cast<void*>(&list_set_compute_root_uav);
-  table[46] = reinterpret_cast<void*>(&list_set_graphics_root_uav);
-  table[47] = reinterpret_cast<void*>(&list_set_index_buffer);
-  table[48] = reinterpret_cast<void*>(&list_set_vertex_buffers);
-  table[50] = reinterpret_cast<void*>(&list_set_render_targets);
-  table[51] = reinterpret_cast<void*>(&list_clear_depth_stencil_view);
-  table[70] = reinterpret_cast<void*>(&list_set_depth_bounds);
-  table[75] = reinterpret_cast<void*>(&list_set_unknown_75);
-  table[142] = reinterpret_cast<void*>(&list_set_sample_mask);
-  table[32] = reinterpret_cast<void*>(&list_set_descriptor_heaps);
-  table[52] = reinterpret_cast<void*>(&list_clear_render_target_view);
-  table[71] = reinterpret_cast<void*>(&list_write_value_x);
-  table[72] = reinterpret_cast<void*>(&list_write_timestamp_x);
-  table[74] = reinterpret_cast<void*>(&list_write_fence_value_x);
-  table[126] = reinterpret_cast<void*>(&list_set_shading_rate);
-  table[139] = reinterpret_cast<void*>(&list_reset_x);
-  table[146] = reinterpret_cast<void*>(&list_barrier);
-  table[131] = reinterpret_cast<void*>(&list_hardware_state);
-  table[132] = reinterpret_cast<void*>(&list_hardware_state);
+  HOLY_D3D_SLOT(table, kCommandListObject, 0, list_query_interface);
+  HOLY_D3D_SLOT(table, kCommandListObject, 1, list_add_ref);
+  HOLY_D3D_SLOT(table, kCommandListObject, 2, list_release);
+  HOLY_D3D_SLOT(table, kCommandListObject, 9, list_close);
+  HOLY_D3D_SLOT(table, kCommandListObject, 12, list_draw_instanced);
+  HOLY_D3D_SLOT(table, kCommandListObject, 13, list_draw_indexed_instanced);
+  HOLY_D3D_SLOT(table, kCommandListObject, 14, list_dispatch);
+  HOLY_D3D_SLOT(table, kCommandListObject, 20, list_set_primitive_topology);
+  HOLY_D3D_SLOT(table, kCommandListObject, 21, list_set_viewports);
+  HOLY_D3D_SLOT(table, kCommandListObject, 22, list_set_scissors);
+  HOLY_D3D_SLOT(table, kCommandListObject, 23, list_set_blend_factor);
+  HOLY_D3D_SLOT(table, kCommandListObject, 24, list_set_stencil_ref);
+  HOLY_D3D_SLOT(table, kCommandListObject, 25, list_set_pipeline_state);
+  HOLY_D3D_SLOT(table, kCommandListObject, 33, list_set_compute_root_signature);
+  HOLY_D3D_SLOT(table, kCommandListObject, 34, list_set_graphics_root_signature);
+  HOLY_D3D_SLOT(table, kCommandListObject, 35, list_set_compute_root_table);
+  HOLY_D3D_SLOT(table, kCommandListObject, 36, list_set_graphics_root_table);
+  HOLY_D3D_SLOT(table, kCommandListObject, 37, list_set_compute_root_constant);
+  HOLY_D3D_SLOT(table, kCommandListObject, 38, list_set_graphics_root_constant);
+  HOLY_D3D_SLOT(table, kCommandListObject, 39, list_set_compute_root_constants);
+  HOLY_D3D_SLOT(table, kCommandListObject, 40, list_set_graphics_root_constants);
+  HOLY_D3D_SLOT(table, kCommandListObject, 41, list_set_compute_root_cbv);
+  HOLY_D3D_SLOT(table, kCommandListObject, 42, list_set_graphics_root_cbv);
+  HOLY_D3D_SLOT(table, kCommandListObject, 43, list_set_compute_root_srv);
+  HOLY_D3D_SLOT(table, kCommandListObject, 44, list_set_graphics_root_srv);
+  HOLY_D3D_SLOT(table, kCommandListObject, 45, list_set_compute_root_uav);
+  HOLY_D3D_SLOT(table, kCommandListObject, 46, list_set_graphics_root_uav);
+  HOLY_D3D_SLOT(table, kCommandListObject, 47, list_set_index_buffer);
+  HOLY_D3D_SLOT(table, kCommandListObject, 48, list_set_vertex_buffers);
+  HOLY_D3D_SLOT(table, kCommandListObject, 50, list_set_render_targets);
+  HOLY_D3D_SLOT(table, kCommandListObject, 51, list_clear_depth_stencil_view);
+  HOLY_D3D_SLOT(table, kCommandListObject, 70, list_set_depth_bounds);
+  HOLY_D3D_SLOT(table, kCommandListObject, 75, list_set_unknown_75);
+  HOLY_D3D_SLOT(table, kCommandListObject, 142, list_set_sample_mask);
+  HOLY_D3D_SLOT(table, kCommandListObject, 32, list_set_descriptor_heaps);
+  HOLY_D3D_SLOT(table, kCommandListObject, 52, list_clear_render_target_view);
+  HOLY_D3D_SLOT(table, kCommandListObject, 71, list_write_value_x);
+  HOLY_D3D_SLOT(table, kCommandListObject, 72, list_write_timestamp_x);
+  HOLY_D3D_SLOT(table, kCommandListObject, 74, list_write_fence_value_x);
+  HOLY_D3D_SLOT(table, kCommandListObject, 126, list_set_shading_rate);
+  HOLY_D3D_SLOT(table, kCommandListObject, 139, list_reset_x);
+  HOLY_D3D_SLOT(table, kCommandListObject, 146, list_barrier);
+  HOLY_D3D_SLOT(table, kCommandListObject, 131, list_hardware_state);
+  HOLY_D3D_SLOT(table, kCommandListObject, 132, list_hardware_state);
   return table;
 }();
 

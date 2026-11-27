@@ -1,3 +1,4 @@
+#include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
 
 #include <d3d12.h>
@@ -153,6 +154,7 @@ const std::pair<uint64_t, HeapRecord>* section_span(Device* device, HANDLE secti
   ID3D12Heap* heap = nullptr;
   const HRESULT hr = d13 ? d13->OpenExistingHeapFromAddress1(record.view + first, last - first, IID_PPV_ARGS(&heap))
                          : E_NOINTERFACE;
+  check_point("GPU heap over physical pages");
   if (FAILED(hr)) {
     LIB_LOG(lib::kError, "d3d12", "cannot open a GPU heap over physical pages (0x%08lX)", static_cast<unsigned long>(hr));
     return nullptr;

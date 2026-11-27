@@ -204,9 +204,26 @@ const AllocationHooks* title_hooks() {
 
 }  // namespace
 
+// HOLY_XMEM_TRACE: allocations with their attributes and results in the log.
+bool allocation_trace() {
+  static const bool on = GetEnvironmentVariableW(L"HOLY_XMEM_TRACE", nullptr, 0) > 0;
+  return on;
+}
+
 HOLY_EXPORT void* XMemAlloc(SIZE_T size, uint64_t attributes) {
-  if (const AllocationHooks* hooks = title_hooks()) return hooks->alloc(size, attributes);
-  return allocate(size, attributes);
+  void* result = nullptr;
+  if (const AllocationHooks* hooks = title_hooks()) {
+    result = hooks->alloc(size, attributes);
+  } else {
+    result = allocate(size, attributes);
+  }
+  if (allocation_trace() && size >= 0x10000) {
+    LIB_LOG(holy::lib::kInfo, "xmem", "alloc 0x%llx bytes, attributes 0x%llx (allocator 0x%llx) -> %p-%p",
+            static_cast<unsigned long long>(size), static_cast<unsigned long long>(attributes),
+            static_cast<unsigned long long>((attributes >> 16) & 0xFF), result,
+            result ? static_cast<char*>(result) + size : nullptr);
+  }
+  return result;
 }
 HOLY_EXPORT void XMemFree(void* address, uint64_t attributes) {
   if (const AllocationHooks* hooks = title_hooks()) {
@@ -262,7 +279,7 @@ HOLY_EXPORT void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_
   constexpr DWORD kMemReservePlaceholder = 0x00040000;
   if (allocation_type & kMemReservePlaceholder) {
     void* placeholder = reserve_placeholder(address, size);
-    LIB_LOG(placeholder ? holy::lib::kDebug : holy::lib::kError, "xmem",
+    LIB_LOG(placeholder ? (allocation_trace() ? holy::lib::kInfo : holy::lib::kDebug) : holy::lib::kError, "xmem",
             "placeholder reservation size=0x%llx allocator=0x%llx -> %p", static_cast<unsigned long long>(size),
             static_cast<unsigned long long>(allocator_id), placeholder);
     return placeholder;
@@ -271,6 +288,10 @@ HOLY_EXPORT void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_
   constexpr DWORD kMemReplacePlaceholder = 0x00004000;
   if (allocation_type & kMemReplacePlaceholder) {
     void* replaced = replace_placeholder(address, size, host_type, host_protect);
+    if (allocation_trace()) {
+      LIB_LOG(holy::lib::kInfo, "xmem", "placeholder replacement at %p size=0x%llx type=0x%08lx protect=0x%lx -> %p",
+              address, static_cast<unsigned long long>(size), allocation_type, protect, replaced);
+    }
     if (!replaced) {
       LIB_LOG(holy::lib::kError, "xmem", "placeholder replacement at %p size=0x%llx failed (error %lu)", address,
               static_cast<unsigned long long>(size), GetLastError());
@@ -302,9 +323,9 @@ HOLY_EXPORT void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_
   }
   const DWORD error = GetLastError();
 
-  if (!result ||
+  if (!result || allocation_trace() ||
       (g_virtual_log_budget.load(std::memory_order_relaxed) > 0 && g_virtual_log_budget.fetch_sub(1) > 0)) {
-    LIB_LOG(result ? holy::lib::kDebug : holy::lib::kError, "xmem",
+    LIB_LOG(result ? (allocation_trace() ? holy::lib::kInfo : holy::lib::kDebug) : holy::lib::kError, "xmem",
             "virtual alloc address=%p size=0x%llx type=0x%08lx allocator=0x%llx protect=0x%lx -> %p%s",
             address, static_cast<unsigned long long>(size), allocation_type,
             static_cast<unsigned long long>(allocator_id), protect, result, result ? "" : " (failed)");

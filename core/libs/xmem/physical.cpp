@@ -363,10 +363,50 @@ void* map_view(const Page& page, uintptr_t granule) {
 
 bool back_granule(uintptr_t granule, ULONG_PTR id);
 
+// Granules where no page is mapped that the title read: a shared read-only
+// view of one page of zeroes (back_on_fault). Called with g_lock held.
+std::unordered_set<uintptr_t>& zero_mapped() {
+  static auto* set = new std::unordered_set<uintptr_t>();
+  return *set;
+}
+
+HANDLE zero_section() {
+  static const HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT, 0,
+                                                   static_cast<DWORD>(kPage), nullptr);
+  return section;
+}
+
+// Shows the zero page at `granule` (a placeholder of its own afterwards).
+bool map_zero(uintptr_t granule) {
+  const auto map = kernelbase<MapViewOfFile3Fn>("MapViewOfFile3");
+  if (!map || !zero_section()) return false;
+  split_placeholder(granule);
+  void* view = map(zero_section(), GetCurrentProcess(), reinterpret_cast<void*>(granule), 0, kPage,
+                   kMemReplacePlaceholder, PAGE_READONLY, nullptr, 0);
+  if (!view) return false;
+  zero_mapped().insert(granule);
+  return true;
+}
+
+// The zero page leaves `granule` (a page is mapped or written there).
+void drop_zero(uintptr_t granule) {
+  if (!zero_mapped().erase(granule)) return;
+  const auto unmap = kernelbase<UnmapViewOfFile2Fn>("UnmapViewOfFile2");
+  if (unmap) unmap(GetCurrentProcess(), reinterpret_cast<void*>(granule), kMemPreservePlaceholder);
+}
+
 bool map_granule(uintptr_t granule, ULONG_PTR id) {
+  drop_zero(granule);
   unmap_granule(granule);
   if (id == 0) return true;
-  if (id > pages().size() || !pages()[id - 1].live) return false;
+  if (id > pages().size() || !pages()[id - 1].live) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) {
+      LIB_LOG(holy::lib::kError, "xmem", "mapping at %p names page %llu, which %s", reinterpret_cast<void*>(granule),
+              static_cast<unsigned long long>(id), id > pages().size() ? "was never allocated" : "was freed");
+    }
+    return false;
+  }
   ++pages()[id - 1].maps;
   if (pages()[id - 1].section < 0) {
     // No storage yet: backed on first use.
@@ -452,9 +492,70 @@ LONG CALLBACK back_on_fault(EXCEPTION_POINTERS* info) {
   const uintptr_t granule = static_cast<uintptr_t>(record->ExceptionInformation[1]) & ~(kPage - 1);
   if (g_lock_owner.load() == GetCurrentThreadId()) return EXCEPTION_CONTINUE_SEARCH;
   lock();
-  const auto found = pending().count(granule) ? mapped().find(granule) : mapped().end();
-  const bool backed = found != mapped().end() && back_granule(granule, found->second);
+  const bool is_pending = pending().count(granule) != 0;
+  const auto found = mapped().find(granule);
+  bool backed = false;
+  if (found != mapped().end()) {
+    if (is_pending) {
+      backed = back_granule(granule, found->second);
+    } else {
+      // Backed by another thread since this access faulted (a fault backs
+      // the pending granules mapped after its own too): the access is
+      // retried if the memory is there now. Observed: a video decoder's
+      // threads faulting on neighbouring granules at once, the later ones
+      // left unhandled.
+      // A write to a page made read-only to watch writes is not this
+      // handler's (the write watch's handler takes it).
+      MEMORY_BASIC_INFORMATION memory{};
+      const DWORD protect = VirtualQuery(reinterpret_cast<void*>(granule), &memory, sizeof(memory)) &&
+                                    memory.State == MEM_COMMIT
+                                ? memory.Protect & 0xFF
+                                : PAGE_NOACCESS;
+      const bool write = record->ExceptionInformation[0] == 1;
+      backed = write ? (protect == PAGE_READWRITE || protect == PAGE_EXECUTE_READWRITE)
+                     : (protect != PAGE_NOACCESS && protect != 0);
+    }
+  }
+  // Observed: titles touch granules of their physical-page reservations where
+  // no page is mapped (a video decoder's frame buffers, with the decoder's
+  // threads already writing them), which would end them here. Such a granule
+  // gets a page of its own, fresh (zero) storage nobody else maps: the title
+  // continues as if the memory had been there, and the page goes when the
+  // title maps a page of its own there (its storage is released once it is
+  // mapped nowhere). Partial: if the title expected another mapping's page
+  // there, it sees zeroes and its writes stay local. Counted and logged.
+  // A read shows the shared page of zeroes, read-only, at the granule (no
+  // storage taken: this project's texture copies read such memory too); a
+  // write, there or anywhere unmapped, gets the granule a page of its own.
+  bool implicit = false;
+  const bool write = record->ExceptionInformation[0] == 1;
+  if (!backed && found == mapped().end() && find_region(granule) != nullptr) {
+    if (!write) {
+      backed = zero_mapped().count(granule) || map_zero(granule);
+    } else {
+      drop_zero(granule);
+      implicit = true;
+    }
+  }
+  if (implicit) {
+    implicit = false;
+    const ULONG_PTR id = pages().size() + 1;
+    pages().push_back(Page{-1, 0, true, false, 0});
+    if (map_granule(granule, id) && pending().count(granule)) backed = back_granule(granule, id);
+    pages()[id - 1].live = false;  // released once mapped nowhere
+    implicit = backed;
+  }
   unlock();
+  if (implicit) {
+    static const holy::lib::Counter implicit_pages("xmem.implicit_page_faults");
+    implicit_pages.add(1);
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) {
+      LIB_LOG(holy::lib::kWarn, "xmem",
+              "write at %p in a physical-page reservation where no page is mapped: the granule %p gets fresh storage",
+              reinterpret_cast<void*>(record->ExceptionInformation[1]), reinterpret_cast<void*>(granule));
+    }
+  }
   return backed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -643,15 +744,22 @@ HOLY_EXPORT BOOL XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* page_array) {
   return TRUE;
 }
 
+// HOLY_XMEM_TRACE: every mapping and unmapping in the log (at info level).
+bool mapping_trace() {
+  static const bool on = GetEnvironmentVariableW(L"HOLY_XMEM_TRACE", nullptr, 0) > 0;
+  return on;
+}
+
 HOLY_EXPORT void* XMemMapPhysicalPages(void* address, ULONG_PTR count, ULONG_PTR* page_array) {
   if (!address || count == 0 || (reinterpret_cast<uintptr_t>(address) & (kPage - 1))) return nullptr;
   install_lazy_backing();
   const auto base = reinterpret_cast<uintptr_t>(address);
   const std::vector<ULONG_PTR> ids = ids_of(page_array, count);
-  if (HolyLogEnabled(holy::lib::kTrace)) {
+  if (HolyLogEnabled(holy::lib::kTrace) || mapping_trace()) {
     std::unordered_set<ULONG_PTR> distinct(ids.begin(), ids.end());
-    LIB_LOG(holy::lib::kTrace, "xmem", "map %llu pages at %p (%llu distinct)", static_cast<unsigned long long>(count),
-            address, static_cast<unsigned long long>(distinct.size()));
+    LIB_LOG(mapping_trace() ? holy::lib::kInfo : holy::lib::kTrace, "xmem", "%s %llu pages at %p-%p (%llu distinct)",
+            page_array ? "map" : "unmap", static_cast<unsigned long long>(count), address,
+            reinterpret_cast<void*>(base + count * kPage), static_cast<unsigned long long>(distinct.size()));
   }
   bool ok = true;
   lock();
@@ -661,6 +769,13 @@ HOLY_EXPORT void* XMemMapPhysicalPages(void* address, ULONG_PTR count, ULONG_PTR
     for (ULONG_PTR i = 0; i < count && ok; ++i) ok = map_granule(base + i * kPage, ids[i]);
   }
   unlock();
+  if (!ok) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) {
+      LIB_LOG(holy::lib::kError, "xmem", "mapping %llu pages at %p failed (pages after the failing one stay unmapped)",
+              static_cast<unsigned long long>(count), address);
+    }
+  }
   return ok ? address : nullptr;
 }
 
@@ -669,11 +784,21 @@ HOLY_EXPORT BOOL XMemMapPhysicalPagesScatter(void** addresses, ULONG_PTR count, 
   install_lazy_backing();
   const std::vector<void*> places(addresses, addresses + count);
   const std::vector<ULONG_PTR> ids = ids_of(page_array, count);
-  if (HolyLogEnabled(holy::lib::kTrace)) {
+  if (HolyLogEnabled(holy::lib::kTrace) || mapping_trace()) {
     std::unordered_set<ULONG_PTR> distinct(ids.begin(), ids.end());
-    LIB_LOG(holy::lib::kTrace, "xmem", "scatter-map %llu pages (%llu distinct), first at %p",
+    LIB_LOG(mapping_trace() ? holy::lib::kInfo : holy::lib::kTrace, "xmem",
+            "scatter-%s %llu pages (%llu distinct), first at %p", page_array ? "map" : "unmap",
             static_cast<unsigned long long>(count), static_cast<unsigned long long>(distinct.size()),
             places.empty() ? nullptr : places[0]);
+    // The addresses as runs of consecutive granules.
+    for (ULONG_PTR i = 0; mapping_trace() && i < count;) {
+      ULONG_PTR j = i + 1;
+      while (j < count && reinterpret_cast<uintptr_t>(places[j]) == reinterpret_cast<uintptr_t>(places[j - 1]) + kPage) ++j;
+      LIB_LOG(holy::lib::kInfo, "xmem", "  scatter run %p-%p (%llu pages)", places[i],
+              reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(places[j - 1]) + kPage),
+              static_cast<unsigned long long>(j - i));
+      i = j;
+    }
   }
   bool ok = true;
   lock();
@@ -686,6 +811,13 @@ HOLY_EXPORT BOOL XMemMapPhysicalPagesScatter(void** addresses, ULONG_PTR count, 
     ok = map_granule(granule, ids[i]);
   }
   unlock();
+  if (!ok) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) {
+      LIB_LOG(holy::lib::kError, "xmem", "scatter mapping of %llu pages failed (pages after the failing one stay unmapped)",
+              static_cast<unsigned long long>(count));
+    }
+  }
   return ok ? TRUE : FALSE;
 }
 

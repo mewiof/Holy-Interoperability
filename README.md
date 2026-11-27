@@ -38,7 +38,7 @@ flowchart LR
 | Start-up in seconds, memory within the host's means | ✅ first frame after 3 s; about 5 GiB of commit at the first frames (was 17 GiB) |
 | Frames presented at the title's pace | ✅ 30 a second, measured |
 | Runs for minutes without crashing | 🟡 five stops in the title's first seconds fixed; runs on the development host now end within 2-30 s because its system commit is exhausted (about 60 GiB still pinned by a host graphics driver leak that older builds triggered; current builds measurably do not leak, and a host restart frees it). The "invalid call" device removals in those runs follow the exhausted commit (`HOLY_D3D_CHECK` finds no call that causes them) |
-| No memory leaks (RAM, VRAM, system commit) | 🟡 live-object counters in every run; host heaps no longer leak system commit after exit; released textures free their host copies; title memory the GPU used is given back when the title frees it (it stayed charged: 1 GiB over 16 rounds of 64 MiB, now none; an end-to-end check); a fence's value no longer keeps a thread and a host fence after the fence is released |
+| No memory leaks (RAM, VRAM, system commit) | 🟡 live-object counters in every run; host heaps no longer leak system commit after exit; released textures free their host copies; title memory the GPU used is given back when the title frees it (it stayed charged: 1 GiB over 16 rounds of 64 MiB, now none; an end-to-end check); a fence's value no longer keeps a thread and a host fence after the fence is released; root argument memory goes back when lists are reset (live count) |
 | A correct picture | ⬜ frames were black: the loading screen's three draws a frame reached no render target. Found since, with checks in the sample title that fail without each fix: draws without indices fetched their vertices from the start of the buffer (the loading screen draws from one buffer at different first vertices); a quarter of native pipelines had no render target or only the first; 477 never wrote target 0; depth tests were off; textures read as their red channel; a fence made where a released one had been showed the old fence's value, so work looked finished before the GPU had run it (its results read as zero, about one read in 70). Not yet tried on the title (the host must restart first) |
 | Menus and input | 🟡 a gamepad from the host controller or keyboard; menus not reached yet |
 | Sound | ⬜ silent audio device |
@@ -50,7 +50,7 @@ flowchart LR
 | Title memory (`xmem`, commit on demand) | `████████░░` 80% |
 | Fast storage | `███████░░░` 70% |
 | Game runtime services | `██████░░░░` 60% |
-| Graphics: device, resources, command recording | `██████░░░░` 55% (one memory map for translated programs; heaps released with title memory) |
+| Graphics: device, resources, command recording | `██████░░░░` 58% (one memory map for translated programs; heaps released with title memory; root arguments in memory the GPU caches, owned by the recordings that use them) |
 | Graphics: shader translation | `█████░░░░░` 45% (ray-intersection instructions open) |
 | Graphics: pipelines and caches | `███████░░░` 70% |
 | Graphics: correct output | `███░░░░░░░` 28% (fence values belong to their fence; textures read with all four channels; texture copies follow the title's writes; native pipelines get their targets, depth tests and vertices right) |

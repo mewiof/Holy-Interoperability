@@ -166,6 +166,14 @@ least free system commit (under 1 GiB, failures are suspect), and leak suspects:
 held bytes that grew in every report after the warm-up. With `--min-fps` the exit code says what failed (1: a
 steady interval below it, 2: a leak suspect, 3: both, 4: no reports), for scripts that run a title and check it.
 
+```sh
+python tools/run_report/check_title.py <package-dir> [--seconds N] [--min-fps FPS] [--warmup SECONDS] [-- holy run options]
+```
+
+Runs the title for N seconds (default 120) with `holy run --timeout`, keeps the run's log as
+`<data>/logs/runtime-<time>.log` and prints its report; the exit code is the report's, or 5 when the title could
+not be started.
+
 ### Translating shaders offline
 
 ```sh

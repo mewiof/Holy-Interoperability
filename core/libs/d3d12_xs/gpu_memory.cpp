@@ -91,11 +91,20 @@ bool locate(Device* device, uint64_t title_va, Backing* out) {
   if (query_physical() && query_physical()(reinterpret_cast<const void*>(title_va), &section, &offset, &run)) {
     auto found = section_heaps().find(section);
     if (found == section_heaps().end()) {
+      // Measured host behaviour (development host): a heap opened from the
+      // section itself (OpenExistingHeapFromFileMapping) keeps the section's
+      // commit charged to the system after the process ends, the whole
+      // section each time, released heap or not; a heap opened over a mapped
+      // view of it (OpenExistingHeapFromAddress) does not. So the heap is
+      // opened over a view of the whole section kept for it (address space
+      // only; the storage is the section's).
+      void* view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0);
       ID3D12Heap* heap = nullptr;
-      const HRESULT hr = d3->OpenExistingHeapFromFileMapping(section, IID_PPV_ARGS(&heap));
+      const HRESULT hr = view ? d3->OpenExistingHeapFromAddress(view, IID_PPV_ARGS(&heap)) : E_OUTOFMEMORY;
       if (FAILED(hr)) {
-        LIB_LOG(lib::kError, "d3d12", "cannot open a GPU heap over physical pages (0x%08lX)",
-                static_cast<unsigned long>(hr));
+        LIB_LOG(lib::kError, "d3d12", "cannot open a GPU heap over physical pages (0x%08lX, error %lu)",
+                static_cast<unsigned long>(hr), view ? 0ul : GetLastError());
+        if (view) UnmapViewOfFile(view);
         return false;
       }
       HeapRecord record;

@@ -1655,7 +1655,26 @@ void test_memory_copies(void* device, void* queue) {
   check(cpu_write_seen, "the CPU's writes to copied title memory reach the GPU at the next submission");
   check(copy_seen && store_seen, "GPU writes to copied title memory are read back (copies and native stores)");
 
+  // The memory released while its other pages are still copied: an empty
+  // submission after it lets their copies go (the live count falls back),
+  // and the work runs.
+  const int64_t copied_at_release = *cached - cached_before;
   if (placed) call<ULONG>(placed, 2);
+  VirtualFree(memory, 0, MEM_RELEASE);
+  bool later = call<HRESULT>(allocator, 8) == S_OK &&
+               call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK &&
+               call<HRESULT>(list, 9) == S_OK;
+  void* lists[] = {list};
+  call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+  call<HRESULT>(queue, 16, fence, ++fence_value);
+  for (int i = 0; value && *value < fence_value && i < 5000; ++i) Sleep(1);
+  later = later && value && *value == fence_value;
+  const int64_t copied_after = *cached - cached_before;
+  std::printf("    (pages copied when the memory was released: %lld; after the next submission: %lld)\n",
+              static_cast<long long>(copied_at_release), static_cast<long long>(copied_after));
+  check(later && copied_at_release > 0 && copied_after == 0,
+        "copies of title memory the title releases go with it, and later work runs");
+
   call<ULONG>(source, 2);
   call<ULONG>(writer, 2);
   call<ULONG>(reader, 2);
@@ -1664,7 +1683,6 @@ void test_memory_copies(void* device, void* queue) {
   call<ULONG>(fence, 2);
   call<ULONG>(list, 2);
   call<ULONG>(allocator, 2);
-  VirtualFree(memory, 0, MEM_RELEASE);
 }
 
 // Title memory released while the GPU still reads it (a title's mistake the

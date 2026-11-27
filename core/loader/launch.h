@@ -40,6 +40,9 @@ struct LaunchOptions {
   uint32_t timeout_ms = 0;  // 0 waits until the title exits
   log::Level runtime_log_level = log::Level::Info;
   std::wstring trace_filter;  // comma separated wildcard patterns of import libraries to trace
+  // Sample the title's threads every this many milliseconds into
+  // <data>/logs/profile.txt (core/loader/profiler.h); 0 does not profile.
+  uint32_t profile_interval_ms = 0;
 };
 
 enum class LaunchStatus { Exited, TimedOut, Failed };

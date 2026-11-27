@@ -1,4 +1,5 @@
 #include "core/loader/launch.h"
+#include "core/loader/profiler.h"
 
 #include <windows.h>
 #include <winternl.h>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <memory>
 
 #include "core/common/boot_block.h"
 #include "core/common/paths.h"
@@ -474,7 +476,13 @@ LaunchResult launch(const LaunchOptions& options) {
             options.sandbox ? " (low integrity)" : "");
   ResumeThread(thread.value);
 
+  std::unique_ptr<Profiler> profiler;
+  if (options.profile_interval_ms) {
+    profiler = std::make_unique<Profiler>(process.value, options.profile_interval_ms,
+                                          join_path(join_path(data_dir, L"logs"), L"profile.txt"), exe_path);
+  }
   const DWORD wait = WaitForSingleObject(process.value, options.timeout_ms ? options.timeout_ms : INFINITE);
+  profiler.reset();  // the final report
   if (wait == WAIT_TIMEOUT) {
     if (job) TerminateJobObject(job.value, 1);
     TerminateProcess(process.value, 1);

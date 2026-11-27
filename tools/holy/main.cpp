@@ -49,6 +49,8 @@ void print_usage() {
       "      --trace <patterns>    comma separated import library patterns to trace, e.g. xmem.dll,d3d12*\n"
       "      --log-level <level>   trace, debug, info, warn, error (default: info)\n"
       "      --timeout <seconds>   stop the title after this long\n"
+      "      --profile [ms]        sample the title's threads (default every 2 ms) into\n"
+      "                            <data>/logs/profile.txt\n"
       "\n"
       "  holy version\n");
 }
@@ -260,6 +262,12 @@ int cmd_run(const std::vector<std::wstring>& args) {
         return kUsage;
       }
       options.timeout_ms = static_cast<uint32_t>(seconds * 1000);
+    } else if (arg == L"--profile") {
+      options.profile_interval_ms = 2;
+      if (i + 1 < args.size() && !args[i + 1].empty() && iswdigit(args[i + 1][0])) {
+        const unsigned long ms = std::wcstoul(args[++i].c_str(), nullptr, 10);
+        options.profile_interval_ms = static_cast<uint32_t>(ms < 1 ? 1 : ms > 1000 ? 1000 : ms);
+      }
     } else if (!arg.empty() && arg[0] == L'-') {
       std::fprintf(stderr, "unknown option: %s\n", narrow(arg).c_str());
       return kUsage;

@@ -39,6 +39,7 @@
 // either way. Titles map large pools up front (several GiB of texture pool)
 // and use them gradually; commit charge follows use instead of the mapping.
 #include <windows.h>
+#include <psapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -180,6 +181,20 @@ int32_t create_section(uint64_t bytes) {
     section.committed = false;
     section.handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                         static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
+    // The host opens GPU heaps only over committed sections: GPU work on
+    // pages stored here will fail. Said once, plainly, since what fails later
+    // (placed buffers, the title's own checks) does not point here.
+    static std::atomic<bool> warned{false};
+    if (section.handle && !warned.exchange(true)) {
+      PERFORMANCE_INFORMATION system{};
+      system.cb = sizeof(system);
+      GetPerformanceInfo(&system, sizeof(system));
+      LIB_LOG(holy::lib::kError, "xmem",
+              "the host's commit is exhausted (%.1f of %.1f GiB): physical storage is only reserved, and the GPU "
+              "cannot use the pages stored in it; close programs or restart the host",
+              static_cast<double>(system.CommitTotal) * system.PageSize / (1ull << 30),
+              static_cast<double>(system.CommitLimit) * system.PageSize / (1ull << 30));
+    }
   }
   if (!section.handle) {
     LIB_LOG(holy::lib::kError, "xmem", "cannot create 0x%llx bytes of physical storage (error %lu)",

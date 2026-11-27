@@ -446,7 +446,9 @@ Notes describe the platform, never a title.
   are opened (committed memory; physical pages: every title address showing storage the heap covers, kept current
   as the title maps and unmaps pages); descriptor heaps' GPU ranges when the heaps are made; buffers the bound tables, root views and vertex buffers name are located before the call if their page
   is not in the table yet. Partial: memory nothing has located (reached only through pointers held in memory)
-  reads as zero; the ring is not fenced.
+  reads as zero. A host list takes the ring's memory in chunks and gives them back when it is reset (the GPU is
+  then done with it), so a recording's root arguments stay its own however much is recorded after it and however
+  often it is submitted (a sample check records 75 MiB past one dispatch).
 - *measured* host behaviour (development host; a desktop compute program reading 16-byte elements, GB/s): the GPU
   does not keep memory of heaps opened over process memory (`OpenExistingHeapFromAddress`) or over a section
   (`OpenExistingHeapFromFileMapping`) in its second-level cache, while it does keep memory the host allocates:

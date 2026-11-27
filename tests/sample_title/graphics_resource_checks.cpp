@@ -1299,6 +1299,115 @@ void test_draw_recording_cost(void* device, void* queue) {
   VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+// A recording keeps its root arguments however much is recorded after it: a
+// list records one dispatch of a native program storing a root constant, a
+// second list records 100,000 more (more than the runtime's memory for root
+// arguments once held), and only the first runs. The runtime's memory for
+// them goes back once the lists are reset (its live count).
+void test_root_arguments_outlive_later_recording(void* device, void* queue) {
+  void* allocators[2] = {};
+  void* lists[2] = {};
+  void* fence = nullptr;
+  void* root = nullptr;
+  void* pipeline = nullptr;
+  void* placed = nullptr;
+  const uint32_t list_desc[4] = {0, 2, 1, 0};
+  for (int i = 0; i < 2; ++i) {
+    call<HRESULT>(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), &allocators[i]);
+    if (allocators[i]) {
+      call<HRESULT>(device, 73, list_desc, allocators[i], static_cast<void*>(nullptr), kListIid, &lists[i]);
+    }
+  }
+  call<HRESULT>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), &fence);
+  D3D12_ROOT_PARAMETER1 parameter{};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameter.Constants = {0, 0, 4};
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+  root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  root_desc.Desc_1_1.NumParameters = 1;
+  root_desc.Desc_1_1.pParameters = &parameter;
+  ID3DBlob* serialized = nullptr;
+  if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&root_desc, &serialized, nullptr)) && serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &root);
+  }
+  // s_load_dwordx4 s[4:7], s[0:1] (the constants: address, value); s[20:23]
+  // a buffer of 64 bytes at s[4:5]; v1 = s6; v0 = 0; buffer_store_dword v1,
+  // off, s[20:23], 0; s_endpgm.
+  const std::vector<uint8_t> container = native_only_container(
+      {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE940304u, 0xBE950305u, 0xB0160040u, 0xBE970380u, 0x7E020206u,
+       0x7E000280u, 0xE0700000u, 0x80050100u, 0xBF810000u});
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+  pso.CS = {container.data(), container.size()};
+  call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
+                __uuidof(ID3D12PipelineState), &pipeline);
+  auto* output = static_cast<volatile uint32_t*>(VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  using CounterFn = volatile int64_t* (*)(const char*);
+  const HMODULE runtime = GetModuleHandleW(L"holyrt.dll");
+  const auto counter = runtime ? reinterpret_cast<CounterFn>(GetProcAddress(runtime, "HolyCounter")) : nullptr;
+  volatile int64_t* held = counter ? counter("d3d12.ring_chunks_held") : nullptr;
+  if (!lists[0] || !lists[1] || !fence || !root || !pipeline || !output || !held) {
+    check(false, "the objects for recording past the root argument memory exist");
+    return;
+  }
+  const auto address = reinterpret_cast<uint64_t>(output);
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 0x10000;
+  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  call<HRESULT>(device, 133, address, &buffer, static_cast<UINT>(0xFFFFFFFF), static_cast<const void*>(nullptr),
+                __uuidof(ID3D12Resource), &placed);
+  const int64_t held_before = *held;
+  auto record = [&](void* list, void* allocator, uint32_t first_value, uint32_t dispatches) {
+    bool ok = call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
+    call<void>(list, 33, root);
+    call<void>(list, 25, pipeline);
+    for (uint32_t i = 0; i < dispatches; ++i) {
+      const uint32_t constants[4] = {static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32),
+                                     first_value + i, 0};
+      call<void>(list, 39, 0u, 4u, static_cast<const void*>(constants), 0u);
+      call<void>(list, 14, 1u, 1u, 1u);
+    }
+    return ok && call<HRESULT>(list, 9) == S_OK;
+  };
+  bool recorded = record(lists[0], allocators[0], 0xA11CEu, 1);
+  recorded = record(lists[1], allocators[1], 1u, 100000) && recorded;
+  const int64_t held_recorded = *held - held_before;
+  void* first[] = {lists[0]};
+  call<void>(queue, 35, 1u, static_cast<void* const*>(first), UINT64{0}, 0u);
+  call<HRESULT>(queue, 16, fence, UINT64{1});
+  const auto* value = call<const volatile uint64_t*>(fence, 12);
+  for (int i = 0; value && *value < 1 && i < 5000; ++i) Sleep(1);
+  const uint32_t stored = output[0];
+  // Reset both (the GPU is done with the first; the second never ran), then
+  // record nothing: the memory goes back.
+  for (int i = 0; i < 2; ++i) {
+    call<HRESULT>(allocators[i], 8);
+    call<HRESULT>(lists[i], 139, allocators[i], static_cast<void*>(nullptr), UINT64{0});
+    call<HRESULT>(lists[i], 9);
+  }
+  const int64_t held_after = *held - held_before;
+  std::printf("    (stored %08x; root argument memory held: %lld MiB recorded, %lld MiB after the resets; fence %llu)\n",
+              stored, static_cast<long long>(held_recorded), static_cast<long long>(held_after),
+              static_cast<unsigned long long>(value ? *value : 0));
+  check(recorded && value && *value == 1 && stored == 0xA11CEu,
+        "a recording keeps its root arguments however much is recorded after it");
+  check(held_recorded > 64 && held_after == 0, "root argument memory goes back when the lists are reset");
+
+  if (placed) call<ULONG>(placed, 2);
+  call<ULONG>(pipeline, 2);
+  call<ULONG>(root, 2);
+  call<ULONG>(fence, 2);
+  for (int i = 0; i < 2; ++i) {
+    call<ULONG>(lists[i], 2);
+    call<ULONG>(allocators[i], 2);
+  }
+  VirtualFree(const_cast<uint32_t*>(output), 0, MEM_RELEASE);
+}
+
 // What translated memory reads cost the GPU against the desktop's: a native
 // compute program and the same program in HLSL each read 16 times 16 bytes
 // per thread (unrolled) and store the sums, dispatched 4 times 4096 groups of
@@ -1701,6 +1810,7 @@ void test_graphics_resources(void* device, void* queue) {
   if (queue) test_native_draw(device, queue);
   if (queue) test_draw_recording_cost(device, queue);
   if (queue) test_memory_read_cost(device, queue);
+  if (queue) test_root_arguments_outlive_later_recording(device, queue);
   if (queue) test_native_depth(device, queue, false);
   if (queue) test_native_depth(device, queue, true);
   test_page_mapping_update(device);

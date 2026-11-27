@@ -54,6 +54,8 @@ struct HostList {
   bool recording = false;
   bool executed = false;  // submitted since it was last reset
   std::vector<void*> ngg_blocks;  // scratch memory of NGG draws (ngg.h)
+  std::vector<uint32_t> ring_chunks;  // upload ring memory of its calls (bindings.h)
+  uint32_t ring_used = 0;             // bytes used in the last chunk
 };
 
 struct DescriptorHeap;

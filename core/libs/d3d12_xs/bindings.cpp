@@ -24,8 +24,7 @@
 //
 // Partial: memory reached only through addresses held in memory (pointers
 // in constant data, descriptors outside the bound tables) that nothing has
-// located reads as zero. The ring is not fenced: it assumes the GPU is fewer
-// than about a thousand draws behind.
+// located reads as zero.
 #include "core/libs/d3d12_xs/bindings.h"
 
 #include <windows.h>
@@ -57,19 +56,39 @@ std::map<const void*, RootLayout>& layouts() {
 // System memory the host allocates, write-back and kept mapped for the CPU:
 // measured, the GPU caches such memory and not process memory a heap is
 // opened over (PLATFORM_NOTES.md), and every translated call reads its root
-// arguments from here. Translated programs reach it at the title addresses of
-// a range reserved below 2^40 (vertex shaders take the vertex buffer table's
-// address with only 8 bits of its high dword); root constant views take its
-// host GPU address.
+// arguments from here. Slabs of kSlabBytes, made as needed, at title
+// addresses of a range reserved below 2^40 (vertex shaders take the vertex
+// buffer table's address with only 8 bits of its high dword), where
+// translated programs reach them; root constant views take host GPU
+// addresses. A host list takes chunks of kChunkBytes for its calls and gives
+// them back when it is reset, once the GPU is done with it: memory a
+// recording uses stays its own for as long as it may run, however often it is
+// submitted.
 
-constexpr size_t kRingBytes = 64ull << 20;
+constexpr uint64_t kChunkBytes = 1ull << 20;
+constexpr uint64_t kSlabBytes = 64ull << 20;
+constexpr uint32_t kSlabs = 16;
+constexpr uint32_t kChunksPerSlab = static_cast<uint32_t>(kSlabBytes / kChunkBytes);
 
 struct Ring {
-  uint8_t* cpu = nullptr;  // the mapping
-  uint64_t title = 0;      // the reserved range translated programs use
-  uint64_t gpu = 0;        // host GPU address
-  std::atomic<uint64_t> next{0};
+  std::mutex lock;
+  uint64_t title = 0;  // the reserved range
+  bool failed = false;
+  uint8_t* cpu[kSlabs] = {};  // slab mappings
+  uint64_t gpu[kSlabs] = {};  // slab host GPU addresses
+  uint32_t slabs = 0;
+  std::vector<uint32_t> free_chunks;
 };
+
+Ring& ring() {
+  static auto* instance = new Ring();
+  return *instance;
+}
+
+const lib::Counter& c_ring_chunks() {
+  static const lib::Counter c("d3d12.ring_chunks_held");
+  return c;
+}
 
 // A piece of the ring: where the CPU writes it, its title and GPU addresses.
 struct RingBlock {
@@ -78,60 +97,98 @@ struct RingBlock {
   uint64_t gpu = 0;
 };
 
-Ring* ring(Device* device) {
-  static Ring* instance = [device] {
-    auto* made = new Ring();
+// Another slab (r.lock held); false when none can be made.
+bool add_slab(Device* device, Ring& r) {
+  if (r.failed || r.slabs == kSlabs) return false;
+  if (!r.title) {
     void* range = nullptr;
     for (uint64_t at = 0x0000008000000000ull; at >= 0x0000001000000000ull && !range; at >>= 1) {
-      range = VirtualAlloc(reinterpret_cast<void*>(at), kRingBytes, MEM_RESERVE, PAGE_NOACCESS);
+      range = VirtualAlloc(reinterpret_cast<void*>(at), kSlabBytes * kSlabs, MEM_RESERVE, PAGE_NOACCESS);
     }
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_CUSTOM;
-    heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
-    heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = kRingBytes;
-    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
-    desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;  // memory slots are raw unordered-access views
-    ID3D12Resource* buffer = nullptr;
-    void* mapped = nullptr;
-    HRESULT hr = range ? device->host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                               D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                               IID_PPV_ARGS(&buffer))
-                       : E_OUTOFMEMORY;
-    const D3D12_RANGE nothing_read{0, 0};
-    if (SUCCEEDED(hr)) hr = buffer->Map(0, &nothing_read, &mapped);
-    const bool mapped_in = SUCCEEDED(hr) && mapped &&
-                           map_host_buffer(device, buffer, reinterpret_cast<uint64_t>(range), kRingBytes);
-    if (!mapped_in) {
-      LIB_LOG(lib::kError, "d3d12", "no upload ring for translated calls (0x%08lX, range %p)",
-              static_cast<unsigned long>(hr), range);
-      return made;
+    if (!range) {
+      r.failed = true;
+      LIB_LOG(lib::kError, "d3d12", "no address range below 2^40 for the upload ring of translated calls");
+      return false;
     }
-    buffer->SetName(L"holy upload ring");
-    made->cpu = static_cast<uint8_t*>(mapped);
-    made->title = reinterpret_cast<uint64_t>(range);
-    made->gpu = buffer->GetGPUVirtualAddress();
-    return made;
-  }();
-  return instance;
+    r.title = reinterpret_cast<uint64_t>(range);
+  }
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+  heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+  heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  desc.Width = kSlabBytes;
+  desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;  // memory slots are raw unordered-access views
+  ID3D12Resource* buffer = nullptr;
+  void* mapped = nullptr;
+  HRESULT hr = device->host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                                     nullptr, IID_PPV_ARGS(&buffer));
+  const D3D12_RANGE nothing_read{0, 0};
+  if (SUCCEEDED(hr)) hr = buffer->Map(0, &nothing_read, &mapped);
+  const uint64_t title = r.title + r.slabs * kSlabBytes;
+  if (FAILED(hr) || !mapped || !map_host_buffer(device, buffer, title, kSlabBytes)) {
+    LIB_LOG(lib::kError, "d3d12", "upload ring slab %u for translated calls refused (0x%08lX)", r.slabs,
+            static_cast<unsigned long>(hr));
+    if (buffer) buffer->Release();
+    if (!r.slabs) r.failed = true;
+    return false;
+  }
+  buffer->SetName(L"holy upload ring");
+  r.cpu[r.slabs] = static_cast<uint8_t*>(mapped);
+  r.gpu[r.slabs] = buffer->GetGPUVirtualAddress();
+  for (uint32_t i = kChunksPerSlab; i-- > 0;) r.free_chunks.push_back(r.slabs * kChunksPerSlab + i);
+  ++r.slabs;
+  LIB_LOG(lib::kDebug, "d3d12", "upload ring slab %u at %p", r.slabs - 1, reinterpret_cast<void*>(title));
+  return true;
 }
 
-// `bytes` of ring memory aligned to 256 (cpu null when there is no ring).
-RingBlock ring_alloc(Device* device, size_t bytes) {
-  Ring* r = ring(device);
-  if (!r->cpu) return {};
+// `bytes` (at most kChunkBytes) of ring memory for a call recorded in `list`,
+// aligned to 256; cpu null when there is none.
+RingBlock ring_alloc(CommandList* list, size_t bytes) {
+  HostList* host = list->current;
   bytes = (bytes + 255) & ~size_t{255};
-  for (;;) {
-    uint64_t at = r->next.fetch_add(bytes);
-    if (at + bytes <= kRingBytes) return {r->cpu + at, r->title + at, r->gpu + at};
-    uint64_t expected = at + bytes;
-    r->next.compare_exchange_strong(expected, 0);  // wrap (one thread wins)
+  if (!host || bytes > kChunkBytes) return {};
+  Ring& r = ring();
+  if (host->ring_chunks.empty() || host->ring_used + bytes > kChunkBytes) {
+    std::lock_guard<std::mutex> guard(r.lock);
+    if (r.free_chunks.empty() && !add_slab(list->device, r)) {
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 4) {
+        LIB_LOG(lib::kError, "d3d12", "the upload ring is used up (%u slabs held by recordings)", r.slabs);
+      }
+      return {};
+    }
+    host->ring_chunks.push_back(r.free_chunks.back());
+    r.free_chunks.pop_back();
+    host->ring_used = 0;
+    c_ring_chunks().add(1);
   }
+  const uint32_t chunk = host->ring_chunks.back();
+  const uint64_t at = (chunk % kChunksPerSlab) * kChunkBytes + host->ring_used;
+  host->ring_used += static_cast<uint32_t>(bytes);
+  const uint32_t slab = chunk / kChunksPerSlab;
+  return {r.cpu[slab] + at, r.title + slab * kSlabBytes + at, r.gpu[slab] + at};
 }
+
+}  // namespace
+
+void release_ring_chunks(HostList* host) {
+  if (host->ring_chunks.empty()) return;
+  Ring& r = ring();
+  {
+    std::lock_guard<std::mutex> guard(r.lock);
+    r.free_chunks.insert(r.free_chunks.end(), host->ring_chunks.begin(), host->ring_chunks.end());
+  }
+  c_ring_chunks().add(-static_cast<int64_t>(host->ring_chunks.size()));
+  host->ring_chunks.clear();
+  host->ring_used = 0;
+}
+
+namespace {
 
 // --- reach --------------------------------------------------------------------------------
 
@@ -165,8 +222,8 @@ void reach_root(Device* device, const RootBinding& binding) {
 constexpr UINT kReservedViews = kReservedHostViews;
 
 // The system constants of shader/translate.h, written into the ring.
-uint64_t write_system(Device* device, const uint32_t (&user)[16], const NggPass* ngg = nullptr) {
-  const RingBlock block = ring_alloc(device, kSystemVectors * 16);
+uint64_t write_system(CommandList* list, const uint32_t (&user)[16], const NggPass* ngg = nullptr) {
+  const RingBlock block = ring_alloc(list, kSystemVectors * 16);
   if (!block.cpu) return 0;
   auto* v = reinterpret_cast<uint32_t*>(block.cpu);
   std::memset(v, 0, kSystemVectors * 16);
@@ -287,7 +344,7 @@ bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t 
   reach_root(device, list->graphics);
   // Vertex buffer table: RDNA 2 buffer descriptors (base, stride, records,
   // identity component selection).
-  const RingBlock table = ring_alloc(device, 16 * 16);
+  const RingBlock table = ring_alloc(list, 16 * 16);
   if (!table.cpu) return false;
   auto* vt = reinterpret_cast<uint32_t*>(table.cpu);
   std::memset(vt, 0, 16 * 16);
@@ -306,7 +363,7 @@ bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t 
   user[2] = base_vertex;
   user[3] = start_instance;
   pack_root(list, list->graphics, user, 8, 16);
-  const uint64_t system = write_system(device, user, ngg);
+  const uint64_t system = write_system(list, user, ngg);
   if (!system) return false;
   // An NGG draw's compute pass reads the graphics bindings (it is the
   // console's vertex stage) and writes the draw's records.
@@ -322,7 +379,7 @@ bool bind_translated_compute(CommandList* list) {
   if (!page_table) return false;
   reach_root(device, list->compute);
   // The root table: the packed arguments, then the sampler heap base.
-  const RingBlock table = ring_alloc(device, 4 * 66);
+  const RingBlock table = ring_alloc(list, 4 * 66);
   if (!table.cpu) return false;
   auto* root = reinterpret_cast<uint32_t*>(table.cpu);
   std::memset(root, 0, 4 * 66);
@@ -330,7 +387,7 @@ bool bind_translated_compute(CommandList* list) {
   uint32_t user[16] = {};
   user[0] = static_cast<uint32_t>(table.title);
   user[1] = static_cast<uint32_t>(table.title >> 32);
-  const uint64_t system = write_system(device, user);
+  const uint64_t system = write_system(list, user);
   if (!system) return false;
   bind_common(list, true, page_table, system);
   return true;

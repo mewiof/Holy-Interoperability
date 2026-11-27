@@ -9,6 +9,7 @@
 namespace holy::d3d12 {
 
 struct CommandList;
+struct HostList;
 
 // A title root signature's parameters as the console passes them to native
 // code: packed in parameter order, a descriptor table as one dword (its
@@ -56,5 +57,9 @@ bool bind_translated_compute(CommandList* list);
 // Re-binds the title's root signature and arguments on the host list after a
 // translated pipeline replaced them.
 void bind_title_root(CommandList* list, bool compute);
+
+// Gives back the upload ring memory a host list's calls used: once the GPU is
+// done with the list (it is reset for new commands).
+void release_ring_chunks(HostList* host);
 
 }  // namespace holy::d3d12

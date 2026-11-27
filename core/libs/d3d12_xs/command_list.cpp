@@ -173,6 +173,7 @@ HRESULT STDMETHODCALLTYPE list_reset_x(CommandList* self, void* allocator, void*
     use_host_list(self, h);
   }
   release_ngg_scratch(h);
+  release_ring_chunks(h);
   const HRESULT hr = h->list->Reset(host_allocator, nullptr);
   if (SUCCEEDED(hr)) {
     h->recording = true;

@@ -17,7 +17,7 @@ _Last updated: 2026-11-27._ The goal is a reference title running as smoothly as
 picture, sound and input at a stable 30 frames a second or better. The percentages are rough estimates of how
 much of the work toward that goal each area has, not test coverage.
 
-**Overall: about 25%** `█████░░░░░░░░░░░░░░░`
+**Overall: about 27%** `█████▌░░░░░░░░░░░░░░`
 
 ```mermaid
 flowchart LR

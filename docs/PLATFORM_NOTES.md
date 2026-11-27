@@ -380,6 +380,12 @@ Notes describe the platform, never a title.
   dword 3's high half is the number of 32-byte records of kind 0x41 that follow: one per resource binding the
   stage reads (dword 2 its offset in dwords in the descriptor table, dword 3 the register, dword 4 the view
   dimension). The pipeline block holds one byte-sized DXGI format per render target (bytes 16-23).
+- *observed*: native graphics pipelines may carry a program with neither exports nor interpolation next to a
+  vertex program (most of six instructions: depth-only passes; some read and write memory only). Implementation:
+  it is the pixel program, writing no target; a pixel program without any export keeps its pixels (lanes are
+  discarded only by programs that export). *observed*: pipeline block dword 3, the target count elsewhere, is
+  0x10f or 0x15f in some pipelines with six formats in bytes 16-21; *assumed*: their targets are the leading
+  formats (the field's meaning there is not established).
 
 ### Root arguments of native code
 

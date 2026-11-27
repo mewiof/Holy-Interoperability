@@ -22,6 +22,7 @@
 #include <cstring>
 
 #include "core/libs/inflate.h"
+#include "core/libs/d3d12_xs/shader/rdna.h"
 
 namespace holy::d3d12 {
 namespace {
@@ -336,6 +337,39 @@ bool native_compute_registers(const uint32_t* registers, size_t size, ComputeSha
   return true;
 }
 
+namespace {
+
+// What a native program exports and which kinds of instructions it uses, for
+// reports about programs the translation does not take yet.
+std::string program_summary(const uint8_t* code, size_t size) {
+  std::string targets, kinds;
+  bool interpolates = false, sends = false, lds = false, memory = false;
+  uint32_t count = 0;
+  rdna::Instruction inst;
+  for (uint32_t pc = 0; rdna::decode(code, size, pc, &inst); pc += 4 * inst.words) {
+    ++count;
+    if (inst.encoding == rdna::Encoding::EXP) {
+      char t[8];
+      std::snprintf(t, sizeof(t), " %u", inst.target);
+      if (targets.find(t) == std::string::npos) targets += t;
+    }
+    interpolates = interpolates || inst.encoding == rdna::Encoding::VINTRP;
+    sends = sends || (inst.encoding == rdna::Encoding::SOPP && (inst.op == 16 || inst.op == 17));
+    lds = lds || inst.encoding == rdna::Encoding::DS;
+    memory = memory || inst.encoding == rdna::Encoding::MUBUF || inst.encoding == rdna::Encoding::MTBUF ||
+             inst.encoding == rdna::Encoding::FLAT;
+    if (inst.encoding == rdna::Encoding::SOPP && inst.op == 31) break;  // s_code_end
+  }
+  kinds = std::to_string(count) + " instructions, exports [" + targets + " ]";
+  if (interpolates) kinds += ", interpolation";
+  if (sends) kinds += ", messages";
+  if (lds) kinds += ", group memory";
+  if (memory) kinds += ", buffer or global memory";
+  return kinds;
+}
+
+}  // namespace
+
 bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription* out, std::string* error) {
   *out = {};
   const auto* state = reinterpret_cast<const uint32_t*>(desc[1]);
@@ -348,6 +382,8 @@ bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription
     *error = text;
     return false;
   }
+  const uint8_t* unknown_code = nullptr;  // a program without exports or interpolation
+  size_t unknown_size = 0, unknown_slot = 0;
   for (size_t i = 5; i + 3 < 5 + 2 * 6; i += 4) {
     if (!desc[i]) continue;  // the stage slots can be sparse
     const auto* code = reinterpret_cast<const uint8_t*>(desc[i]);
@@ -358,8 +394,18 @@ bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription
     }
     GraphicsStage stage;
     if (!native_graphics_stage(code, desc[i + 1], &stage)) {
-      *error = "a stage that is neither a vertex nor a pixel program";
-      return false;
+      // Neither exports nor interpolation: observed in pipelines whose other
+      // program is a vertex program, so taken as a pixel program that writes
+      // no target (depth-only passes; programs that only write memory).
+      if (unknown_code) {
+        *error = "a stage that is neither a vertex nor a pixel program (slot " + std::to_string((i - 5) / 4) + ": " +
+                 program_summary(code, desc[i + 1]) + ")";
+        return false;
+      }
+      unknown_code = code;
+      unknown_size = desc[i + 1];
+      unknown_slot = (i - 5) / 4;
+      continue;
     }
     if (stage == GraphicsStage::Vertex && !out->vertex_code) {
       out->vertex_code = code;
@@ -372,18 +418,31 @@ bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription
       return false;
     }
   }
+  if (unknown_code) {
+    if (!out->vertex_code || out->pixel_code) {
+      *error = "a stage that is neither a vertex nor a pixel program (slot " + std::to_string(unknown_slot) + ": " +
+               program_summary(unknown_code, unknown_size) + ")";
+      return false;
+    }
+    out->pixel_code = unknown_code;
+    out->pixel_size = unknown_size;
+  }
   if (!out->vertex_code) {
     *error = "no vertex stage";
-    return false;
-  }
-  out->render_targets = pipeline[3];
-  if (out->render_targets > 8) {
-    *error = "more than eight render targets";
     return false;
   }
   // Bytes 16-23: one DXGI format per render target (titles leave values in
   // the bytes past the target count).
   const auto* format_bytes = reinterpret_cast<const uint8_t*>(pipeline + 4);
+  out->render_targets = pipeline[3];
+  if (out->render_targets > 8) {
+    // Observed: 0x10f and 0x15f here, with six formats in bytes 16-21, in
+    // pipelines that otherwise look alike; not a count (*assumed*: the
+    // targets are the leading formats; the field's meaning is not
+    // established).
+    out->render_targets = 0;
+    while (out->render_targets < 8 && format_bytes[out->render_targets]) ++out->render_targets;
+  }
   for (uint32_t i = 0; i < out->render_targets; ++i) out->formats[i] = format_bytes[i];
   // Observed: a pipeline without a pixel program counts one target whose
   // format is 0 (DXGI_FORMAT_UNKNOWN); such targets are not written.

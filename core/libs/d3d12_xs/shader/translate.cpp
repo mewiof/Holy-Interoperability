@@ -524,9 +524,11 @@ class Translator {
   // exit; host drivers have refused programs that return from inside it).
   void end_program() { put(kNextR, I(kEndBlock)); }
   // After the dispatcher: graphics outputs are written from their temps;
-  // pixel shaders that exported nothing (killed lanes) are discarded.
+  // pixel shaders that exported nothing (killed lanes) are discarded. A pixel
+  // program without any export (depth-only passes, programs that only write
+  // memory) keeps its pixels: the depth test and write happen without it.
   void epilogue(dxbc::Program& program) {
-    if (stage_ == Stage::Pixel) program.emit(dx::kDiscard, {R(kExportedR)});
+    if (stage_ == Stage::Pixel && pixel_exports_) program.emit(dx::kDiscard, {R(kExportedR)});
     for (uint32_t reg = 0; reg < kOutputRegisters; ++reg) {
       if (!outputs_register(reg)) continue;
       for (uint32_t c = 0; c < 4; ++c) {
@@ -712,6 +714,7 @@ class Translator {
   NggInfo ngg_;
   ShaderInterface iface_;
   uint8_t written_[kOutputRegisters] = {};  // components exported per output register
+  bool pixel_exports_ = false;              // a pixel program reaches an export instruction
   uint32_t exchange_reg_ = 0;    // temp holding the exchanged value while an instruction is emitted
   uint32_t modified_reg_ = 0;    // temp holding a DPP instruction's modified source 1
   bool exchange_ = false;        // the exchange area is used
@@ -2495,6 +2498,7 @@ bool Translator::emit_export(const Instruction& inst) {
   // Lanes no longer in EXEC are not written by the hardware: discard them.
   emit(dx::kDiscard, {active()});
   put(kExportedR, I(1));
+  pixel_exports_ = true;
   if (target < 8) {
     iface_.targets |= 1u << target;
     for (int c = 0; c < 4; ++c) {

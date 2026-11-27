@@ -2,7 +2,10 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "core/common/boot_block.h"
 #include "core/common/log.h"
@@ -61,6 +64,41 @@ uint64_t return_zero() {
   return 0;
 }
 
+// HOLY_TRACE_DUMP=<symbol>:<argument>:<bytes>: a traced call of `symbol`
+// also logs `bytes` (up to 1024) of the memory its register argument
+// `argument` (0-3) points to, in 64-bit words: what a title passes in a
+// structure, for working out a call's contract.
+void dump_argument(const std::string& symbol, const uint64_t* frame) {
+  static const struct Request {
+    std::string symbol;
+    int argument = -1;
+    size_t bytes = 0;
+  } request = [] {
+    Request r;
+    char text[256] = {};
+    if (!GetEnvironmentVariableA("HOLY_TRACE_DUMP", text, sizeof(text))) return r;
+    const std::string all = text;
+    const size_t first = all.find(':'), second = all.find(':', first + 1);
+    if (first == std::string::npos || second == std::string::npos) return r;
+    r.symbol = all.substr(0, first);
+    r.argument = std::atoi(all.c_str() + first + 1);
+    r.bytes = std::min<size_t>(static_cast<size_t>(std::atoi(all.c_str() + second + 1)), 1024);
+    return r;
+  }();
+  if (request.argument < 0 || request.argument > 3 || symbol != request.symbol) return;
+  uint64_t words[128] = {};
+  SIZE_T read = 0;
+  const auto* from = reinterpret_cast<const void*>(frame[request.argument]);
+  if (!ReadProcessMemory(GetCurrentProcess(), from, words, request.bytes, &read)) {
+    LOG_INFO("trace", "  argument %d: %p cannot be read", request.argument, from);
+    return;
+  }
+  for (size_t i = 0; i < read / 8; i += 4) {
+    LOG_INFO("trace", "  [+%03zx] %016llx %016llx %016llx %016llx", i * 8, words[i], words[i + 1], words[i + 2],
+             words[i + 3]);
+  }
+}
+
 // Layout of `frame`: [0..3] rcx, rdx, r8, r9; [4] return address; [5..8] the
 // caller's home space; [9..] stack arguments.
 void* dispatch(ImportRecord* record, const uint64_t* frame) {
@@ -82,6 +120,7 @@ void* dispatch(ImportRecord* record, const uint64_t* frame) {
     LOG_INFO("trace", "%s!%s(%llx, %llx, %llx, %llx) from %s [call %llu]", record->library.c_str(),
              record->symbol.c_str(), frame[0], frame[1], frame[2], frame[3], describe_address(caller).c_str(),
              count);
+    dump_argument(record->symbol, frame);
   }
 
   SetLastError(saved_error);

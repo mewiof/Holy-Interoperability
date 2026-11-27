@@ -68,6 +68,13 @@ void log_exception(const char* kind, const EXCEPTION_POINTERS* info) {
     LOG_ERROR(kComponent, "  %s address 0x%016llx",
               operation == 0 ? "reading" : (operation == 1 ? "writing" : "executing"),
               static_cast<unsigned long long>(record->ExceptionInformation[1]));
+    // What the memory there is: whose fault it is (not committed, read-only
+    // for write tracking, a guard page) shows in its state and protection.
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(reinterpret_cast<const void*>(record->ExceptionInformation[1]), &memory, sizeof(memory))) {
+      LOG_ERROR(kComponent, "  memory there: state 0x%lx, protection 0x%lx, type 0x%lx, allocation %p (protection 0x%lx)",
+                memory.State, memory.Protect, memory.Type, memory.AllocationBase, memory.AllocationProtect);
+    }
   }
 }
 

@@ -120,6 +120,7 @@ void register_services() {
   register_system();
   register_user();
   register_game_save();
+  register_store();
 }
 
 }  // namespace holy::xgr

@@ -13,6 +13,7 @@ holy_add_system_library(holy_lib_xgameruntime
     provider.h
     services.h
     speech.cpp
+    store.cpp
     system.cpp
     task_queue.cpp
     task_queue.h

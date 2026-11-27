@@ -25,9 +25,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "core/libs/support.h"
 #include "core/libs/vtable.h"
@@ -110,6 +114,131 @@ bool process_has_focus() {
 
 bool key(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
+// --- scripted input ------------------------------------------------------------------
+//
+// For runs without a person at the controls (regression runs, measurements):
+// HOLY_INPUT_SCRIPT lists presses, each `<when>:<controls>[/<ms>]`, separated
+// by ';'. `<when>` is seconds since the process started (the runtime log's
+// clock): `8.5` once, `10-60/2` every 2 s from 10 s to 60 s. `<controls>` are
+// joined by '+': A B X Y Menu View Up Down Left Right LB RB LS RS (buttons),
+// LT RT (triggers), LSUp LSDown LSLeft LSRight RSUp RSDown RSLeft RSRight
+// (sticks pushed fully). A press lasts `<ms>` (150 by default). Scripted
+// presses add to the host controller's and the keyboard's.
+
+struct ScriptedPress {
+  double first = 0, last = 0, period = 0;  // seconds; period 0: once
+  double hold = 0.15;
+  GamepadState controls;
+};
+
+bool parse_controls(const std::string& text, GamepadState* out) {
+  static const struct {
+    const char* name;
+    uint32_t button;
+  } kNames[] = {{"A", kA},           {"B", kB},       {"X", kX},           {"Y", kY},
+                {"Menu", kMenu},     {"View", kView}, {"Up", kDpadUp},     {"Down", kDpadDown},
+                {"Left", kDpadLeft}, {"Right", kDpadRight}, {"LB", kLeftShoulder}, {"RB", kRightShoulder},
+                {"LS", kLeftThumb},  {"RS", kRightThumb}};
+  size_t at = 0;
+  while (at <= text.size()) {
+    const size_t end = std::min(text.find('+', at), text.size());
+    const std::string name = text.substr(at, end - at);
+    bool known = false;
+    for (const auto& n : kNames) {
+      if (name == n.name) out->buttons |= n.button, known = true;
+    }
+    if (name == "LT") out->left_trigger = 1.0f, known = true;
+    if (name == "RT") out->right_trigger = 1.0f, known = true;
+    if (name == "LSUp") out->left_y = 1.0f, known = true;
+    if (name == "LSDown") out->left_y = -1.0f, known = true;
+    if (name == "LSLeft") out->left_x = -1.0f, known = true;
+    if (name == "LSRight") out->left_x = 1.0f, known = true;
+    if (name == "RSUp") out->right_y = 1.0f, known = true;
+    if (name == "RSDown") out->right_y = -1.0f, known = true;
+    if (name == "RSLeft") out->right_x = -1.0f, known = true;
+    if (name == "RSRight") out->right_x = 1.0f, known = true;
+    if (!known) return false;
+    at = end + 1;
+  }
+  return true;
+}
+
+const std::vector<ScriptedPress>& script() {
+  static const std::vector<ScriptedPress> presses = [] {
+    std::vector<ScriptedPress> out;
+    char text[4096] = {};
+    if (!GetEnvironmentVariableA("HOLY_INPUT_SCRIPT", text, sizeof(text))) return out;
+    const std::string all = text;
+    size_t at = 0;
+    while (at < all.size()) {
+      const size_t end = std::min(all.find(';', at), all.size());
+      const std::string entry = all.substr(at, end - at);
+      at = end + 1;
+      if (entry.empty()) continue;
+      ScriptedPress press;
+      const size_t colon = entry.find(':');
+      bool ok = colon != std::string::npos;
+      if (ok) {
+        const std::string when = entry.substr(0, colon);
+        std::string controls = entry.substr(colon + 1);
+        const size_t slash = controls.find('/');
+        if (slash != std::string::npos) {
+          press.hold = std::atof(controls.c_str() + slash + 1) / 1000.0;
+          controls.resize(slash);
+        }
+        const size_t dash = when.find('-');
+        press.first = std::atof(when.c_str());
+        press.last = press.first;
+        if (dash != std::string::npos) {
+          press.last = std::atof(when.c_str() + dash + 1);
+          const size_t every = when.find('/');
+          press.period = every != std::string::npos ? std::atof(when.c_str() + every + 1) : 1.0;
+        }
+        ok = parse_controls(controls, &press.controls) && press.hold > 0 && press.period >= 0;
+      }
+      if (!ok) {
+        LIB_LOG(holy::lib::kError, "gameinput", "HOLY_INPUT_SCRIPT: cannot read \"%s\"", entry.c_str());
+        continue;
+      }
+      out.push_back(press);
+    }
+    LIB_LOG(holy::lib::kInfo, "gameinput", "scripted input: %zu entries", out.size());
+    return out;
+  }();
+  return presses;
+}
+
+// Seconds since the process started.
+double process_seconds() {
+  static const uint64_t created = [] {
+    FILETIME creation, exit, kernel, user;
+    GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user);
+    return (static_cast<uint64_t>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+  }();
+  FILETIME now;
+  GetSystemTimeAsFileTime(&now);
+  const uint64_t ticks = (static_cast<uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+  return static_cast<double>(ticks - created) / 1e7;
+}
+
+void add_scripted(GamepadState* s) {
+  const std::vector<ScriptedPress>& presses = script();
+  if (presses.empty()) return;
+  const double now = process_seconds();
+  for (const ScriptedPress& p : presses) {
+    if (now < p.first || now > p.last + p.hold) continue;
+    const double into = p.period > 0 ? std::fmod(now - p.first, p.period) : now - p.first;
+    if (into > p.hold) continue;
+    s->buttons |= p.controls.buttons;
+    if (p.controls.left_trigger) s->left_trigger = p.controls.left_trigger;
+    if (p.controls.right_trigger) s->right_trigger = p.controls.right_trigger;
+    if (p.controls.left_x) s->left_x = p.controls.left_x;
+    if (p.controls.left_y) s->left_y = p.controls.left_y;
+    if (p.controls.right_x) s->right_x = p.controls.right_x;
+    if (p.controls.right_y) s->right_y = p.controls.right_y;
+  }
+}
+
 GamepadState host_gamepad() {
   GamepadState s;
   using GetStateFn = DWORD(WINAPI*)(DWORD, XInputState*);
@@ -158,6 +287,7 @@ GamepadState host_gamepad() {
     if (key('Z')) s.left_trigger = 1.0f;
     if (key('C')) s.right_trigger = 1.0f;
   }
+  add_scripted(&s);
   return s;
 }
 

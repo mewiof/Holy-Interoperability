@@ -261,8 +261,15 @@ bool ensure_swap_chain(Presenter* p, DXGI_FORMAT format, UINT width, UINT height
   return p->swap_chain != nullptr;
 }
 
+// Presents 1, 30 and 300 are captured; later ones every HOLY_CAPTURE_EVERY
+// presents when that is set (a capture of a 4K frame is 33 MB: periodic
+// captures by default would fill the disk over long sessions).
 bool capture_due(uint64_t present) {
-  return present == 1 || present == 30 || present == 300 || (present % 1800) == 0;
+  static const uint64_t every = [] {
+    wchar_t text[32] = {};
+    return GetEnvironmentVariableW(L"HOLY_CAPTURE_EVERY", text, 32) ? static_cast<uint64_t>(_wtoi64(text)) : 0ull;
+  }();
+  return present == 1 || present == 30 || present == 300 || (every && present % every == 0);
 }
 
 uint8_t to_byte(float value) {

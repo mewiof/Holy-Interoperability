@@ -339,7 +339,7 @@ Notes describe the platform, never a title.
   pass the token of a frame a few frames back, the mask `0x11100`, a count of 6 and room for six 56-byte records,
   and use the records only when the call succeeds with a nonzero count (dword 0 of a record is one bit of the
   mask, byte 8 a flag, bytes 0x18-0x1F a 64-bit value). *assumed*: timing statistics of a frame's events.
-  Implementation: none are kept; the call succeeds with no records. Presents 1, 30, 300 and every 1800th are also written to
+  Implementation: none are kept; the call succeeds with no records. Presents 1, 30 and 300 (and every `HOLY_CAPTURE_EVERY`th when set) are also written to
   `<data>/frames/present-<n>.bmp`. Partial: one plane; colour space and placement not applied.
 
 ### Resources

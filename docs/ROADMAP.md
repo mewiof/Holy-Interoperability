@@ -115,8 +115,8 @@ The largest piece.
   slot), which also replaces the per-access scan of the region table.
 - done: native pipelines with a program that neither exports nor interpolates (depth-only passes) and with an
   unusual target field; placeholder pipelines in the reference title's first minute went from 426 to 66.
-- next: unordered-access views of depth textures (the host has no texture with both usages: a paired texture
-  kept in step at barriers); ray intersection image instructions in compute programs.
+- done: unordered-access views of depth textures, through a twin texture kept in step at barriers.
+- next: ray intersection image instructions in compute programs.
 - next: textures streamed into scattered pool pages are copied through the CPU.
 - open: textures the GPU writes in title memory as seen by the CPU.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed

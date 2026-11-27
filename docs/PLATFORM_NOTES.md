@@ -349,8 +349,10 @@ Notes describe the platform, never a title.
 - *observed*: titles set texture layout 0x105 on 3D textures (a console swizzle mode, *assumed*); console layouts
   and flag bits above the desktop's are dropped for the host. Depth textures may ask for unordered access, and
   packed 16-bit formats (`B5G6R5`, `B5G5R5A1`, `B4G4R4A4`) for typed unordered access; the desktop allows neither,
-  so the first are made without unordered access (UAVs of them report themselves) and the second as
-  `R8G8B8A8_UNORM` textures with matching views.
+  so the first are made without unordered access, with a twin texture of the same format family that has it
+  (unordered-access views are of the twin; a barrier into the unordered-access layout copies the depth texture into
+  the twin, one out of it copies the twin back), and the second as `R8G8B8A8_UNORM` textures with matching views
+  when the host GPU does not support them for the usage asked.
 - *observed*: the initial state titles pass to `CreatePlacedResourceX` for textures and to slot 127 is a barrier
   layout (3 and 6 seen, then named as the layout before the first barrier). Implementation: host textures are
   created in that layout (`CreateCommittedResource3`); each placement gets its own host texture.

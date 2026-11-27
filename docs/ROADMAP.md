@@ -168,7 +168,9 @@ output through the host's audio stack.
 - partial: shape contexts, the control processor and both audio processors' connections and command queues, as a
   silent device: titles start audio, nothing is decoded, mixed or played.
 - open: carrying out the processors' commands. They include decoding the console's compressed audio format, which
-  needs either an original decoder or a third-party one (a decision for the maintainer).
+  needs either an original decoder or a third-party one (a decision for the maintainer). Titles drive the
+  processors themselves (no middleware, no host audio interface): `HOLY_AUDIO_TRACE` records the command
+  streams and the records commands name, the material for establishing the command formats.
 
 ## 6. Input (`gameinput`) — partial
 

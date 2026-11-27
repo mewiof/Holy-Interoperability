@@ -18,7 +18,9 @@
 //
 // Host: a silent audio device. The memory block is zeroed audio processor
 // memory; commands are accepted and not carried out, so no result is ever
-// produced (the count stays 0).
+// produced (the count stays 0). HOLY_AUDIO_TRACE writes the configuration,
+// every command and the 0x280-byte record its dword 1 names to
+// <data>/logs/audio-xapu.txt (core/libs/trace_file.h), for studying them.
 #include <windows.h>
 
 #include <atomic>
@@ -26,6 +28,7 @@
 #include <cstring>
 
 #include "core/libs/support.h"
+#include "core/libs/trace_file.h"
 
 extern "C" __declspec(dllimport) HRESULT ApuAlloc(void** address, uint32_t* apu_address, uint32_t bytes,
                                                   uint32_t alignment, uint32_t flags);
@@ -38,6 +41,10 @@ struct XApuConfig {
 };
 
 constexpr uint32_t kConnection = 0x58415055;  // "XAPU"
+constexpr uint32_t kRecordBytes = 0x280;
+constexpr uint32_t kRecords = 0x100;  // records before the buffers (at 0x14000) for the size seen
+
+holy::lib::TraceFile g_trace(L"HOLY_AUDIO_TRACE", L"audio-xapu.txt");
 
 struct Connection {
   uint32_t magic = kConnection;
@@ -71,14 +78,30 @@ HOLY_EXPORT HRESULT XApuConnect(const XApuConfig* config, void** memory, void** 
   }
   *memory = connection->memory;
   *out = connection;
+  if (g_trace.on()) {
+    uint32_t words[8];
+    std::memcpy(words, config->words, sizeof(config->words));
+    const auto base = reinterpret_cast<uintptr_t>(connection->memory);
+    words[6] = static_cast<uint32_t>(base);
+    words[7] = static_cast<uint32_t>(base >> 32);
+    g_trace.event("connect", words, 8);
+  }
   LIB_LOG(holy::lib::kInfo, "xapu", "connected (%u %u %u 0x%x %u %u): a silent audio device", config->words[0],
           config->words[1], config->words[2], config->words[3], config->words[4], config->words[5]);
   return S_OK;
 }
 
 HOLY_EXPORT HRESULT XApuEnqueueCommand(void* handle, const uint32_t* command, uint32_t flags) {
-  if (!connection_of(handle)) return E_HANDLE;
+  Connection* connection = connection_of(handle);
+  if (!connection) return E_HANDLE;
   if (!command) return E_POINTER;
+  if (g_trace.on()) {
+    g_trace.event("command", command, 16);
+    if (connection->memory && command[1] < kRecords) {
+      g_trace.event("record", static_cast<const uint8_t*>(connection->memory) + command[1] * kRecordBytes,
+                    kRecordBytes / 4);
+    }
+  }
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1) < 16) {
     LIB_LOG(holy::lib::kDebug, "xapu", "command %u (%08x %08x %08x, flags 0x%x): not carried out", command[0],

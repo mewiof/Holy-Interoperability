@@ -12,13 +12,16 @@
 //   HRESULT XDspDeactivate(Handle), XDspDisconnect(Handle)
 //
 // Host: a silent DSP. Connections, activations and commands are accepted and
-// not carried out (nothing is decoded or mixed).
+// not carried out (nothing is decoded or mixed). HOLY_AUDIO_TRACE writes
+// connections and the first 64 bytes of every command to
+// <data>/logs/audio-chad.txt (core/libs/trace_file.h).
 #include <windows.h>
 
 #include <atomic>
 #include <cstdint>
 
 #include "core/libs/support.h"
+#include "core/libs/trace_file.h"
 
 namespace {
 
@@ -30,6 +33,8 @@ struct Connection {
   uint32_t bytes = 0;
   uint32_t streams = 0;
 };
+
+holy::lib::TraceFile g_trace(L"HOLY_AUDIO_TRACE", L"audio-chad.txt");
 
 Connection* connection_of(void* handle) {
   auto* c = static_cast<Connection*>(handle);
@@ -46,6 +51,11 @@ HOLY_EXPORT HRESULT XDspConnectWithMaximumStreamLimit(void* memory, uint32_t byt
   connection->bytes = bytes;
   connection->streams = streams;
   *out = connection;
+  if (g_trace.on()) {
+    const auto base = reinterpret_cast<uintptr_t>(memory);
+    const uint32_t words[6] = {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32), bytes, streams, a, b};
+    g_trace.event("connect", words, 6);
+  }
   LIB_LOG(holy::lib::kInfo, "chad", "connected (memory %p, 0x%x bytes, %u streams, 0x%x, %u): a silent DSP", memory,
           bytes, streams, a, b);
   return S_OK;
@@ -58,6 +68,7 @@ HOLY_EXPORT HRESULT XDspActivate(void* handle, void*, void*, void*) {
 HOLY_EXPORT HRESULT XDspSubmitCommand(void* handle, const void* command) {
   if (!connection_of(handle)) return E_HANDLE;
   if (!command) return E_POINTER;
+  g_trace.event("command", command, 16);
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1) < 16) {
     const auto* words = static_cast<const uint32_t*>(command);

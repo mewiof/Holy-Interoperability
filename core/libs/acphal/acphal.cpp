@@ -46,6 +46,7 @@
 #include <mutex>
 
 #include "core/libs/support.h"
+#include "core/libs/trace_file.h"
 #include "core/libs/vtable.h"
 
 namespace {
@@ -223,8 +224,18 @@ HRESULT STDMETHODCALLTYPE processor_initialize(ControlProcessor*, uint32_t a, ui
 HRESULT STDMETHODCALLTYPE processor_shutdown(ControlProcessor*) {
   return S_OK;
 }
+// HOLY_AUDIO_TRACE: the control processor's commands (number, cookie, mask,
+// extra, then the payload's first 64 bytes) and shape context allocations,
+// to <data>/logs/audio-acphal.txt (core/libs/trace_file.h).
+holy::lib::TraceFile g_trace(L"HOLY_AUDIO_TRACE", L"audio-acphal.txt");
+
 HRESULT STDMETHODCALLTYPE processor_submit(ControlProcessor*, uint32_t command, uint32_t cookie, uint32_t mask,
                                            const void* payload, uint32_t extra) {
+  if (g_trace.on()) {
+    const uint32_t words[4] = {command, cookie, mask, extra};
+    g_trace.event("submit", words, 4);
+    if (payload) g_trace.event("payload", payload, 16);
+  }
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1) < 16) {
     LIB_LOG(holy::lib::kDebug, "acphal", "command %u (cookie 0x%x, mask 0x%x, payload %p, 0x%x): not carried out",
@@ -263,6 +274,7 @@ HOLY_EXPORT HRESULT AcpHalAllocateShapeContexts(ShapeContexts* contexts) {
     std::memset(g_contexts[kind], 0, static_cast<size_t>(bytes));
     contexts->contexts[kind] = g_contexts[kind];
   }
+  if (g_trace.on()) g_trace.event("shape contexts", contexts, sizeof(ShapeContexts) / 4);
   LIB_LOG(holy::lib::kInfo, "acphal", "shape contexts: %u %u %u %u %u %u", contexts->counts[0], contexts->counts[1],
           contexts->counts[2], contexts->counts[3], contexts->counts[4], contexts->counts[5]);
   return S_OK;

@@ -71,6 +71,7 @@ Debugging aids, set in the environment:
 | `HOLY_D3D_TRACE=<n>` | every call between presents `n-1` and `n` (from the start for `n` = 1) is logged, with what draws, clears, barriers, pipelines, render targets and viewports were given, and for draws their vertex buffers (first vertex as floats) and root arguments: an account of one frame |
 | `HOLY_CAPTURE_EVERY=<n>` | besides presents 1, 30 and 300, write every `n`th presented frame to `<data>/frames/present-<n>.bmp` |
 | `HOLY_DUMP_TARGETS=<n>` | at present `n`, every live texture of the title is written to `<data>/frames/textures-<n>/` and its per-channel minimum and maximum logged |
+| `HOLY_AUDIO_TRACE=1` (or a number: the events kept, 4000 by default) | the audio libraries write what titles send them to `<data>/logs/audio-xapu.txt` (configuration, every 64-byte command and the record it names), `audio-chad.txt` (connections, commands) and `audio-acphal.txt` (shape contexts, control processor commands and payloads): one event a line, milliseconds then dwords in hexadecimal, for studying the audio processors' commands |
 | `HOLY_WATCH=at=<offset>;if=<reg>+<off>:<value>;watch=<reg>+<off>` | hardware watchpoints: when the title executes `title+<offset>` (and the 32-bit value at `<reg>+<off>` matches), writes to the 8 bytes at the `watch` address (`*<reg>+<off>`: at the address stored there) are logged with their stacks, in every thread, for the three latest such addresses |
 
 In exploration mode (`--unimplemented continue`), a pipeline whose creation reports itself as unimplemented is

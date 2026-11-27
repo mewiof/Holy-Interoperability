@@ -8,8 +8,9 @@ libraries itself, as clean-room reimplementations on top of the host's own APIs.
 virtual machine and no separate runtime process.
 
 > **Status: bring-up.** A retail title boots, creates its graphics device and tens of thousands of pipelines
-> translated from native GPU code, and presents frames at its own pace within seconds of starting, but what it
-> draws is not visible yet and no title is playable. See [Progress](#progress).
+> translated from native GPU code, runs steadily at 30 frames a second for as long as it was tested (90 s, with
+> the host's graphics debug layer finding nothing), and shows its first screen; no title is playable yet. See
+> [Progress](#progress).
 
 ## Progress
 
@@ -17,7 +18,7 @@ _Last updated: 2026-11-27._ The goal is a reference title running as smoothly as
 picture, sound and input at a stable 30 frames a second or better. The percentages are rough estimates of how
 much of the work toward that goal each area has, not test coverage.
 
-**Overall: about 27%** `█████▌░░░░░░░░░░░░░░`
+**Overall: about 33%** `██████▌░░░░░░░░░░░░░`
 
 ```mermaid
 flowchart LR
@@ -27,8 +28,8 @@ flowchart LR
   classDef active fill:#d29922,color:#ffffff,stroke:#9a6700
   classDef open fill:#f6f8fa,color:#57606a,stroke:#d0d7de
   class load,boot,gpu,first done
-  class stable active
-  class picture,menu,game,fps open
+  class stable,picture active
+  class menu,game,fps open
 ```
 
 | Milestone (reference title) | State |
@@ -37,10 +38,10 @@ flowchart LR
 | Graphics device, title memory as GPU memory, pipelines from native GPU code | ✅ done; translated rendering not yet checked against known results |
 | Start-up in seconds, memory within the host's means | ✅ first frame after 3 s; about 5 GiB of commit at the first frames (was 17 GiB) |
 | Frames presented at the title's pace | ✅ 30 a second, measured |
-| Runs for minutes without crashing | 🟡 five stops in the title's first seconds fixed; runs on the development host now end within 2-30 s because its system commit is exhausted (about 60 GiB still pinned by a host graphics driver leak that older builds triggered; current builds measurably do not leak, and a host restart frees it). The "invalid call" device removals in those runs follow the exhausted commit (`HOLY_D3D_CHECK` finds no call that causes them) |
+| Runs for minutes without crashing | 🟡 90 s so far (longer runs next) at a steady 30 frames a second, no live counter growing, the host's debug layer silent (was: the device removed after 40-80 s). The "invalid call" removals were not the host's exhausted commit but a buffer view reaching past its buffer, which the console allows and the host cannot report but by removing the device; host views and copies now stay inside their buffers, buffers over physical pages out of order are placed, texture copies survive unreadable title memory |
 | No memory leaks (RAM, VRAM, system commit) | 🟡 live-object counters in every run; host heaps no longer leak system commit after exit; released textures free their host copies; title memory the GPU used is given back when the title frees it (it stayed charged: 1 GiB over 16 rounds of 64 MiB, now none; an end-to-end check); a fence's value no longer keeps a thread and a host fence after the fence is released; root argument memory goes back when lists are reset (live count) |
-| A correct picture | ⬜ frames were black: the loading screen's three draws a frame reached no render target. Found since, with checks in the sample title that fail without each fix: draws without indices fetched their vertices from the start of the buffer (the loading screen draws from one buffer at different first vertices); a quarter of native pipelines had no render target or only the first; 477 never wrote target 0; depth tests were off; textures read as their red channel; a fence made where a released one had been showed the old fence's value, so work looked finished before the GPU had run it (its results read as zero, about one read in 70). Not yet tried on the title (the host must restart first) |
-| Menus and input | 🟡 a gamepad from the host controller or keyboard; menus not reached yet |
+| A correct picture | 🟡 the first screen shows (an account prompt, text drawn correctly) after frames were black; its full-screen background covers half the screen (a rectangle drawn as one triangle). Found before, with checks in the sample title that fail without each fix: draws without indices fetched their vertices from the start of the buffer; a quarter of native pipelines had no render target or only the first; 477 never wrote target 0; depth tests were off; textures read as their red channel; a fence made where a released one had been showed the old fence's value |
+| Menus and input | 🟡 a gamepad from the host controller or keyboard; the title waits at its account prompt (nobody is signed in) |
 | Sound | ⬜ silent audio device |
 | In game at a stable 30 FPS, no leaks | ⬜ |
 
@@ -54,7 +55,7 @@ flowchart LR
 | Graphics: shader translation | `██████░░░░` 58% (every one of the reference title's 19,305 saved programs translates, ray intersection included (checked against hand-computed results, not yet against the console's); translations 45% smaller and laid out in program order, so the host compiles them in a third of the time: measured) |
 | Graphics: pipelines and caches | `███████▌░░` 75% (translations cached on disk compressed, 8.7 times smaller; pipeline creation reads only their headers, the bytes are read when compiling: about 11 s of processor time less at every start; host pipelines compiled at first use or, when an earlier run used them, in the background) |
 | Graphics: correct output | `███░░░░░░░` 28% (fence values belong to their fence; textures read with all four channels; texture copies follow the title's writes; native pipelines get their targets, depth tests and vertices right) |
-| Graphics: performance | `███▌░░░░░░` 35% (host shader compile time, the first run's main cost, 3 times lower: 166 s to 56 s for 60 compute programs, measured without the driver's cache answering; page table and root arguments in memory the GPU caches; aligned reads as one load; memory accesses: two page-table reads instead of a scan; no views written per draw; recording a draw of native programs costs 0.3 us of CPU time, 0.4 us with a pipeline and table change each draw, measured over 20,000 draws; translated memory reads now cost the same as the desktop's on the same memory (1.0 times, was 1.5), and the GPU reads title memory over the bus without its second-level cache, about 20 times slower than video memory: measured; copies in video memory of what translated programs read, opt-in for now, make such reads 3 times faster) |
+| Graphics: performance | `████░░░░░░` 40% (host memory queries no longer stall the title: `VirtualQuery` takes up to 10 ms on large committed memory and was asked per timestamp, buffer and reached address (a loading thread spent up to 89 s of 100 in the kernel, 0.4 frames a second), now the allocation record answers in 0.15 us; a growing allocation re-opened its GPU heap with a quadratic walk (1.3-3 s a frame), now 15 ms with room to grow; host shader compile time, the first run's main cost, 3 times lower: 166 s to 56 s for 60 compute programs, measured without the driver's cache answering; page table and root arguments in memory the GPU caches; aligned reads as one load; memory accesses: two page-table reads instead of a scan; no views written per draw; recording a draw of native programs costs 0.3 us of CPU time, 0.4 us with a pipeline and table change each draw, measured over 20,000 draws; translated memory reads now cost the same as the desktop's on the same memory (1.0 times, was 1.5), and the GPU reads title memory over the bus without its second-level cache, about 20 times slower than video memory: measured; copies in video memory of what translated programs read, opt-in for now, make such reads 3 times faster) |
 | Input | `████░░░░░░` 40% |
 | Audio | `█░░░░░░░░░` 10% |
 | Measurement: statistics, profiler, leak checks, call check, frame trace | `████████▌░` 85% (a run report turns a run's log into frames a second, frame times, memory growth and leak suspects, with exit codes; one command runs and checks a title; offline host compile times of every kind of translated program, without the driver's cache answering) |

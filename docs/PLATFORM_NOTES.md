@@ -472,8 +472,9 @@ Notes describe the platform, never a title.
   Title memory reaches the GPU through heaps of the first two kinds, so whatever misses the first-level caches
   (vertices, structured data, tables beyond a few KiB) crosses the bus each time: about 20 times slower than video
   memory. Measured through the runtime (sample title): a native compute program reading 256 times 16 bytes
-  per thread over 1 MiB of title memory takes 0.98 ms, the same program in HLSL 0.65 ms (1.5 times: the
-  translated access path, page table reads and a guard per access). An earlier version of this measurement read
+  per thread over 1 MiB of title memory took 0.98 ms, the same program in HLSL 0.65 ms (1.5 times: the
+  translated access path, page table reads and a guard per access); with the page lookup without branches,
+  no guard on memory views and the program laid out in order it takes 0.62 ms against 0.62 ms (1.0 times). An earlier version of this measurement read
   a few KiB and had every thread store to the same addresses: its equal times (about 47 ms) were set by those
   stores, not by the reads. Textures are not affected (host copies in video memory).
 - Implementation (opt-in, `HOLY_BUFFER_COPIES` in MiB): pages that translated calls read through bound buffers

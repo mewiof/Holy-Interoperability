@@ -39,6 +39,19 @@ __declspec(dllimport) HRESULT ApuFree(void* address);
 __declspec(dllimport) bool ApuIsVirtualAddressValid(const void* address, uint32_t bytes);
 __declspec(dllimport) uint32_t ApuMapVirtualAddress(const void* address);
 __declspec(dllimport) void* ApuMapApuAddress(uint32_t apu_address);
+__declspec(dllimport) HRESULT AcpHalAllocateShapeContexts(void* contexts);
+__declspec(dllimport) void AcpHalReleaseShapeContexts();
+__declspec(dllimport) HRESULT AcpHalCreate(void** out);
+__declspec(dllimport) HRESULT XApuConnect(const uint32_t* config, void** memory, void** out);
+__declspec(dllimport) HRESULT XApuEnqueueCommand(void* handle, const uint32_t* command, uint32_t flags);
+__declspec(dllimport) uint32_t XApuGetResultCount(void* handle, uint32_t);
+__declspec(dllimport) void XApuDisconnect(void* handle);
+__declspec(dllimport) HRESULT XDspConnectWithMaximumStreamLimit(void* memory, uint32_t bytes, uint32_t streams,
+                                                                uint32_t a, uint32_t b, void** out);
+__declspec(dllimport) HRESULT XDspActivate(void* handle, void* a, void* b, void* c);
+__declspec(dllimport) HRESULT XDspSubmitCommand(void* handle, const void* command);
+__declspec(dllimport) HRESULT XDspDeactivate(void* handle);
+__declspec(dllimport) HRESULT XDspDisconnect(void* handle);
 }
 
 namespace {
@@ -475,6 +488,45 @@ void test_audio_heap() {
   ApuFree(non_cached);
 }
 
+// The audio processors, as titles start them (a silent device on the host).
+void test_audio_processors() {
+  struct {
+    uint32_t counts[6];
+    void* contexts[6];
+  } shapes{{0, 0, 0, 0, 3, 0}, {}};
+  check(AcpHalAllocateShapeContexts(&shapes) == S_OK && shapes.contexts[4] && !shapes.contexts[0],
+        "shape contexts are allocated for the kinds the title asks for");
+  void* processor = nullptr;
+  check(AcpHalCreate(&processor) == S_OK && processor, "the audio control processor is created");
+  if (processor) {
+    using InitFn = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);
+    using SubmitFn = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
+    void** vtable = *static_cast<void***>(processor);
+    const uint32_t payload = 0xC0;
+    check(reinterpret_cast<InitFn>(vtable[0])(processor, 0x1000, 0x1000) == S_OK &&
+              reinterpret_cast<SubmitFn>(vtable[2])(processor, 2, 0xF0F0F0F0, 0xFFFFFFFF, &payload, 0) == S_OK,
+          "the control processor starts and accepts commands");
+  }
+  const uint32_t config[6] = {1, 0x100, 2, 0x4000, 0, 1};
+  void* memory = nullptr;
+  void* apu = nullptr;
+  check(XApuConnect(config, &memory, &apu) == S_OK && apu && memory &&
+            static_cast<volatile uint8_t*>(memory)[0x3FFF] == 0,
+        "the audio processor connects with zeroed memory of the size asked for");
+  const uint32_t command[16] = {1};
+  check(apu && XApuEnqueueCommand(apu, command, 0) == S_OK && XApuGetResultCount(apu, 0) == 0,
+        "the audio processor accepts commands");
+  static uint8_t dsp_memory[0x1000];
+  void* dsp = nullptr;
+  check(XDspConnectWithMaximumStreamLimit(dsp_memory, sizeof(dsp_memory), 30, 0x80, 1, &dsp) == S_OK && dsp,
+        "the audio DSP connects (titles require S_OK)");
+  check(dsp && XDspActivate(dsp, nullptr, nullptr, nullptr) == S_OK && XDspSubmitCommand(dsp, command) == S_OK &&
+            XDspDeactivate(dsp) == S_OK && XDspDisconnect(dsp) == S_OK,
+        "the audio DSP activates, accepts commands and disconnects");
+  if (apu) XApuDisconnect(apu);
+  AcpHalReleaseShapeContexts();
+}
+
 void test_fast_storage() {
   constexpr GUID kFactory = {0x62959d11, 0xd45f, 0x4884, {0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae}};
   void* factory = nullptr;
@@ -610,6 +662,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR command_line, int) {
   test_deferred_commit();
   test_fast_storage();
   test_audio_heap();
+  test_audio_processors();
   test_texture_layout();
   test_graphics();
   if (!(command_line && std::strstr(command_line, "--expect-online"))) test_offline();

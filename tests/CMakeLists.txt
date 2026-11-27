@@ -59,7 +59,7 @@ set_target_properties(sample_package_lib PROPERTIES
 add_executable(sample_title WIN32 sample_title/alloc_hooks.cpp sample_title/checks.h sample_title/graphics_checks.cpp
   sample_title/graphics_resource_checks.cpp sample_title/main.cpp sample_title/runtime_checks.cpp)
 holy_target_defaults(sample_title)
-target_link_libraries(sample_title PRIVATE holy_lib_xmem holy_lib_xcrdapi holy_lib_d3d12_xs holy_lib_acphal
+target_link_libraries(sample_title PRIVATE holy_lib_xmem holy_lib_xcrdapi holy_lib_d3d12_xs holy_lib_acphal holy_lib_xapu holy_lib_chad
   sample_stub_lifecycle sample_stub_missing
   sample_stub_gameinput sample_package_lib advapi32 ws2_32)
 set_target_properties(sample_title PROPERTIES

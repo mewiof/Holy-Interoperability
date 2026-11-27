@@ -20,17 +20,33 @@
 // audio processor address is the offset in it plus a fixed base (so 0 is
 // never one). Allocation is first fit over each heap's free ranges.
 //
-// The shape-context and processor functions (AcpHalCreate,
-// AcpHalAllocateShapeContexts, AcpHalReleaseShapeContexts) do the hardware's
-// audio processing and are not implemented: they report themselves.
+// Shape contexts and the control processor (observed):
+//
+//   HRESULT AcpHalAllocateShapeContexts(ShapeContexts* contexts)
+//           six 32-bit context counts the title fills in, then six pointers
+//           this call writes: arrays of 64 bytes a context (the title clears
+//           them itself).
+//   void    AcpHalReleaseShapeContexts(void)
+//   HRESULT AcpHalCreate(IAcpHal** out)
+//           slot 0 (two 4 KiB sizes) once after creation, slot 2
+//           (command, cookie, 0xFFFFFFFF, payload, extra) to send the
+//           processor commands (results mostly not checked), slot 1 and 5
+//           when audio shuts down.
+//
+// Host: a silent audio device. Context arrays are audio processor memory;
+// commands are accepted and not carried out (nothing is decoded, mixed or
+// played). Other object slots report themselves.
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
 #include <map>
 #include <mutex>
 
 #include "core/libs/support.h"
+#include "core/libs/vtable.h"
 
 namespace {
 
@@ -180,6 +196,87 @@ HOLY_EXPORT void* ApuMapApuAddress(uint32_t apu_address) {
   return s.base + (apu_address - kApuBase);
 }
 
-HOLY_UNIMPLEMENTED_EXPORT(kLibrary, AcpHalCreate)
-HOLY_UNIMPLEMENTED_EXPORT(kLibrary, AcpHalAllocateShapeContexts)
-HOLY_UNIMPLEMENTED_EXPORT(kLibrary, AcpHalReleaseShapeContexts)
+namespace {
+
+constexpr int kContextKinds = 6;
+constexpr uint32_t kContextBytes = 64;
+
+struct ShapeContexts {
+  uint32_t counts[kContextKinds];
+  void* contexts[kContextKinds];
+};
+static_assert(sizeof(ShapeContexts) == 0x48);
+
+void* g_contexts[kContextKinds] = {};
+
+struct ControlProcessor {
+  void* const* vtable;
+  const holy::lib::VtableInfo* info;
+};
+
+const holy::lib::VtableInfo kProcessorInfo{kLibrary, "IAcpHal"};
+
+HRESULT STDMETHODCALLTYPE processor_initialize(ControlProcessor*, uint32_t a, uint32_t b) {
+  LIB_LOG(holy::lib::kInfo, "acphal", "control processor started (0x%x, 0x%x): a silent audio device", a, b);
+  return S_OK;
+}
+HRESULT STDMETHODCALLTYPE processor_shutdown(ControlProcessor*) {
+  return S_OK;
+}
+HRESULT STDMETHODCALLTYPE processor_submit(ControlProcessor*, uint32_t command, uint32_t cookie, uint32_t mask,
+                                           const void* payload, uint32_t extra) {
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 16) {
+    LIB_LOG(holy::lib::kDebug, "acphal", "command %u (cookie 0x%x, mask 0x%x, payload %p, 0x%x): not carried out",
+            command, cookie, mask, payload, extra);
+  }
+  return S_OK;
+}
+ULONG STDMETHODCALLTYPE processor_release(ControlProcessor*) {
+  return 0;
+}
+
+const auto kProcessorVtable = [] {
+  auto table = holy::lib::make_reporting_vtable<16>();
+  table[0] = reinterpret_cast<void*>(&processor_initialize);
+  table[1] = reinterpret_cast<void*>(&processor_shutdown);
+  table[2] = reinterpret_cast<void*>(&processor_submit);
+  table[5] = reinterpret_cast<void*>(&processor_release);
+  return table;
+}();
+
+ControlProcessor g_processor{kProcessorVtable.data(), &kProcessorInfo};
+
+}  // namespace
+
+HOLY_EXPORT HRESULT AcpHalAllocateShapeContexts(ShapeContexts* contexts) {
+  if (!contexts) return E_POINTER;
+  for (int kind = 0; kind < kContextKinds; ++kind) {
+    contexts->contexts[kind] = nullptr;
+    if (!contexts->counts[kind]) continue;
+    if (g_contexts[kind]) ApuFree(g_contexts[kind]);
+    g_contexts[kind] = nullptr;
+    const uint64_t bytes = static_cast<uint64_t>(contexts->counts[kind]) * kContextBytes;
+    if (bytes > 0xFFFFFFFFu) return E_INVALIDARG;
+    const HRESULT hr = ApuAlloc(&g_contexts[kind], nullptr, static_cast<uint32_t>(bytes), kContextBytes, kCached);
+    if (FAILED(hr)) return hr;
+    std::memset(g_contexts[kind], 0, static_cast<size_t>(bytes));
+    contexts->contexts[kind] = g_contexts[kind];
+  }
+  LIB_LOG(holy::lib::kInfo, "acphal", "shape contexts: %u %u %u %u %u %u", contexts->counts[0], contexts->counts[1],
+          contexts->counts[2], contexts->counts[3], contexts->counts[4], contexts->counts[5]);
+  return S_OK;
+}
+
+HOLY_EXPORT void AcpHalReleaseShapeContexts() {
+  for (void*& context : g_contexts) {
+    if (context) ApuFree(context);
+    context = nullptr;
+  }
+}
+
+HOLY_EXPORT HRESULT AcpHalCreate(ControlProcessor** out) {
+  if (!out) return E_POINTER;
+  *out = &g_processor;
+  return S_OK;
+}

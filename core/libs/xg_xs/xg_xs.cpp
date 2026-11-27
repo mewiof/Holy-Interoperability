@@ -127,6 +127,16 @@ HRESULT STDMETHODCALLTYPE get_resource_tiling(Computer* self, UINT* tiles, D3D12
   }
   device->GetResourceTiling(reserved, tiles, packed, shape, count, first, tilings);
   reserved->Release();
+  static const bool trace = GetEnvironmentVariableW(L"HOLY_XG_TRACE", nullptr, 0) > 0;
+  if (trace) {
+    LIB_LOG(holy::lib::kInfo, "xg",
+            "tiling of %ux%u x%u, %u mips, format %u: %u tiles; packed: %u standard mips, %u packed, %u tiles from %u; "
+            "tile %ux%ux%u",
+            static_cast<unsigned>(desc.Width), desc.Height, desc.DepthOrArraySize, desc.MipLevels, desc.Format,
+            tiles ? *tiles : 0, packed ? packed->NumStandardMips : 0, packed ? packed->NumPackedMips : 0,
+            packed ? packed->NumTilesForPackedMips : 0, packed ? packed->StartTileIndexInOverallResource : 0,
+            shape ? shape->WidthInTexels : 0, shape ? shape->HeightInTexels : 0, shape ? shape->DepthInTexels : 0);
+  }
   return S_OK;
 }
 

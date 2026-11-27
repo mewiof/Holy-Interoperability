@@ -180,8 +180,33 @@ ULONG STDMETHODCALLTYPE resource_release(Resource* self) {
   return static_cast<ULONG>(left);
 }
 
-HRESULT STDMETHODCALLTYPE resource_map(Resource* self, UINT, const D3D12_RANGE*, void** data) {
+// The physical page number mapped at `address` (0: none), from the memory library.
+uint64_t physical_page_at(uint64_t address) {
+  using PageAtFn = ULONG_PTR (*)(const void*);
+  static const auto page_at =
+      reinterpret_cast<PageAtFn>(GetProcAddress(GetModuleHandleW(L"xmem.dll"), "HolyXMemPhysicalPageAt"));
+  return page_at ? page_at(reinterpret_cast<const void*>(address)) : 0;
+}
+
+HRESULT STDMETHODCALLTYPE resource_map(Resource* self, UINT subresource, const D3D12_RANGE*, void** data) {
   if (data) *data = reinterpret_cast<void*>(self->title_va);
+  // The CPU is about to use the resource's memory: say so when it is not
+  // there (no page mapped, not committed), which faults later in the title.
+  MEMORY_BASIC_INFORMATION info{};
+  if (self->title_va && VirtualQuery(reinterpret_cast<const void*>(self->title_va), &info, sizeof(info)) &&
+      info.State != MEM_COMMIT) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 16) {
+      LIB_LOG(lib::kWarn, "d3d12",
+              "Map of a resource (dim %d %llux%ux%u, %u mips, format %d, flags 0x%x, subresource %u) whose memory at "
+              "%p is not there (state 0x%lx; %s; physical page number 0x%llx there)",
+              self->desc.Dimension, static_cast<unsigned long long>(self->desc.Width), self->desc.Height,
+              self->desc.DepthOrArraySize, self->desc.MipLevels, self->desc.Format, self->desc.Flags, subresource,
+              reinterpret_cast<void*>(self->title_va), info.State,
+              self->runtime_memory ? "memory the runtime allocated" : "memory the title placed it in",
+              static_cast<unsigned long long>(physical_page_at(self->title_va)));
+    }
+  }
   return S_OK;
 }
 void STDMETHODCALLTYPE resource_unmap(Resource*, UINT, const D3D12_RANGE*) {}

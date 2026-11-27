@@ -146,6 +146,212 @@ void create_buffer_uav(ID3D12Device* host, ID3D12Resource* buffer, ID3D12Resourc
   host->CreateUnorderedAccessView(buffer, counter, &desc, dest);
 }
 
+// --- views fitted to their host textures ------------------------------------------------
+//
+// View creation cannot report errors: the host removes the device for a view
+// that does not fit its resource ("invalid call"). Observed: titles make views
+// that do not fit the host texture (a shader resource view of 15 mip levels of
+// a texture made with one). Views of textures are fitted here: the view's
+// dimension must suit the texture's, mip and array ranges are kept inside it
+// (all levels or slices "from here on" stay so), and a view nothing of which
+// lies in the texture is made a null view of its kind. Logged now and then.
+
+struct TextureExtent {
+  D3D12_RESOURCE_DIMENSION dimension = D3D12_RESOURCE_DIMENSION_UNKNOWN;
+  UINT mips = 1, slices = 1, depth = 1, samples = 1;
+};
+
+TextureExtent extent_of(ID3D12Resource* texture) {
+  const D3D12_RESOURCE_DESC d = texture->GetDesc();
+  TextureExtent e;
+  e.dimension = d.Dimension;
+  e.mips = d.MipLevels ? d.MipLevels : 1;
+  e.slices = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : d.DepthOrArraySize;
+  e.depth = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? d.DepthOrArraySize : 1;
+  e.samples = d.SampleDesc.Count;
+  return e;
+}
+
+void report_unfit(const char* kind, UINT dimension, const TextureExtent& e, bool fitted) {
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 8) {
+    LIB_LOG(lib::kWarn, "d3d12", "%s view (dimension %u) does not fit its texture (dimension %d, %u mips, %u slices): %s",
+            kind, dimension, e.dimension, e.mips, e.slices, fitted ? "kept inside it" : "a null view");
+  }
+}
+
+// Clamps [first, first + count) to `size` (count UINT_MAX: the rest); false
+// when `first` lies outside.
+bool fit_range(UINT* first, UINT* count, UINT size, bool* changed) {
+  if (*first >= size) return false;
+  if (*count != UINT_MAX && *count > size - *first) {
+    *count = size - *first;
+    *changed = true;
+  }
+  return *count != 0;
+}
+
+bool fit_slices(UINT* first, UINT* count, UINT size, bool* changed) {
+  if (*first >= size) return false;
+  if (*count == UINT_MAX || *count > size - *first) {
+    if (*count != UINT_MAX) *changed = true;
+    *count = size - *first;
+  }
+  return *count != 0;
+}
+
+bool fit_mip(UINT* mip, UINT mips) { return *mip < mips; }
+
+bool fit_srv(ID3D12Resource* texture, D3D12_SHADER_RESOURCE_VIEW_DESC* v) {
+  const TextureExtent e = extent_of(texture);
+  bool changed = false, ok = true;
+  UINT six = 6;
+  switch (v->ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1D:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+           fit_range(&v->Texture1D.MostDetailedMip, &v->Texture1D.MipLevels, e.mips, &changed);
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+           fit_range(&v->Texture1DArray.MostDetailedMip, &v->Texture1DArray.MipLevels, e.mips, &changed) &&
+           fit_slices(&v->Texture1DArray.FirstArraySlice, &v->Texture1DArray.ArraySize, e.slices, &changed);
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE2D:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && e.samples == 1 &&
+           fit_range(&v->Texture2D.MostDetailedMip, &v->Texture2D.MipLevels, e.mips, &changed);
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && e.samples == 1 &&
+           fit_range(&v->Texture2DArray.MostDetailedMip, &v->Texture2DArray.MipLevels, e.mips, &changed) &&
+           fit_slices(&v->Texture2DArray.FirstArraySlice, &v->Texture2DArray.ArraySize, e.slices, &changed);
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMS:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && e.samples > 1;
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && e.samples > 1 &&
+           fit_slices(&v->Texture2DMSArray.FirstArraySlice, &v->Texture2DMSArray.ArraySize, e.slices, &changed);
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+           fit_range(&v->Texture3D.MostDetailedMip, &v->Texture3D.MipLevels, e.mips, &changed);
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && e.slices >= 6 &&
+           fit_range(&v->TextureCube.MostDetailedMip, &v->TextureCube.MipLevels, e.mips, &changed);
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: {
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && e.slices >= 6 &&
+           fit_range(&v->TextureCubeArray.MostDetailedMip, &v->TextureCubeArray.MipLevels, e.mips, &changed) &&
+           v->TextureCubeArray.First2DArrayFace + 6 <= e.slices;
+      if (ok) {
+        const UINT cubes = (e.slices - v->TextureCubeArray.First2DArrayFace) / six;
+        if (v->TextureCubeArray.NumCubes > cubes) v->TextureCubeArray.NumCubes = cubes, changed = true;
+      }
+      break;
+    }
+    default:
+      return true;  // buffers and others: not textures' views
+  }
+  if (!ok || changed) report_unfit("shader resource", v->ViewDimension, e, ok);
+  return ok;
+}
+
+bool fit_uav(ID3D12Resource* texture, D3D12_UNORDERED_ACCESS_VIEW_DESC* v) {
+  const TextureExtent e = extent_of(texture);
+  bool changed = false, ok = true;
+  switch (v->ViewDimension) {
+    case D3D12_UAV_DIMENSION_TEXTURE1D:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && fit_mip(&v->Texture1D.MipSlice, e.mips);
+      break;
+    case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && fit_mip(&v->Texture1DArray.MipSlice, e.mips) &&
+           fit_slices(&v->Texture1DArray.FirstArraySlice, &v->Texture1DArray.ArraySize, e.slices, &changed);
+      break;
+    case D3D12_UAV_DIMENSION_TEXTURE2D:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && fit_mip(&v->Texture2D.MipSlice, e.mips);
+      break;
+    case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && fit_mip(&v->Texture2DArray.MipSlice, e.mips) &&
+           fit_slices(&v->Texture2DArray.FirstArraySlice, &v->Texture2DArray.ArraySize, e.slices, &changed);
+      break;
+    case D3D12_UAV_DIMENSION_TEXTURE3D: {
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && fit_mip(&v->Texture3D.MipSlice, e.mips);
+      const UINT depth = std::max<UINT>(1, e.depth >> v->Texture3D.MipSlice);
+      ok = ok && fit_slices(&v->Texture3D.FirstWSlice, &v->Texture3D.WSize, depth, &changed);
+      break;
+    }
+    default:
+      return true;
+  }
+  if (!ok || changed) report_unfit("unordered access", v->ViewDimension, e, ok);
+  return ok;
+}
+
+bool fit_rtv(ID3D12Resource* texture, D3D12_RENDER_TARGET_VIEW_DESC* v) {
+  const TextureExtent e = extent_of(texture);
+  bool changed = false, ok = true;
+  switch (v->ViewDimension) {
+    case D3D12_RTV_DIMENSION_TEXTURE1D:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && fit_mip(&v->Texture1D.MipSlice, e.mips);
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE1DARRAY:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && fit_mip(&v->Texture1DArray.MipSlice, e.mips) &&
+           fit_slices(&v->Texture1DArray.FirstArraySlice, &v->Texture1DArray.ArraySize, e.slices, &changed);
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE2D:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && fit_mip(&v->Texture2D.MipSlice, e.mips);
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE2DARRAY:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && fit_mip(&v->Texture2DArray.MipSlice, e.mips) &&
+           fit_slices(&v->Texture2DArray.FirstArraySlice, &v->Texture2DArray.ArraySize, e.slices, &changed);
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           fit_slices(&v->Texture2DMSArray.FirstArraySlice, &v->Texture2DMSArray.ArraySize, e.slices, &changed);
+      break;
+    case D3D12_RTV_DIMENSION_TEXTURE3D: {
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && fit_mip(&v->Texture3D.MipSlice, e.mips);
+      const UINT depth = std::max<UINT>(1, e.depth >> v->Texture3D.MipSlice);
+      ok = ok && fit_slices(&v->Texture3D.FirstWSlice, &v->Texture3D.WSize, depth, &changed);
+      break;
+    }
+    default:
+      return true;
+  }
+  if (!ok || changed) report_unfit("render target", v->ViewDimension, e, ok);
+  return ok;
+}
+
+bool fit_dsv(ID3D12Resource* texture, D3D12_DEPTH_STENCIL_VIEW_DESC* v) {
+  const TextureExtent e = extent_of(texture);
+  bool changed = false, ok = true;
+  switch (v->ViewDimension) {
+    case D3D12_DSV_DIMENSION_TEXTURE1D:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && fit_mip(&v->Texture1D.MipSlice, e.mips);
+      break;
+    case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && fit_mip(&v->Texture1DArray.MipSlice, e.mips) &&
+           fit_slices(&v->Texture1DArray.FirstArraySlice, &v->Texture1DArray.ArraySize, e.slices, &changed);
+      break;
+    case D3D12_DSV_DIMENSION_TEXTURE2D:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && fit_mip(&v->Texture2D.MipSlice, e.mips);
+      break;
+    case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && fit_mip(&v->Texture2DArray.MipSlice, e.mips) &&
+           fit_slices(&v->Texture2DArray.FirstArraySlice, &v->Texture2DArray.ArraySize, e.slices, &changed);
+      break;
+    case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
+      ok = e.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           fit_slices(&v->Texture2DMSArray.FirstArraySlice, &v->Texture2DMSArray.ArraySize, e.slices, &changed);
+      break;
+    default:
+      return true;
+  }
+  if (!ok || changed) report_unfit("depth stencil", v->ViewDimension, e, ok);
+  return ok;
+}
+
 // Render-target and depth-stencil descriptors and what they view, kept only
 // while calls are wrapped (call_check.h), for traces.
 struct TargetView {
@@ -239,8 +445,12 @@ void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_
   if (resource->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
     // A texture in title memory: viewed through a host copy (texture_upload.h).
     ID3D12Resource* texture = texture_at(self, *resource, view->address);
-    if (texture) self->host->CreateShaderResourceView(texture, &view->srv, host_cpu_handle(dest));
-    if (texture) publish_descriptors(dest);
+    if (texture) {
+      D3D12_SHADER_RESOURCE_VIEW_DESC fitted = view->srv;
+      self->host->CreateShaderResourceView(fit_srv(texture, &fitted) ? texture : nullptr, &fitted,
+                                           host_cpu_handle(dest));
+      publish_descriptors(dest);
+    }
     write_indexed_descriptor(dest, kKindShaderResource);
     return;
   }
@@ -321,7 +531,9 @@ void STDMETHODCALLTYPE create_shader_resource_view(Device* self, void* resource,
       return;
     }
   }
-  self->host->CreateShaderResourceView(host_resource(resource), desc ? &host : nullptr, host_cpu_handle(dest));
+  ID3D12Resource* texture = host_resource(resource);
+  if (texture && desc && !fit_srv(texture, &host)) texture = nullptr;
+  self->host->CreateShaderResourceView(texture, desc ? &host : nullptr, host_cpu_handle(dest));
   publish_descriptors(dest);
   write_indexed_descriptor(dest, kKindShaderResource);
 }
@@ -354,7 +566,9 @@ void STDMETHODCALLTYPE create_unordered_access_view(Device* self, void* resource
       if (desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) host.Texture2D.PlaneSlice = 0;
       if (desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY) host.Texture2DArray.PlaneSlice = 0;
     }
-    self->host->CreateUnorderedAccessView(object->twin, nullptr, desc ? &host : nullptr, host_cpu_handle(dest));
+    ID3D12Resource* twin = object->twin;
+    if (desc && !fit_uav(twin, &host)) twin = nullptr;
+    self->host->CreateUnorderedAccessView(twin, nullptr, desc ? &host : nullptr, host_cpu_handle(dest));
     publish_descriptors(dest);
     write_indexed_descriptor(dest, kKindUnorderedAccess);
     return;
@@ -376,7 +590,9 @@ void STDMETHODCALLTYPE create_unordered_access_view(Device* self, void* resource
                                                                             : format_bytes(desc->Format);
     create_buffer_uav(self->host, host_resource(resource), host_resource(counter), host, stride, host_cpu_handle(dest));
   } else {
-    self->host->CreateUnorderedAccessView(host_resource(resource), host_resource(counter), desc ? &host : nullptr,
+    ID3D12Resource* texture = host_resource(resource);
+    if (texture && desc && !fit_uav(texture, &host)) texture = nullptr;
+    self->host->CreateUnorderedAccessView(texture, texture ? host_resource(counter) : nullptr, desc ? &host : nullptr,
                                           host_cpu_handle(dest));
   }
   publish_descriptors(dest);
@@ -404,7 +620,9 @@ void STDMETHODCALLTYPE create_render_target_view(Device* self, void* resource,
     host = *desc;
     host.Format = host_view_format(resource, desc->Format);
   }
-  self->host->CreateRenderTargetView(host_resource(resource), desc ? &host : nullptr, host_cpu_handle(dest));
+  ID3D12Resource* texture = host_resource(resource);
+  if (texture && desc && !fit_rtv(texture, &host)) texture = nullptr;
+  self->host->CreateRenderTargetView(texture, desc ? &host : nullptr, host_cpu_handle(dest));
   publish_descriptors(dest);
   note_target(dest, resource, desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
 }
@@ -416,7 +634,9 @@ void STDMETHODCALLTYPE create_depth_stencil_view(Device* self, void* resource,
     host = *desc;
     host.Format = desktop_format(desc->Format);
   }
-  self->host->CreateDepthStencilView(host_resource(resource), desc ? &host : nullptr, host_cpu_handle(dest));
+  ID3D12Resource* texture = host_resource(resource);
+  if (texture && desc && !fit_dsv(texture, &host)) texture = nullptr;
+  self->host->CreateDepthStencilView(texture, desc ? &host : nullptr, host_cpu_handle(dest));
   publish_descriptors(dest);
   {
     const auto* r = static_cast<const Resource*>(resource);

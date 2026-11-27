@@ -654,6 +654,77 @@ TEST(scalar_loads_ignore_the_low_address_bits) {
   EXPECT(after[33] == 0x1002);
 }
 
+// Control flow (the linear layout): nested loops closed by backward
+// branches, a branch forward out of both, uniform scalar counters.
+TEST(nested_loops_and_a_branch_out_of_both_run_as_written) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // s4 = 0; s6 = 3;
+  // outer: s5 = 4;
+  //   inner: s4 += 1; s5 -= 1; if (s4 == 10) goto exit; if (s5 != 0) goto inner;
+  //   s6 -= 1; if (s6 != 0) goto outer;
+  // exit: v0 = s4; v1 = s6; buffer_store_dwordx2 v[0:1], off, s[0:3], 0 offset:128; s_endpgm.
+  const std::vector<uint32_t> program = {0xBE840380u, 0xBE860383u, 0xBE850384u, 0x80048104u, 0x80858105u,
+                                         0xBF068A04u, 0xBF850005u, 0xBF078005u, 0xBF85FFFAu, 0x80868106u,
+                                         0xBF078006u, 0xBF85FFF6u, 0x7E000204u, 0x7E020206u, 0xE0740080u,
+                                         0x80000000u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  info.user_sgprs = 4;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  const std::vector<uint32_t> after = gpu.dispatch(cs, std::vector<uint32_t>(64, 0));
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  // Two whole outer rounds (8), then the exit at 10 in the third, s6 at 1.
+  EXPECT(after[32] == 10);
+  EXPECT(after[33] == 1);
+}
+
+// A group barrier between local data share writes and reads of other
+// threads' values (two waves of 32: the barrier is the group's).
+TEST(group_barriers_order_local_data_share_between_waves) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v1 = v0 * 4; ds_write_b32 v1, v0; s_barrier; v2 = 252 - v1;
+  // ds_read_b32 v3, v2; buffer_store_dword v3, v1, s[0:3], 0 offen; s_endpgm.
+  const std::vector<uint32_t> program = {0x34020082u, 0xD8340000u, 0x00000001u, 0xBF8A0000u, 0x4C0402FFu,
+                                         0x000000FCu, 0xD8D80000u, 0x03000002u, 0xE0701000u, 0x80000301u,
+                                         0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 64;
+  info.user_sgprs = 4;
+  info.lds_bytes = 256;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));
+  const std::vector<uint32_t> after = gpu.dispatch(cs, std::vector<uint32_t>(64, 0));
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  bool reversed = true;
+  for (uint32_t i = 0; i < 64; ++i) reversed = reversed && after[i] == 63 - i;
+  EXPECT(reversed);
+}
+
 // Cached pages (shader/translate.h): the fourth page of the window is cache
 // line 0, whose copy is slot 2 (a buffer holding 0x2000 + i) and whose page
 // itself is slot 1 from view offset 0x80. Reads take the copy until a write;

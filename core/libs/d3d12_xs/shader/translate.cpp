@@ -606,6 +606,8 @@ class Translator {
     return value;
   }
 
+  bool linear_layout(const std::vector<std::pair<uint32_t, dxbc::Program>>& blocks,
+                     const std::vector<char>& barrier_after, dxbc::Program& body);
   bool emit(const Instruction& inst);
   bool emit_sop2(const Instruction& inst);
   bool emit_sopk(const Instruction& inst);
@@ -1330,6 +1332,112 @@ bool Translator::emit_sopc(const Instruction& inst) {
     }
     default: return fail(format("SOPC op %u", inst.op));
   }
+}
+
+// The linear layout: blocks in program order, each run when the next-block
+// register names it (a test only where an earlier branch can pass over it);
+// a loop only around each region a backward branch closes (from its target,
+// the loop's header, to the last block branching back to it), continuing
+// while the register names the header; group barriers in line, where the
+// block they follow ends (every thread passes them there; programs that are
+// correct on the console reach the same barriers in every thread). Branches
+// forward need no loop and no search, and the host compiler sees code
+// outside loops as such (the dispatcher keeps every register live around
+// one loop). Programs that jump through registers, or whose loop regions
+// overlap without nesting, keep the dispatcher (false).
+bool Translator::linear_layout(const std::vector<std::pair<uint32_t, dxbc::Program>>& blocks,
+                               const std::vector<char>& barrier_after, dxbc::Program& body) {
+  const size_t count = blocks.size();
+  auto block_of = [&](uint32_t pc) {
+    size_t lo = 0, hi = count;  // the last block starting at or before pc
+    while (hi - lo > 1) {
+      const size_t mid = (lo + hi) / 2;
+      (blocks[mid].first <= pc ? lo : hi) = mid;
+    }
+    return lo;
+  };
+  auto block_at = [&](uint32_t pc) -> size_t {
+    const size_t b = block_of(pc);
+    return blocks[b].first == pc ? b : count;
+  };
+  // Loop regions: header block -> last block branching back to it.
+  std::map<size_t, size_t> loop_end;
+  struct Skip {
+    size_t from;     // the block the branch ends
+    uint32_t target; // kEndBlock: the program's end; backward: the header
+    bool backward;
+  };
+  std::vector<Skip> skips;
+  for (const Instruction& inst : program_) {
+    if (inst.encoding == Encoding::SOP1 && (inst.op == 32 || inst.op == 33)) return false;
+    if (inst.encoding != Encoding::SOPP) continue;
+    const size_t from = block_of(inst.pc);
+    if (inst.op == 1) {
+      skips.push_back({from, kEndBlock, false});
+      continue;
+    }
+    if (inst.op != 2 && (inst.op < 4 || inst.op > 9)) continue;
+    const uint32_t target = static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm);
+    if (target > inst.pc) {
+      skips.push_back({from, target, false});
+      continue;
+    }
+    const size_t header = block_at(target);
+    if (header == count) return false;
+    loop_end[header] = std::max(loop_end[header], from);
+    skips.push_back({from, target, true});
+  }
+  // Regions nest or are disjoint.
+  {
+    std::vector<size_t> open;
+    for (const auto& [header, end] : loop_end) {
+      while (!open.empty() && open.back() < header) open.pop_back();
+      if (!open.empty() && end > open.back()) return false;
+      open.push_back(end);
+    }
+  }
+  // Blocks a branch can pass over: forward, those up to its target (all, for
+  // the program's end); backward, the rest of its header's region.
+  std::vector<int> delta(count + 1, 0);
+  for (const Skip& skip : skips) {
+    const size_t first = skip.from + 1;
+    size_t last;  // one past
+    if (skip.backward) last = loop_end[block_at(skip.target)] + 1;
+    else if (skip.target == kEndBlock) last = count;
+    else last = std::min(count, block_of(skip.target - 1) + 1);
+    if (first < last) {
+      ++delta[first];
+      --delta[last];
+    }
+  }
+  std::vector<std::pair<size_t, uint32_t>> loops;  // open loops: last block, header address
+  int passed = 0;
+  for (size_t b = 0; b < count; ++b) {
+    passed += delta[b];
+    const auto region = loop_end.find(b);
+    if (region != loop_end.end()) {
+      body.emit(dx::kLoop, {});
+      loops.emplace_back(region->second, blocks[b].first);
+    }
+    if (passed > 0) {
+      body.emit(dx::kIeq, {D(kScratch), R(kNextR), I(blocks[b].first)});
+      body.emit(dx::kIf, {R(kScratch)}, dxbc::kTestNonZero);
+      body.append(blocks[b].second);
+      body.emit(dx::kEndif, {});
+    } else {
+      body.append(blocks[b].second);
+    }
+    if (barrier_after[b]) {
+      body.emit(dx::kSync, {}, dxbc::kSyncThreads | dxbc::kSyncGroupMemory | dxbc::kSyncUavGlobal);
+    }
+    while (!loops.empty() && loops.back().first == b) {
+      body.emit(dx::kIne, {D(kScratch), R(kNextR), I(loops.back().second)});
+      body.emit(dx::kBreakc, {R(kScratch)}, dxbc::kTestNonZero);
+      body.emit(dx::kEndloop, {});
+      loops.pop_back();
+    }
+  }
+  return true;
 }
 
 bool Translator::emit_smem(const Instruction& inst) {
@@ -3737,9 +3845,9 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
     if (i + 1 < program_.size()) leaders.insert(program_[i + 1].pc);
   }
 
-  // Blocks, each translated on its own, then selected by a balanced tree of
-  // comparisons on the next block's address inside the dispatcher loop.
+  // Blocks, each translated on its own, then laid out (below).
   std::vector<std::pair<uint32_t, dxbc::Program>> blocks;
+  std::vector<char> barrier_after;  // a group barrier follows the block
   for (size_t i = 0; i < program_.size(); ++i) {
     const Instruction& inst = program_[i];
     at_ = i;
@@ -3751,6 +3859,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
         p_ = dxbc::Program();
       }
       blocks.emplace_back(inst.pc, dxbc::Program());
+      barrier_after.push_back(0);
     }
     if (inst.encoding == Encoding::SOPP) {
       const uint32_t target = static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm);
@@ -3771,6 +3880,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
           barrier_ = true;
           put(kNextR, I(next));
           put(kBarrierR, I(1));
+          barrier_after.back() = 1;
           continue;
         default: continue;  // waits, priorities, messages, prefetch hints
       }
@@ -3791,9 +3901,11 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       barrier_ = true;
       put(kNextR, I(inst.pc + 2));
       put(kBarrierR, I(1));
+      barrier_after.back() = 1;
       blocks.back().second = std::move(p_);
       p_ = dxbc::Program();
       blocks.emplace_back(inst.pc + 2, dxbc::Program());
+      barrier_after.push_back(0);
       scratch_ = 0;
       if (!exchange_read(inst) || !error_.empty()) {
         *error = format("at 0x%x: %s", inst.pc, error_.c_str());
@@ -3821,6 +3933,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   blocks.back().second = std::move(p_);
   p_ = dxbc::Program();
   dxbc::Program body;
+  const bool linear = linear_layout(blocks, barrier_after, body);
   std::function<void(size_t, size_t)> tree = [&](size_t first, size_t last) {
     if (last - first == 1) {
       body.append(blocks[first].second);
@@ -3834,11 +3947,13 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
     tree(middle, last);
     body.emit(dx::kEndif, {});
   };
-  // The end marker (and any address past the program) selects no block.
-  body.emit(dx::kUlt, {D(kScratch), R(kNextR), I(kEndBlock)});
-  body.emit(dx::kIf, {R(kScratch)}, dxbc::kTestNonZero);
-  tree(0, blocks.size());
-  body.emit(dx::kEndif, {});
+  if (!linear) {
+    // The end marker (and any address past the program) selects no block.
+    body.emit(dx::kUlt, {D(kScratch), R(kNextR), I(kEndBlock)});
+    body.emit(dx::kIf, {R(kScratch)}, dxbc::kTestNonZero);
+    tree(0, blocks.size());
+    body.emit(dx::kEndif, {});
+  }
 
   // Program: declarations, register initialisation, dispatcher loop.
   if (stage_ == Stage::Pixel && (iface_.params & iface_.flat_params) != iface_.flat_params) {
@@ -4016,6 +4131,12 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       init(kVgprBase + 0, dxbc::input_register(0, 0));
       if (vgprs_ > 3) init(kVgprBase + 3, dxbc::input_register(1, 0));
     }
+  }
+  if (linear) {
+    program.append(body);
+    epilogue(program);
+    *out = program.container(inputs, outputs, features_);
+    return true;
   }
   if (barrier_) {
     // The dispatcher stops at barriers; every thread reaches the same number

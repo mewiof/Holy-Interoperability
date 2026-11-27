@@ -706,6 +706,15 @@ Notes describe the platform, never a title.
   without a table and addresses from 2^47), and tests for cached pages only when the page cache runs; buffer
   formats come from a table in the immediate constant buffer instead of a 128-case switch at every typed access;
   the container checksum is computed with the MD5 rounds written out.
+- Implementation, program layout: a native program's blocks (split at branches and their targets) were each a
+  case of one loop that found the next block by a binary search on its address, so every register stayed live
+  around that loop. They are now laid out in program order: a block is guarded by a test of the next block's
+  address only where an earlier branch can pass over it; a loop surrounds each region a backward branch closes
+  (its target, the header, to the last block branching back to it) and continues while the next block is the
+  header; group barriers are in line after the block they end. *measured*: the host compiler's time for the same
+  60 compute programs fell from 136 s to 68 s at an unchanged size (166 s before the size work). Programs that
+  jump through registers (subroutines) or whose loop regions overlap without nesting keep the dispatcher loop.
+  Unit tests run nested loops with a branch out of both, and a group barrier between waves.
 - *documented* (RDNA 2): the two low bits of each part of a scalar memory address (base, offset, instruction
   offset) are ignored, so `s_load_*` and `s_buffer_load_*` read whole, aligned dwords. Translated as such: one
   load, no alignment test (a unit test reads at unaligned parts).

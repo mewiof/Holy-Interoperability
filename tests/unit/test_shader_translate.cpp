@@ -186,9 +186,10 @@ TEST(translated_program_is_valid_bytecode) {
   EXPECT(text.find("cs_5_1") != std::string::npos);
   EXPECT(text.find("dcl_thread_group 64, 1, 1") != std::string::npos);
   EXPECT(text.find("dcl_uav_raw U0[0:65535], space=8") != std::string::npos);
-  // Blocks at 0, 12 and 16, selected by comparisons on the next block.
-  EXPECT(text.find("loop") != std::string::npos);
-  EXPECT(text.find("l(16)") != std::string::npos);
+  // Blocks at 0, 12 and 16 in order, without a loop (no branch goes back);
+  // the block the branch can pass over (12) runs when it is the next block.
+  EXPECT(text.find("loop") == std::string::npos);
+  EXPECT(text.find("ieq r116.x, r112.x, l(12)") != std::string::npos);
 }
 
 TEST(ngg_vertex_groups_come_from_either_shift_of_the_vertex_id) {

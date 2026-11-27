@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -27,6 +28,7 @@ struct Uploader {
 };
 
 std::mutex g_lock;
+std::atomic<uint64_t> g_texture_bytes{0};
 std::map<Key, ID3D12Resource*>& textures() {
   static auto* map = new std::map<Key, ID3D12Resource*>();
   return *map;
@@ -77,6 +79,49 @@ Key key_of(uint64_t address, const lib::TextureShape& shape) {
   return Key{address, shape.dimension, shape.width, shape.height, shape.depth_or_array, shape.mips, shape.format};
 }
 
+// Whether `size` bytes from `address` are committed, readable title memory.
+bool readable(uint64_t address, uint64_t size) {
+  const uint64_t end = address + size;
+  while (address < end) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info))) return false;
+    const DWORD protect = info.Protect & 0xFF;
+    if (info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD) || protect == PAGE_NOACCESS ||
+        protect == PAGE_EXECUTE) {
+      return false;
+    }
+    address = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+  }
+  return true;
+}
+
+// An upload buffer holding a copy of `size` bytes of title memory.
+ID3D12Resource* staged_copy(Device* device, uint64_t address, uint64_t size) {
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  desc.Width = size;
+  desc.Height = 1;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  ID3D12Resource* buffer = nullptr;
+  if (FAILED(device->host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&buffer)))) {
+    return nullptr;
+  }
+  void* mapped = nullptr;
+  if (FAILED(buffer->Map(0, nullptr, &mapped))) {
+    buffer->Release();
+    return nullptr;
+  }
+  std::memcpy(mapped, reinterpret_cast<const void*>(address), size);
+  buffer->Unmap(0, nullptr);
+  return buffer;
+}
+
 }  // namespace
 
 ID3D12Resource* placed_texture(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address,
@@ -117,19 +162,34 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
 
   const uint64_t size = lib::texture_size(shape);
   Backing backing;
-  if (!size || !locate(device, address, &backing) || !backing.whole || backing.contiguous < size) {
+  // Observed: titles stream textures into pages of a pool mapped one by one
+  // into an address range (queue slot 31), so no host heap backs such a
+  // texture as a whole; the CPU reads it through the title's addresses.
+  ID3D12Resource* staging = nullptr;
+  uint64_t source_offset = 0;
+  ID3D12Resource* source_buffer = nullptr;
+  if (size && locate(device, address, &backing) && backing.whole && backing.contiguous >= size) {
+    source_buffer = backing.whole;
+    source_offset = backing.heap_offset;
+  } else if (size && readable(address, size) && (staging = staged_copy(device, address, size)) != nullptr) {
+    source_buffer = staging;
+  } else {
     LIB_LOG(lib::kError, "d3d12",
-            "texture dim %u %llux%ux%u, %u mips, format %u at %p (0x%llx bytes) lies in no contiguous GPU memory",
+            "texture dim %u %llux%ux%u, %u mips, format %u at %p (0x%llx bytes) lies in no readable memory",
             shape.dimension, static_cast<unsigned long long>(shape.width), shape.height, shape.depth_or_array,
             shape.mips, shape.format, reinterpret_cast<void*>(address), static_cast<unsigned long long>(size));
     return nullptr;
   }
   Uploader* up = uploader(device);
-  if (!up) return nullptr;
+  if (!up) {
+    if (staging) staging->Release();
+    return nullptr;
+  }
 
   D3D12_RESOURCE_DESC host_desc = desc;
   host_desc.Alignment = 0;
   host_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  host_desc.Format = desktop_format(desc.Format);
   host_desc.MipLevels = static_cast<UINT16>(shape.mips);
   host_desc.Flags &= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
@@ -142,6 +202,7 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   if (FAILED(hr)) {
     LIB_LOG(lib::kError, "d3d12", "host texture of format %u %llux%u refused (0x%08lX)", shape.format,
             static_cast<unsigned long long>(shape.width), shape.height, static_cast<unsigned long>(hr));
+    if (staging) staging->Release();
     return nullptr;
   }
 
@@ -153,9 +214,9 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
     lib::subresource_layout(shape, index, &layout);
     const uint32_t mip = index % shape.mips;
     D3D12_TEXTURE_COPY_LOCATION source{};
-    source.pResource = backing.whole;
+    source.pResource = source_buffer;
     source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    source.PlacedFootprint.Offset = backing.heap_offset + layout.offset;
+    source.PlacedFootprint.Offset = source_offset + layout.offset;
     source.PlacedFootprint.Footprint.Format = desc.Format;
     source.PlacedFootprint.Footprint.Width = static_cast<UINT>((shape.width >> mip) ? (shape.width >> mip) : 1);
     source.PlacedFootprint.Footprint.Height = (shape.height >> mip) ? (shape.height >> mip) : 1;
@@ -180,12 +241,20 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   up->queue->Signal(up->fence, ++up->value);
   up->fence->SetEventOnCompletion(up->value, up->event);
   WaitForSingleObject(up->event, INFINITE);
+  if (staging) staging->Release();
 
   LIB_LOG(lib::kDebug, "d3d12", "host texture for format %u %llux%ux%u, %u mips at %p", shape.format,
           static_cast<unsigned long long>(shape.width), shape.height, shape.depth_or_array, shape.mips,
           reinterpret_cast<void*>(address));
   textures().emplace(key, texture);
+  g_texture_bytes.fetch_add(size, std::memory_order_relaxed);
   return texture;
+}
+
+void host_texture_totals(uint64_t* count, uint64_t* bytes) {
+  std::lock_guard<std::mutex> guard(g_lock);
+  *count = textures().size();
+  *bytes = g_texture_bytes.load(std::memory_order_relaxed);
 }
 
 }  // namespace holy::d3d12

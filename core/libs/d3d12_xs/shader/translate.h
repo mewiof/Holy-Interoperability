@@ -48,7 +48,9 @@ inline constexpr uint32_t kRegionTableSize = 64;
 inline constexpr uint32_t kSystemRegionVector = 0;   // [64] base lo, base hi, size, view index
 inline constexpr uint32_t kSystemUserVector = 64;    // [4]  initial user SGPRs
 inline constexpr uint32_t kSystemCountsVector = 68;  // x = region count
-inline constexpr uint32_t kSystemVectors = 69;
+inline constexpr uint32_t kSystemNggVector = 69;     // NGG draws: index area offset, groups in x, first vertex,
+                                                     // first instance (translate_ngg)
+inline constexpr uint32_t kSystemVectors = 70;
 
 // Image instructions address the bound shader-visible heaps through the
 // index in descriptor dword 0 (shader/descriptor_layout.h): float texture
@@ -56,11 +58,19 @@ inline constexpr uint32_t kSystemVectors = 69;
 // typed UAV arrays likewise, and the sampler array in kTextureSpace.
 inline constexpr uint32_t kTextureSpace = 9;
 enum ImageSlot : uint32_t {
-  kImage2D = 0, kImage2DArray = 1, kImage3D = 2, kImage1D = 4, kImage1DArray = 5,
+  kImage2D = 0, kImage2DArray = 1, kImage3D = 2, kImageCube = 3, kImage1D = 4, kImage1DArray = 5, kImage2DMS = 6,
 };
+inline constexpr uint32_t kImageSlots = 7;
+// Image atomics address the same heap through integer UAV arrays, in spaces
+// kIntegerImageSpace + slot (typed atomics need integer declarations).
+inline constexpr uint32_t kIntegerImageSpace = 21;
 
 bool translate_compute(const uint8_t* code, size_t size, const ComputeShaderInfo& info, std::vector<uint8_t>* dxbc,
                        std::string* error);
+
+// When the translator was built (its source files' compile times): stored
+// translations are keyed by it, so a changed translator misses them.
+std::string translator_build();
 
 // Graphics stages. Vertex shaders get the vertex id in v0 and the instance id
 // in v3 (assumed); all 16 user SGPRs come from the HolySystem user values.
@@ -78,14 +88,50 @@ struct ShaderInterface {
   uint32_t targets = 0;      // pixel: render targets written
   bool position = false;     // vertex: exports a position
   bool depth = false;        // pixel: writes depth
+  // pixel: attributes read as pairs of 16-bit floats (v_interp_*_f16), each
+  // as two inputs HALFPARAM 2n and 2n + 1: the halves of channels x, y (low,
+  // high, low, high), then of z, w, interpolated (half_param_register).
+  uint32_t half_params = 0;
 };
+
+// The first of the two input registers of half-precision attribute n: after
+// the attributes read whole (in registers n + 1), in attribute order.
+uint32_t half_param_register(uint32_t params, uint32_t half_params, uint32_t n);
 
 // The stage a graphics program was built for, from its exports (position
 // exports: vertex; colour, depth or null exports and attribute
 // interpolation: pixel). False when the code shows neither.
 bool native_graphics_stage(const uint8_t* code, size_t size, GraphicsStage* stage);
 
+// `consumer` (vertex programs, optional): the interface of the pixel program
+// that follows. Only what it reads is output: attributes read whole as
+// TEXCOORDn, attributes read as 16-bit halves as HALFPARAM pairs (each
+// exported channel's halves as floats, in half_param_register's registers).
 bool translate_graphics(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,
-                        ShaderInterface* link, std::string* error);
+                        ShaderInterface* link, std::string* error, const ShaderInterface* consumer = nullptr);
+
+// NGG vertex programs (observed: titles' vertex programs that export
+// primitives, request output space with s_sendmsg and share data through
+// group shared memory, each group of vertex ids (v5 >> k) being one group of
+// vertices and primitives). Translated into a host compute program, a thread
+// group per vertex group (x) and instance (y), that writes the draw's records
+// into the raw UAV u0 of space kNggSpace: vertex slot n at n * stride
+// (position, then parameter k at 16 * (1 + k)), and from HolySystem's NGG
+// vector x on three indices per primitive slot, a slot being group * group
+// size + thread. Primitive slots the program does not export stay degenerate.
+// A host draw of those indices with a vertex program that reads the records
+// (u0 as t0 of the same space) draws what the console would.
+inline constexpr uint32_t kNggSpace = 20;  // between the image spaces (kTextureSpace + ImageSlot) and the
+                                           // integer image spaces
+struct NggInfo {
+  uint32_t group = 0;   // threads (vertex and primitive slots) per group
+  uint32_t stride = 0;  // bytes per vertex record
+};
+bool native_ngg_program(const uint8_t* code, size_t size);
+// The host vertex program of an NGG draw: SV_VertexID's record (t0 of space
+// kNggSpace) as SV_Position and TEXCOORDn for the parameters in `params`.
+std::vector<uint8_t> ngg_vertex_program(uint32_t stride, uint32_t params, uint32_t half_params = 0);
+bool translate_ngg(const uint8_t* code, size_t size, std::vector<uint8_t>* dxbc, ShaderInterface* link, NggInfo* info,
+                   std::string* error);
 
 }  // namespace holy::d3d12

@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -22,11 +23,20 @@
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
+#include "core/libs/d3d12_xs/ngg.h"
 #include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/support.h"
 
 namespace holy::d3d12 {
 namespace {
+
+// Recorded work, for recorded_work_summary.
+struct WorkCounts {
+  std::atomic<uint64_t> draws{0}, indexed{0}, ngg{0}, dispatches{0}, no_pipeline{0}, unbound{0};
+  std::atomic<uint64_t> clears{0}, depth_clears{0}, nonblack_clears{0};
+};
+WorkCounts g_work;
+
 
 const lib::VtableInfo kListInfo{kLibrary, "ID3D12GraphicsCommandListX"};
 
@@ -43,8 +53,63 @@ ULONG STDMETHODCALLTYPE list_release(CommandList* self) {
   return static_cast<ULONG>(self->refs.fetch_sub(1) - 1);
 }
 
+// --- host command lists ------------------------------------------------------------
+//
+// Observed: titles reset a command list and submit it again while its
+// previous submission is still executing (the console allows it). The
+// desktop does not: a command list must not be submitted again before the
+// GPU has finished its previous submission (the debug layer refuses such a
+// submission; without it the driver re-records what the GPU is executing,
+// and the host device is removed as hung). Host model: a title list records
+// into a host list from a pool; resetting a title list whose host list may
+// still be executing takes another host list, one the GPU is done with (or a
+// new one), and leaves the busy one in the pool.
+
+struct HostListPool {
+  std::mutex lock;
+  std::vector<HostList*> idle[4];  // by list type: direct, bundle, compute, copy
+};
+
+HostListPool& pool() {
+  static auto* instance = new HostListPool();
+  return *instance;
+}
+
+bool in_flight(const HostList* h) {
+  return h->fence && h->fence->GetCompletedValue() < h->value;
+}
+
+HostList* new_host_list(Device* device, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator) {
+  ID3D12GraphicsCommandList* list = nullptr;
+  const HRESULT hr = device->host->CreateCommandList(0, type, allocator, nullptr, IID_PPV_ARGS(&list));
+  if (FAILED(hr)) {
+    LIB_LOG(lib::kError, "d3d12", "host command list of type %d refused (0x%08lX)", static_cast<int>(type),
+            static_cast<unsigned long>(hr));
+    return nullptr;
+  }
+  auto* h = new HostList();
+  h->list = list;
+  h->recording = true;
+  list->QueryInterface(IID_PPV_ARGS(&h->list2));
+  list->QueryInterface(IID_PPV_ARGS(&h->list7));
+  return h;
+}
+
+void use_host_list(CommandList* self, HostList* h) {
+  self->current = h;
+  self->host = h->list;
+  self->host2 = h->list2;
+  self->host7 = h->list7;
+  if (HolyLogEnabled(lib::kDebug)) {
+    wchar_t name[32];
+    std::swprintf(name, 32, L"title list %u", self->number);
+    h->list->SetName(name);  // device-removed data reports lists by name
+  }
+}
+
 HRESULT STDMETHODCALLTYPE list_close(CommandList* self) {
   const HRESULT hr = self->host->Close();
+  if (SUCCEEDED(hr)) self->current->recording = false;
   LIB_LOG(FAILED(hr) ? lib::kError : lib::kTrace, "d3d12", "list %p closed -> 0x%08lX", static_cast<void*>(self),
           static_cast<unsigned long>(hr));
   return hr;
@@ -69,7 +134,43 @@ HRESULT STDMETHODCALLTYPE list_reset_x(CommandList* self, void* allocator, void*
   self->pipeline = nullptr;
   self->translated = false;
   std::memset(self->vertex_buffers, 0, sizeof(self->vertex_buffers));
-  const HRESULT hr = self->host->Reset(host_allocator, nullptr);
+  HostList* h = self->current;
+  if (h->recording) {  // reset without a close: the desktop wants the list closed first
+    h->list->Close();
+    h->recording = false;
+  }
+  if (in_flight(h)) {
+    HostListPool& p = pool();
+    HostList* next = nullptr;
+    {
+      std::lock_guard<std::mutex> guard(p.lock);
+      std::vector<HostList*>& idle = p.idle[self->type & 3];
+      for (size_t i = 0; i < idle.size(); ++i) {
+        if (!in_flight(idle[i])) {
+          next = idle[i];
+          idle[i] = idle.back();
+          idle.pop_back();
+          break;
+        }
+      }
+      idle.push_back(h);
+    }
+    if (!next) {
+      next = new_host_list(self->device, self->type, host_allocator);
+      if (!next) return E_OUTOFMEMORY;
+      use_host_list(self, next);
+      LIB_LOG(lib::kTrace, "d3d12", "list %p reset onto a new host list", static_cast<void*>(self));
+      return S_OK;
+    }
+    h = next;
+    use_host_list(self, h);
+  }
+  release_ngg_scratch(h);
+  const HRESULT hr = h->list->Reset(host_allocator, nullptr);
+  if (SUCCEEDED(hr)) {
+    h->recording = true;
+    h->executed = false;
+  }
   LIB_LOG(FAILED(hr) ? lib::kError : lib::kTrace, "d3d12", "list %p reset with allocator %p -> 0x%08lX",
           static_cast<void*>(self), allocator, static_cast<unsigned long>(hr));
   return hr;
@@ -98,6 +199,10 @@ void STDMETHODCALLTYPE list_clear_render_target_view(CommandList* self, SIZE_T h
   if (!host.ptr) {
     LIB_LOG(lib::kError, "d3d12", "render target clear of an unknown descriptor %p", reinterpret_cast<void*>(handle));
     return;
+  }
+  g_work.clears.fetch_add(1, std::memory_order_relaxed);
+  if (colour && (colour[0] != 0 || colour[1] != 0 || colour[2] != 0)) {
+    g_work.nonblack_clears.fetch_add(1, std::memory_order_relaxed);
   }
   self->host->ClearRenderTargetView(host, colour, rect_count, rects);
 }
@@ -243,7 +348,35 @@ void STDMETHODCALLTYPE list_barrier(CommandList* self, UINT32 count, const D3D12
 }
 
 // Observed: slot 20 is IASetPrimitiveTopology, at its desktop position.
+// Titles also set topology 17 (0x11), which the desktop does not define: the
+// console GPU's rectangle list (documented in public RDNA register references
+// as DI_PT_RECTLIST, 0x11). Each three vertices are three corners of a
+// rectangle whose fourth corner the GPU adds. Passed to the host as is, an
+// undefined topology removes the host device (as hung) at the next work the
+// list submits. Host, partial: rectangle lists are drawn as triangle lists,
+// which draws one half of each rectangle; other topologies the desktop does
+// not define report themselves.
+constexpr D3D12_PRIMITIVE_TOPOLOGY kRectangleList = static_cast<D3D12_PRIMITIVE_TOPOLOGY>(17);
+
+bool desktop_topology(D3D12_PRIMITIVE_TOPOLOGY t) {
+  return (t >= D3D_PRIMITIVE_TOPOLOGY_UNDEFINED && t <= D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) ||
+         (t >= D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ && t <= D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ) ||
+         (t >= D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST && t <= D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST);
+}
+
 void STDMETHODCALLTYPE list_set_primitive_topology(CommandList* self, D3D12_PRIMITIVE_TOPOLOGY topology) {
+  if (topology == kRectangleList) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+      LIB_LOG(lib::kWarn, "d3d12", "rectangle lists are drawn as triangle lists (half of each rectangle)");
+    }
+    topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+  } else if (!desktop_topology(topology)) {
+    LIB_LOG(lib::kError, "d3d12", "primitive topology %d is not a desktop topology", static_cast<int>(topology));
+    HolyUnimplementedFrom(kLibrary, "IASetPrimitiveTopology(console topology)", _ReturnAddress());
+    return;
+  }
+  self->topology = topology;
   self->host->IASetPrimitiveTopology(topology);
 }
 
@@ -430,6 +563,7 @@ void STDMETHODCALLTYPE list_set_graphics_root_uav(CommandList* self, UINT index,
 
 void STDMETHODCALLTYPE list_set_index_buffer(CommandList* self, const D3D12_INDEX_BUFFER_VIEW* view) {
   if (!view) {
+    self->index_buffer_set = false;
     self->host->IASetIndexBuffer(nullptr);
     return;
   }
@@ -439,6 +573,8 @@ void STDMETHODCALLTYPE list_set_index_buffer(CommandList* self, const D3D12_INDE
     LIB_LOG(lib::kError, "d3d12", "index buffer at %p lies in no GPU memory", reinterpret_cast<void*>(view->BufferLocation));
     return;
   }
+  self->index_buffer = host;
+  self->index_buffer_set = true;
   self->host->IASetIndexBuffer(&host);
 }
 
@@ -472,6 +608,7 @@ void STDMETHODCALLTYPE list_clear_depth_stencil_view(CommandList* self, SIZE_T h
                                                      const D3D12_RECT* rects) {
   const D3D12_CPU_DESCRIPTOR_HANDLE host = host_cpu_handle(handle);
   if (!host.ptr) return;
+  g_work.depth_clears.fetch_add(1, std::memory_order_relaxed);
   self->host->ClearDepthStencilView(host, flags, depth, stencil, rect_count, rects);
 }
 
@@ -515,6 +652,7 @@ void STDMETHODCALLTYPE list_set_unknown_75(CommandList*, uint32_t value) {
 }
 
 void report_unbound(const char* what) {
+  g_work.unbound.fetch_add(1, std::memory_order_relaxed);
   static std::atomic<int> logged{0};
   if (logged.fetch_add(1) < 8) LIB_LOG(lib::kError, "d3d12", "%s with a translated pipeline could not be bound", what);
 }
@@ -535,8 +673,17 @@ void mark_work(CommandList* self) {
 
 void STDMETHODCALLTYPE list_draw_instanced(CommandList* self, UINT vertices, UINT instances, UINT first_vertex,
                                            UINT first_instance) {
-  if (!self->pipeline) return;  // no host pipeline (reported when it was set)
+  if (!self->pipeline) {  // no host pipeline (reported when it was set)
+    g_work.no_pipeline.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  g_work.draws.fetch_add(1, std::memory_order_relaxed);
   mark_work(self);
+  if (const NggPipeline* ngg = self->translated ? ngg_pipeline(self->pipeline) : nullptr) {
+    g_work.ngg.fetch_add(1, std::memory_order_relaxed);
+    if (!draw_ngg(self, *ngg, vertices, instances, first_vertex, first_instance)) report_unbound("an NGG draw");
+    return;
+  }
   if (self->translated) {
     // The host's vertex index already includes the first vertex.
     if (!bind_translated_graphics(self, 0, first_instance)) return report_unbound("a draw");
@@ -548,8 +695,17 @@ void STDMETHODCALLTYPE list_draw_instanced(CommandList* self, UINT vertices, UIN
 
 void STDMETHODCALLTYPE list_draw_indexed_instanced(CommandList* self, UINT indices, UINT instances, UINT first_index,
                                                    INT base_vertex, UINT first_instance) {
-  if (!self->pipeline) return;  // no host pipeline (reported when it was set)
+  if (!self->pipeline) {  // no host pipeline (reported when it was set)
+    g_work.no_pipeline.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  g_work.indexed.fetch_add(1, std::memory_order_relaxed);
   mark_work(self);
+  if (self->translated && ngg_pipeline(self->pipeline)) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 4) LIB_LOG(lib::kError, "d3d12", "indexed draw with an NGG pipeline: not drawn");
+    return;
+  }
   if (self->translated) {
     // The host's vertex index is the index; native code adds the base vertex.
     if (!bind_translated_graphics(self, static_cast<uint32_t>(base_vertex), first_instance)) {
@@ -563,7 +719,11 @@ void STDMETHODCALLTYPE list_draw_indexed_instanced(CommandList* self, UINT indic
 }
 
 void STDMETHODCALLTYPE list_dispatch(CommandList* self, UINT x, UINT y, UINT z) {
-  if (!self->pipeline) return;  // no host pipeline (reported when it was set)
+  if (!self->pipeline) {  // no host pipeline (reported when it was set)
+    g_work.no_pipeline.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  g_work.dispatches.fetch_add(1, std::memory_order_relaxed);
   mark_work(self);
   if (self->translated) {
     if (!bind_translated_compute(self)) return report_unbound("a dispatch");
@@ -624,6 +784,20 @@ const auto kListVtable = [] {
 
 }  // namespace
 
+std::string recorded_work_summary() {
+  auto take = [](std::atomic<uint64_t>& counter) {
+    return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed));
+  };
+  char text[256];
+  std::snprintf(text, sizeof(text),
+                "%llu draws (%llu NGG), %llu indexed draws, %llu dispatches, %llu colour clears (%llu not black), "
+                "%llu depth clears; dropped: %llu without a host pipeline, %llu unbound",
+                take(g_work.draws), take(g_work.ngg), take(g_work.indexed), take(g_work.dispatches),
+                take(g_work.clears), take(g_work.nonblack_clears), take(g_work.depth_clears),
+                take(g_work.no_pipeline), take(g_work.unbound));
+  return text;
+}
+
 HRESULT create_command_list(Device* device, const uint32_t* desc, void* allocator, void* initial_state,
                             void** out) {
   if (!out || !desc) return E_POINTER;
@@ -635,27 +809,60 @@ HRESULT create_command_list(Device* device, const uint32_t* desc, void* allocato
     return E_NOTIMPL;
   }
   const auto type = static_cast<D3D12_COMMAND_LIST_TYPE>(desc[0]);
-  ID3D12GraphicsCommandList* host = nullptr;
-  const HRESULT hr = device->host->CreateCommandList(0, type, host_allocator, nullptr, IID_PPV_ARGS(&host));
-  LIB_LOG(lib::kDebug, "d3d12", "command list {%u, %u, %u, %u} -> 0x%08lX", desc[0], desc[1], desc[2], desc[3],
-          static_cast<unsigned long>(hr));
-  if (FAILED(hr)) return hr;
+  HostList* host = new_host_list(device, type, host_allocator);
+  LIB_LOG(lib::kDebug, "d3d12", "command list {%u, %u, %u, %u} -> %s", desc[0], desc[1], desc[2], desc[3],
+          host ? "made" : "refused");
+  if (!host) return E_OUTOFMEMORY;
   static std::atomic<uint32_t> lists{0};
   const uint32_t number = lists.fetch_add(1) + 1;
-  wchar_t name[32];
-  std::swprintf(name, 32, L"title list %u", number);
-  host->SetName(name);  // device-removed data reports lists by name
   auto* list = new CommandList();
   list->number = number;
   list->vtable = kListVtable.data();
   list->info = &kListInfo;
   list->device = device;
-  list->host = host;
   list->type = type;
-  host->QueryInterface(IID_PPV_ARGS(&list->host2));
-  host->QueryInterface(IID_PPV_ARGS(&list->host7));
+  use_host_list(list, host);
   *out = list;
   return S_OK;
+}
+
+void submit_command_lists(CommandQueue* queue, UINT count, void* const* lists) {
+  ID3D12CommandList* stack[64];
+  std::vector<ID3D12CommandList*> spill;
+  ID3D12CommandList** host = stack;
+  if (count > 64) {
+    spill.resize(count);
+    host = spill.data();
+  }
+  UINT used = 0;
+  std::lock_guard<std::mutex> guard(queue->lock);
+  for (UINT i = 0; i < count; ++i) {
+    auto* list = static_cast<CommandList*>(lists[i]);
+    if (!list || !list->current) continue;
+    HostList* h = list->current;
+    if (h->executed && in_flight(h)) {
+      // The same recording submitted again before the GPU finished it: wait.
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 4) {
+        LIB_LOG(lib::kWarn, "d3d12", "title list %u submitted again while executing; waiting for it", list->number);
+      }
+      const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      if (event && SUCCEEDED(h->fence->SetEventOnCompletion(h->value, event))) WaitForSingleObject(event, INFINITE);
+      if (event) CloseHandle(event);
+    }
+    host[used++] = h->list;
+  }
+  if (!used) return;
+  queue->host->ExecuteCommandLists(used, host);
+  const uint64_t value = ++queue->submitted;
+  queue->host->Signal(queue->fence, value);
+  for (UINT i = 0; i < count; ++i) {
+    auto* list = static_cast<CommandList*>(lists[i]);
+    if (!list || !list->current) continue;
+    list->current->fence = queue->fence;
+    list->current->value = value;
+    list->current->executed = true;
+  }
 }
 
 }  // namespace holy::d3d12

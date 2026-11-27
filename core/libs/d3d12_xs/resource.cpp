@@ -84,7 +84,31 @@ const auto kResourceVtable = [] {
 
 }  // namespace
 
+// Formats the console adds to DXGI (documented: their numbers are public in
+// open-source texture tooling), with the nearest desktop format: depth 16 /
+// stencil 8 (118) and its depth (119) and stencil (120) views become the
+// 24/8 family; the 10:10:10:2 float formats (116 7e3, 117 6e4) 16-bit float
+// RGBA; R4G4 (190) R8G8. Host textures never live in title memory, so only
+// precision and size differ.
+DXGI_FORMAT desktop_format(DXGI_FORMAT format) {
+  switch (static_cast<uint32_t>(format)) {
+    case 116: case 117: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case 118: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case 119: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case 120: return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    case 190: return DXGI_FORMAT_R8G8_UNORM;
+    default: return format;
+  }
+}
+
+D3D12_CLEAR_VALUE desktop_clear_value(const D3D12_CLEAR_VALUE& clear) {
+  D3D12_CLEAR_VALUE host = clear;
+  host.Format = desktop_format(clear.Format);
+  return host;
+}
+
 DXGI_FORMAT substitute_format(DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags) {
+  format = desktop_format(format);
   if (!(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return format;
   switch (format) {
     case DXGI_FORMAT_B5G6R5_UNORM:
@@ -126,17 +150,17 @@ HRESULT create_host_committed(Device* device, const D3D12_HEAP_PROPERTIES& heap,
     layout = D3D12_BARRIER_LAYOUT_COMMON;
   }
   const bool target = (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
-  const HRESULT hr = device10->CreateCommittedResource3(&heap, flags, &desc1, layout, target ? clear : nullptr, nullptr,
-                                                        0, nullptr, IID_PPV_ARGS(out));
+  const D3D12_CLEAR_VALUE host_clear = clear ? desktop_clear_value(*clear) : D3D12_CLEAR_VALUE{};
+  const HRESULT hr = device10->CreateCommittedResource3(&heap, flags, &desc1, layout, target && clear ? &host_clear : nullptr,
+                                                        nullptr, 0, nullptr, IID_PPV_ARGS(out));
   device10->Release();
   return hr;
 }
 
 DXGI_FORMAT host_view_format(const void* resource, DXGI_FORMAT format) {
   const auto* r = static_cast<const Resource*>(resource);
-  if (!r || r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return format;
-  const DXGI_FORMAT substitute = substitute_format(format, r->desc.Flags);
-  return substitute != format ? substitute : format;
+  if (!r || r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return desktop_format(format);
+  return substitute_format(format, r->desc.Flags);
 }
 
 // Observed: device slot 127 is called with heap properties, heap flags
@@ -167,10 +191,12 @@ HRESULT create_committed_resource(Device* device, const D3D12_HEAP_PROPERTIES* p
   const bool render_target = (host_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                                                  D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
   ID3D12Resource* host = nullptr;
+  const D3D12_CLEAR_VALUE host_clear = clear ? desktop_clear_value(*clear) : D3D12_CLEAR_VALUE{};
   const HRESULT hr =
       layout ? create_host_committed(device, host_properties, host_flags, host_desc, state, clear, &host)
              : device->host->CreateCommittedResource(&host_properties, host_flags, &host_desc,
-                                                     D3D12_RESOURCE_STATE_COMMON, render_target ? clear : nullptr,
+                                                     D3D12_RESOURCE_STATE_COMMON,
+                                                     render_target && clear ? &host_clear : nullptr,
                                                      IID_PPV_ARGS(&host));
   LIB_LOG(lib::kDebug, "d3d12", "committed resource dim %d %llux%u fmt %d heap %d flags 0x%x state 0x%x -> 0x%08lX",
           desc->Dimension, static_cast<unsigned long long>(desc->Width), desc->Height, desc->Format,

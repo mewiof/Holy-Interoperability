@@ -22,7 +22,8 @@ uint64_t shader_hash(const void* bytes, size_t size) {
   return hash;
 }
 
-void discard_host_caches_after_run() {
+void discard_host_caches_after_run(long refusal) {
+  if (refusal != E_OUTOFMEMORY) return;
   const wchar_t* data_dir = HolyDataDir();
   if (!data_dir || !*data_dir) return;
   const std::wstring path = std::wstring(data_dir) + L"\\" + kHostCacheDir + L"\\" + kHostCacheDiscard;

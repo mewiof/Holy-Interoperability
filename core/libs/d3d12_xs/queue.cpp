@@ -56,12 +56,6 @@ HRESULT STDMETHODCALLTYPE queue_signal(CommandQueue* self, void* fence, UINT64 v
 // and flags are not used.
 void STDMETHODCALLTYPE queue_execute_command_lists_x(CommandQueue* self, UINT count, void* const* lists,
                                                     UINT64 token, UINT flags) {
-  std::vector<ID3D12CommandList*> host;
-  host.reserve(count);
-  for (UINT i = 0; i < count; ++i) {
-    const auto* list = static_cast<const CommandList*>(lists[i]);
-    if (list && list->host) host.push_back(list->host);
-  }
   LIB_LOG(lib::kTrace, "d3d12", "execute %u lists (token %llu, flags 0x%x)", count,
           static_cast<unsigned long long>(token), flags);
   if (HolyLogEnabled(lib::kDebug)) {
@@ -72,7 +66,7 @@ void STDMETHODCALLTYPE queue_execute_command_lists_x(CommandQueue* self, UINT co
     }
     LIB_LOG(lib::kDebug, "d3d12", "queue type %d executes title lists%s", self->type, numbers.c_str());
   }
-  if (!host.empty()) self->host->ExecuteCommandLists(static_cast<UINT>(host.size()), host.data());
+  submit_command_lists(self, count, lists);
 }
 
 // Observed: slot 32 is PresentX(plane_count, planes, parameters) (present.h).
@@ -190,12 +184,19 @@ HRESULT create_command_queue(Device* device, const D3D12_COMMAND_QUEUE_DESC* des
   host->SetName(desc->Type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? L"title compute queue"
                 : desc->Type == D3D12_COMMAND_LIST_TYPE_COPY  ? L"title copy queue"
                                                               : L"title direct queue");
+  ID3D12Fence* fence = nullptr;
+  const HRESULT fence_hr = device->host->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+  if (FAILED(fence_hr)) {
+    host->Release();
+    return fence_hr;
+  }
   auto* queue = new CommandQueue();
   queue->vtable = kQueueVtable.data();
   queue->info = &kQueueInfo;
   queue->device = device;
   queue->host = host;
   queue->type = desc->Type;
+  queue->fence = fence;
   *out = queue;
   return S_OK;
 }

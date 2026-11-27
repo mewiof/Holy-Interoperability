@@ -22,16 +22,22 @@
 #include "core/libs/d3d12_xs/present.h"
 
 #include <dxgi1_4.h>
+#include <psapi.h>
 #include <intrin.h>
 
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/libs/d3d12_xs/device.h"
+#include "core/libs/d3d12_xs/frame_pacing.h"
+#include "core/libs/d3d12_xs/texture_upload.h"
 #include "core/libs/support.h"
 
 namespace holy::d3d12 {
@@ -58,6 +64,18 @@ struct Presenter {
 
 std::mutex g_lock;
 Presenter* g_presenter = nullptr;
+
+// Frames reach "presented" (frame event 2, wait_for_presented) at the frame
+// interval boundary after their GPU work is done, as a console present flips
+// at the interval: titles wait for an earlier frame's present to pace
+// themselves. A thread carries the presents out in order.
+struct Flip {
+  uint64_t token;
+  uint64_t gpu_value;  // the presenter fence value of the present's copy
+};
+std::mutex g_flip_lock;
+std::condition_variable g_flip_ready;
+std::deque<Flip> g_flips;
 std::atomic<uint64_t> g_tokens{0};
 std::atomic<uint64_t> g_last_presented{0};
 ID3D12Fence* g_presented_fence = nullptr;  // value: highest token presented
@@ -254,6 +272,20 @@ void write_capture(uint64_t present, DXGI_FORMAT format, UINT width, UINT height
   CloseHandle(handle);
   LIB_LOG(lib::kInfo, "d3d12", "present %llu captured (%ux%u, format %u)", static_cast<unsigned long long>(present),
           width, height, format);
+  // What was recorded since the previous capture, and memory use.
+  LIB_LOG(lib::kInfo, "d3d12", "since the previous capture: %s", recorded_work_summary().c_str());
+  PROCESS_MEMORY_COUNTERS_EX counters{};
+  counters.cb = sizeof(counters);
+  GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters));
+  MEMORYSTATUSEX status{};
+  status.dwLength = sizeof(status);
+  GlobalMemoryStatusEx(&status);
+  uint64_t textures = 0, texture_bytes = 0;
+  host_texture_totals(&textures, &texture_bytes);
+  LIB_LOG(lib::kInfo, "d3d12", "memory: process commit %.2f GiB, system commit available %.2f GiB; %llu host textures "
+          "copied from title memory (%.2f GiB)", counters.PrivateUsage / 1073741824.0,
+          status.ullAvailPageFile / 1073741824.0, static_cast<unsigned long long>(textures),
+          texture_bytes / 1073741824.0);
 }
 
 // Reads `resource` back (in the common state) and writes it to a file.
@@ -315,6 +347,22 @@ void capture(Presenter* p, ID3D12Resource* resource, DXGI_FORMAT format, const D
     readback->Unmap(0, nullptr);
   }
   readback->Release();
+}
+
+void flip_thread(Presenter* p) {
+  const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  for (;;) {
+    Flip flip;
+    {
+      std::unique_lock<std::mutex> lock(g_flip_lock);
+      g_flip_ready.wait(lock, [] { return !g_flips.empty(); });
+      flip = g_flips.front();
+      g_flips.pop_front();
+    }
+    wait_fence(p->fence, flip.gpu_value, event);
+    wait_frame_boundary();
+    if (flip.token > g_presented_fence->GetCompletedValue()) g_presented_fence->Signal(flip.token);
+  }
 }
 
 }  // namespace
@@ -422,7 +470,14 @@ HRESULT present_x(CommandQueue* queue, uint32_t plane_count, const PresentPlane*
     uint64_t seen = g_last_presented.load();
     while (token > seen && !g_last_presented.compare_exchange_weak(seen, token)) {
     }
-    p->queue->Signal(g_presented_fence, g_last_presented.load());
+    p->queue->Signal(p->fence, ++p->fence_value);
+    static std::once_flag started;
+    std::call_once(started, [p] { std::thread(flip_thread, p).detach(); });
+    {
+      std::lock_guard<std::mutex> lock(g_flip_lock);
+      g_flips.push_back({g_last_presented.load(), p->fence_value});
+    }
+    g_flip_ready.notify_one();
   }
   return S_OK;
 }

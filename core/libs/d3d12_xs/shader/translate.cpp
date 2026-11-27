@@ -1,8 +1,11 @@
 #include "core/libs/d3d12_xs/shader/translate.h"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <functional>
+#include <map>
 #include <set>
 #include <tuple>
 #include <utility>
@@ -45,6 +48,12 @@ constexpr uint16_t kExchangeOperand = 0x200;
 // Operand code standing for a DPP instruction's source 1 with its modifiers.
 constexpr uint16_t kModifiedOperand = 0x201;
 constexpr uint32_t kNoView = 0xFFFFFFFFu;
+// Program data reached through s_getpc_b64 (tables after the code): the
+// program's bytes appear at this address (above any title memory, inside the
+// 48 bits a buffer descriptor holds), read through kCodeView.
+constexpr uint32_t kCodeAddressHi = 0xFFF0u;
+constexpr uint32_t kCodeView = 0xFFFFFFFEu;
+constexpr uint32_t kCodeDataLimit = 65536;  // an immediate constant buffer's 4096 vectors
 
 Operand R(uint32_t r) { return dxbc::temp(r); }
 Operand I(uint32_t v) { return dxbc::imm(v); }
@@ -53,15 +62,22 @@ bool is_temp(const Operand& o) { return ((o[0] >> 12) & 0xFF) == dxbc::kTemp; }
 
 class Translator {
  public:
-  enum class Stage { Compute, Vertex, Pixel };
+  enum class Stage { Compute, Vertex, Pixel, Ngg };
 
   Translator(const uint8_t* code, size_t size, const ComputeShaderInfo& info) : code_(code), size_(size), info_(info) {}
   Translator(const uint8_t* code, size_t size, GraphicsStage stage)
       : code_(code), size_(size), stage_(stage == GraphicsStage::Vertex ? Stage::Vertex : Stage::Pixel) {
     info_.user_sgprs = 16;
   }
+  struct NggTag {};
+  Translator(const uint8_t* code, size_t size, NggTag) : code_(code), size_(size), stage_(Stage::Ngg) {
+    info_.user_sgprs = 16;
+  }
+
+  const NggInfo& ngg() const { return ngg_; }
 
   const ShaderInterface& link() const { return iface_; }
+  void set_consumer(const ShaderInterface* consumer) { consumer_ = consumer; }
 
   bool run(std::vector<uint8_t>* out, std::string* error);
 
@@ -119,6 +135,7 @@ class Translator {
   Operand eq(const Operand& a, const Operand& b) { return op2(dx::kIeq, a, b); }
   Operand ne(const Operand& a, const Operand& b) { return op2(dx::kIne, a, b); }
   Operand ult(const Operand& a, const Operand& b) { return op2(dx::kUlt, a, b); }
+  Operand uge(const Operand& a, const Operand& b) { return op2(dx::kUge, a, b); }
   Operand ilt(const Operand& a, const Operand& b) { return op2(dx::kIlt, a, b); }
   Operand bit01(const Operand& mask) { return band(mask, I(1)); }
   Operand nonzero(const Operand& a) { return ne(a, I(0)); }
@@ -282,6 +299,9 @@ class Translator {
   }
   Operand mask_bit(const Instruction& inst, uint16_t code) { return bit01(src(inst, code)); }
   Operand active() { return bit01(R(kExecLoR)); }
+  // Stages that run as host compute programs (thread groups, group shared
+  // memory, exchanges between lanes).
+  bool computeish() const { return stage_ == Stage::Compute || stage_ == Stage::Ngg; }
 
   // 64-bit helpers.
   std::pair<Operand, Operand> add64(const Operand& lo, const Operand& hi, const Operand& value, bool is_signed) {
@@ -340,13 +360,50 @@ class Translator {
     end_if();
     emit(dx::kIadd, {D(i), R(i), I(1)});
     emit(dx::kEndloop, {});
+    if (code_data_) {
+      const Operand in_code = band(eq(ahi, I(kCodeAddressHi)), ult(alo, I(static_cast<uint32_t>(size_))));
+      if_nz(band(in_code, eq(R(view), I(kNoView))));
+      put(view, I(kCodeView));
+      put(offset, alo);
+      end_if();
+    }
     return {view, offset};
+  }
+  // The program dword at a byte offset (4-aligned), 0 outside the data the
+  // immediate constant buffer holds.
+  Operand code_dword(const Operand& byte_offset) {
+    const uint32_t result = fresh();
+    put(result, I(0));
+    const Operand rel = sub(byte_offset, I(code_first_));
+    if_nz(band(uge(byte_offset, I(code_first_)), ult(rel, I(code_bytes_))));
+    const uint32_t vec = fresh();
+    put(vec, shr(rel, I(4)));
+    const Operand comp = ubfe(I(2), I(2), rel);
+    Operand value = dxbc::icb_indexed(vec, 3);
+    for (int c = 2; c >= 0; --c) value = select(eq(comp, I(static_cast<uint32_t>(c))), dxbc::icb_indexed(vec, c), value);
+    put(result, value);
+    end_if();
+    return R(result);
   }
   // Reads the dword at view/offset (any alignment); 0 when unresolved.
   Operand read(uint32_t view, const Operand& offset) {
     const uint32_t value = fresh();
     put(value, I(0));
-    if_nz(ne(R(view), I(kNoView)));
+    if (code_data_) {
+      if_nz(eq(R(view), I(kCodeView)));
+      const Operand o = in_temp(offset);
+      const Operand aligned = band(o, I(~3u));
+      const Operand shift = shl(band(o, I(3)), I(3));
+      const uint32_t w = fresh();
+      put(w, code_dword(aligned));
+      if_nz(shift);
+      const Operand next = code_dword(add(aligned, I(4)));
+      put(w, bor(shr(R(w), shift), shl(next, sub(I(32), shift))));
+      end_if();
+      put(value, R(w));
+      end_if();
+    }
+    if_nz(ult(R(view), I(kRegionTableSize)));
     const Operand o = in_temp(offset);
     const Operand aligned = band(o, I(~3u));
     const Operand shift = shl(band(o, I(3)), I(3));
@@ -370,13 +427,13 @@ class Translator {
     scratch_ = mark;
   }
   void write(uint32_t view, const Operand& offset, const Operand& value) {
-    if_nz(ne(R(view), I(kNoView)));
+    if_nz(ult(R(view), I(kRegionTableSize)));
     emit(dx::kStoreRaw, {dxbc::uav_indexed(0, view, dxbc::Access::Store), band(offset, I(~3u)), value});
     end_if();
   }
   // Byte or halfword store inside the containing dword.
   void write_part(uint32_t view, const Operand& offset, const Operand& value, uint32_t bytes) {
-    if_nz(ne(R(view), I(kNoView)));
+    if_nz(ult(R(view), I(kRegionTableSize)));
     const Operand aligned = band(offset, I(~3u));
     const Operand shift = shl(band(offset, I(3)), I(3));
     const Operand mask = shl(I(bytes == 1 ? 0xFFu : 0xFFFFu), shift);
@@ -391,7 +448,7 @@ class Translator {
   Operand atomic(int kind, uint32_t view, const Operand& offset, const Operand& value, const Operand& compare) {
     const uint32_t old = fresh();
     put(old, I(0));
-    if_nz(ne(R(view), I(kNoView)));
+    if_nz(ult(R(view), I(kRegionTableSize)));
     const Operand uav = dxbc::uav_indexed(0, view, dxbc::Access::Atomic);
     const Operand address = band(offset, I(~3u));
     static const uint32_t kOps[] = {dx::kImmAtomicExch, dx::kImmAtomicCmpExch, dx::kImmAtomicIadd,
@@ -419,13 +476,13 @@ class Translator {
     }
     return value;
   }
+  // Output modifiers of a float result (VOP3, and SDWA once emit_vector has
+  // copied them from the SDWA dword).
   Operand fresult(const Instruction& inst, Operand value) {
-    if (inst.encoding == Encoding::VOP3) {
-      if (inst.omod == 1) value = op2(dx::kMul, value, dxbc::immf(2.0f));
-      if (inst.omod == 2) value = op2(dx::kMul, value, dxbc::immf(4.0f));
-      if (inst.omod == 3) value = op2(dx::kMul, value, dxbc::immf(0.5f));
-      if (inst.clamp) value = op1(dx::kMov, value, dxbc::kSaturate);
-    }
+    if (inst.omod == 1) value = op2(dx::kMul, value, dxbc::immf(2.0f));
+    if (inst.omod == 2) value = op2(dx::kMul, value, dxbc::immf(4.0f));
+    if (inst.omod == 3) value = op2(dx::kMul, value, dxbc::immf(0.5f));
+    if (inst.clamp) value = op1(dx::kMov, value, dxbc::kSaturate);
     return value;
   }
 
@@ -441,18 +498,25 @@ class Translator {
   bool typed_load(uint32_t fmt, uint32_t components, uint32_t view, uint32_t at, uint32_t data);
   bool decode_format(uint32_t fmt, uint32_t components, uint32_t view, uint32_t at, const uint32_t* out);
   void format_load(uint32_t descriptor, uint32_t components, uint32_t view, uint32_t at, uint32_t data);
+  void format_store(const Operand& format, uint32_t components, uint32_t view, uint32_t at, uint32_t data);
   bool emit_ds(const Instruction& inst);
   bool emit_export(const Instruction& inst);
   bool emit_image(const Instruction& inst);
+  bool image_atomic64(const Instruction& inst, uint32_t slot, uint32_t coord_count, uint32_t index_reg);
   bool emit_vop3p(const Instruction& inst);
   // Cross-lane operations (compute programs): each lane stores the source
   // value and its EXEC bit in group shared memory; after a group barrier the
   // continuation reads the source lane's.
   static bool cross_lane(const Instruction& inst);
-  static bool read_first_lane(const Instruction& inst);
   void exchange_write(const Instruction& inst);
   bool exchange_read(const Instruction& inst);
   bool quad_read(const Instruction& inst);
+  // The value lanes outside the quad contribute to `inst` as the source of
+  // its operation (src0 = identity leaves the other operand), if it has one.
+  bool source_identity(const Instruction& inst, uint32_t* identity) const;
+  // The identity the next instruction reading `vgpr` (after program index
+  // `from`) applies to it, if that instruction is such an operation.
+  bool consumer_identity(size_t from, uint16_t vgpr, uint32_t* identity) const;
   bool finish_exchange(const Instruction& inst, uint32_t value, Operand valid, Operand write, bool fetch_inactive,
                        bool bound_zero, const Operand& source_active);
   bool emit_interp(const Instruction& inst);
@@ -464,6 +528,7 @@ class Translator {
   void epilogue(dxbc::Program& program) {
     if (stage_ == Stage::Pixel) program.emit(dx::kDiscard, {R(kExportedR)});
     for (uint32_t reg = 0; reg < kOutputRegisters; ++reg) {
+      if (!outputs_register(reg)) continue;
       for (uint32_t c = 0; c < 4; ++c) {
         if (!(written_[reg] & (1u << c))) continue;
         const Operand value = R(kOutputBase + 4 * reg + c);
@@ -471,24 +536,180 @@ class Translator {
         else program.emit(dx::kMov, {dxbc::output_register(reg, 1u << c), value});
       }
     }
+    if (stage_ == Stage::Vertex && consumer_) {
+      // Attributes the pixel program reads as halves: each channel's low and
+      // high halves (kNextR, done with by now, holds the high one).
+      for (uint32_t n = 0; n < 32; ++n) {
+        if (!((consumer_->half_params & iface_.params) & (1u << n))) continue;
+        const uint32_t out = half_param_register(consumer_->params, consumer_->half_params, n);
+        for (uint32_t c = 0; c < 4; ++c) {
+          const Operand value = R(kOutputBase + 4 * (n + 1) + c);
+          const uint32_t component = (c & 1) * 2;
+          program.emit(dx::kF16tof32, {dxbc::output_register(out + (c >> 1), 1u << component), value});
+          program.emit(dx::kUshr, {D(kNextR), value, I(16)});
+          program.emit(dx::kF16tof32, {dxbc::output_register(out + (c >> 1), 1u << (component + 1)), R(kNextR)});
+        }
+      }
+    }
     program.emit(dx::kRet, {});
+  }
+  // Vertex programs with a consumer: whether output register `reg` (an
+  // attribute's, n + 1) is output as is.
+  bool outputs_register(uint32_t reg) const {
+    if (stage_ != Stage::Vertex || !consumer_ || reg == 0 || reg > 32) return true;
+    return (consumer_->params >> (reg - 1)) & 1;
   }
   void set_output(uint32_t reg, uint32_t component, const Operand& value) {
     written_[reg] |= 1u << component;
     put(kOutputBase + 4 * reg + component, value);
   }
 
+  // NGG programs (see translate_ngg): the group size from the program's
+  // v_lshrrev_b32 vN, k, v5 (the group of a vertex id), and the vertex
+  // record from the parameters it exports.
+  bool ngg_scan() {
+    uint32_t shift = 0;
+    int max_param = -1;
+    for (const Instruction& inst : program_) {
+      if (inst.encoding == Encoding::VOP2 && inst.op == 22 && inst.src[1] == rdna::kVgpr0 + 5 &&
+          inst.src[0] >= 129 && inst.src[0] <= 136) {
+        shift = inst.src[0] - 128;  // inline constants 1-8
+      }
+      if (inst.encoding == Encoding::EXP && inst.target >= 32 && inst.target < 64) {
+        max_param = std::max(max_param, static_cast<int>(inst.target) - 32);
+      }
+    }
+    if (!shift) return fail("an NGG program without a vertex group (v_lshrrev_b32 of v5)");
+    ngg_.group = 1u << shift;
+    ngg_.stride = 16u * static_cast<uint32_t>(2 + max_param);
+    info_.threads[0] = ngg_.group;
+    info_.threads[1] = info_.threads[2] = 1;
+    return true;
+  }
+  // Group index (y groups of x) and this thread's slot (vertex and
+  // primitive record) in the draw.
+  Operand ngg_slot() {
+    const Operand group = add(mul_lo(dxbc::input(dxbc::kThreadGroupId, 1), dxbc::cb(0, kSystemNggVector, 1)),
+                              dxbc::input(dxbc::kThreadGroupId, 0));
+    return add(mul_lo(group, I(ngg_.group)), dxbc::input(dxbc::kThreadIdInGroupFlattened, 0));
+  }
+  void ngg_prologue(dxbc::Program& program) {
+    // Documented by open-source drivers for NGG programs: s2 group
+    // information (vertices in bits 12-20, primitives in 22-30), s3 wave
+    // information (wave index in bits 24-27, waves in 28-31), v5 the vertex
+    // id, v8 the instance id. The draw's vertex groups are thread groups (x)
+    // per instance (y).
+    const uint32_t waves = (ngg_.group + info_.wave_size - 1) / info_.wave_size;
+    const uint32_t shift = info_.wave_size == 64 ? 6 : 5;
+    dxbc::Program saved = std::move(p_);
+    p_ = dxbc::Program();
+    put(2, I((ngg_.group << 22) | (ngg_.group << 12)));
+    const Operand wave = shr(dxbc::input(dxbc::kThreadIdInGroupFlattened, 0), I(shift));
+    put(3, bor(I((waves << 28) | (info_.wave_size << 8) | info_.wave_size), shl(wave, I(24))));
+    const Operand first = add(dxbc::cb(0, kSystemNggVector, 2), mul_lo(dxbc::input(dxbc::kThreadGroupId, 0), I(ngg_.group)));
+    if (vgprs_ > 5) put(kVgprBase + 5, add(first, dxbc::input(dxbc::kThreadIdInGroupFlattened, 0)));
+    if (vgprs_ > 8) put(kVgprBase + 8, add(dxbc::cb(0, kSystemNggVector, 3), dxbc::input(dxbc::kThreadGroupId, 1)));
+    // Every primitive slot starts as a degenerate triangle.
+    const Operand slot = ngg_slot();
+    const Operand base = sub(slot, dxbc::input(dxbc::kThreadIdInGroupFlattened, 0));
+    const Operand at = add(dxbc::cb(0, kSystemNggVector, 0), mul_lo(slot, I(12)));
+    for (uint32_t i = 0; i < 3; ++i) {
+      emit(dx::kStoreRaw, {dxbc::uav(1, 0, dxbc::Access::Store), add(at, I(4 * i)), base});
+    }
+    program.append(p_);
+    p_ = std::move(saved);
+    scratch_ = 0;
+  }
+  // Exports of NGG programs go to the draw's vertex and primitive records.
+  bool ngg_export(const Instruction& inst) {
+    auto vgpr = [&](int i) { return R(vreg(inst.src[i] - rdna::kVgpr0)); };
+    const uint32_t target = inst.target;
+    if (target == 9 || (target >= 13 && target <= 15)) return true;  // null, point size, clip distances
+    if_nz(active());
+    const Operand slot = in_temp(ngg_slot());
+    if (target == 12 || (target >= 32 && target < 64)) {
+      if (target == 12) iface_.position = true;
+      else iface_.params |= 1u << (target - 32);
+      const uint32_t offset = target == 12 ? 0 : 16 * (1 + target - 32);
+      const Operand at = add(mul_lo(slot, I(ngg_.stride)), I(offset));
+      for (int c = 0; c < 4; ++c) {
+        if (!(inst.enable & (1 << c))) continue;
+        emit(dx::kStoreRaw, {dxbc::uav(1, 0, dxbc::Access::Store), add(at, I(4u * c)), vgpr(c)});
+      }
+    } else if (target == 20) {
+      // Primitive: vertex indices in bits 0-8, 10-18, 20-28 of the group,
+      // bit 31 a null primitive.
+      const Operand packed = in_temp(vgpr(0));
+      const Operand base = in_temp(sub(slot, dxbc::input(dxbc::kThreadIdInGroupFlattened, 0)));
+      const Operand null = in_temp(nonzero(shr(packed, I(31))));
+      const Operand at = add(dxbc::cb(0, kSystemNggVector, 0), mul_lo(slot, I(12)));
+      for (uint32_t i = 0; i < 3; ++i) {
+        const Operand index = select(null, base, add(base, ubfe(I(9), I(10 * i), packed)));
+        emit(dx::kStoreRaw, {dxbc::uav(1, 0, dxbc::Access::Store), add(at, I(4 * i)), index});
+      }
+    } else {
+      end_if();
+      return fail(format("NGG export target %u", target));
+    }
+    end_if();
+    return true;
+  }
+
+  // Cube coordinates as the console GPU takes them (documented by
+  // open-source drivers, which form them from v_cube*: s and t are the face
+  // coordinates divided by the major axis plus 1.5, then the face) turned
+  // back into a direction for a host cube texture, in place in temp t.
+  void cube_direction(uint32_t t) {
+    const Operand s1 = in_temp(op2(dx::kAdd, dxbc::temp(t, 0), dxbc::immf(-1.5f)));
+    const Operand t1 = in_temp(op2(dx::kAdd, dxbc::temp(t, 1), dxbc::immf(-1.5f)));
+    // Cube arrays: the third coordinate is 8 x slice + face; slice 0 is read.
+    const Operand face = in_temp(band(op1(dx::kFtou, dxbc::temp(t, 2)), I(7)));
+    // The major axis is 0.5: s and t are the minor axes over twice the major.
+    cube_vector(t, face, s1, t1, 0.5f);
+  }
+  // Writes into temp t the direction of face coordinates (s, t) relative to
+  // the face centre with major axis component h: faces +x (h, -t, -s),
+  // -x (-h, -t, s), +y (s, h, t), -y (s, -h, -t), +z (s, -t, h), -z (-s, -t, -h).
+  // With h = 0 it maps face-coordinate gradients to direction gradients (the
+  // direction is linear in s and t on a face).
+  void cube_vector(uint32_t t, const Operand& face, const Operand& s1, const Operand& t1, float h) {
+    const Operand ns = in_temp(dxbc::neg(s1)), nt = in_temp(dxbc::neg(t1));
+    const Operand one = dxbc::immf(h), minus = dxbc::immf(-h);
+    auto by_face = [&](const Operand v[6]) {
+      Operand r = v[5];
+      for (int f = 4; f >= 0; --f) r = select(eq(face, I(static_cast<uint32_t>(f))), v[f], r);
+      return r;
+    };
+    const Operand xs[6] = {one, minus, s1, s1, s1, ns};
+    const Operand ys[6] = {nt, nt, one, minus, nt, nt};
+    const Operand zs[6] = {ns, s1, t1, nt, one, minus};
+    const Operand x = in_temp(by_face(xs)), y = in_temp(by_face(ys)), z = in_temp(by_face(zs));
+    emit(dx::kMov, {dxbc::temp_dst_mask(t, 1), x});
+    emit(dx::kMov, {dxbc::temp_dst_mask(t, 2), y});
+    emit(dx::kMov, {dxbc::temp_dst_mask(t, 4), z});
+    emit(dx::kMov, {dxbc::temp_dst_mask(t, 8), I(0)});
+  }
+
   const uint8_t* code_;
   size_t size_;
   ComputeShaderInfo info_;
   std::vector<Instruction> program_;
+  size_t at_ = 0;  // index in program_ of the instruction being translated
   dxbc::Program p_;
   std::string error_;
   uint32_t scratch_ = 0;
   uint32_t vgprs_ = 3;
   bool barrier_ = false;
   bool lds_ = false;
+  // s_getpc_b64 present: program bytes [code_first_, + code_bytes_) are an
+  // immediate constant buffer.
+  bool code_data_ = false;
+  uint32_t code_first_ = 0, code_bytes_ = 0;
+  std::set<uint32_t> indirect_targets_;  // addresses s_setpc_b64 / s_swappc_b64 reach
+  const ShaderInterface* consumer_ = nullptr;  // vertex programs: the pixel program's interface
+  uint32_t scan_params_ = 0;  // pixel: attributes read whole (VINTRP), from the scan
   Stage stage_ = Stage::Compute;
+  NggInfo ngg_;
   ShaderInterface iface_;
   uint8_t written_[kOutputRegisters] = {};  // components exported per output register
   uint32_t exchange_reg_ = 0;    // temp holding the exchanged value while an instruction is emitted
@@ -497,6 +718,9 @@ class Translator {
   bool quad_ = false;            // a pixel program exchanges values within its quad (reads its position)
   uint32_t exchange_parity_ = 0; // which of the two exchange buffers the next exchange uses
   uint32_t textures_used_ = 0;  // ImageSlot bits
+  uint32_t integer_uavs_used_ = 0;  // ImageSlot bits of image atomics
+  bool ordered_uavs_ = false;        // pixel programs: integer image views are rasterizer-ordered
+  uint64_t features_ = 0;            // SFI0 feature bits
   uint32_t uavs_used_ = 0;
   bool samplers_used_ = false;
 };
@@ -769,9 +993,57 @@ bool Translator::emit_sop1(const Instruction& inst) {
       return true;
     }
     case 11: set_s(d, op1(dx::kBfrev, a)); return true;
+    case 12: {  // s_brev_b64
+      Operand lo, hi;
+      src64(inst, inst.src[0], &lo, &hi);
+      set_s64(d, op1(dx::kBfrev, hi), op1(dx::kBfrev, lo));
+      return true;
+    }
+    case 13: {  // s_bcnt0_i32_b32
+      const Operand r = sub(I(32), op1(dx::kCountbits, a));
+      scc_nonzero(r);
+      set_s(d, r);
+      return true;
+    }
+    case 14: case 16: {  // s_bcnt0_i32_b64, s_bcnt1_i32_b64
+      Operand lo, hi;
+      src64(inst, inst.src[0], &lo, &hi);
+      const Operand ones = add(op1(dx::kCountbits, lo), op1(dx::kCountbits, hi));
+      const Operand r = inst.op == 14 ? sub(I(64), ones) : ones;
+      scc_nonzero(r);
+      set_s(d, r);
+      return true;
+    }
     case 15: { const Operand r = op1(dx::kCountbits, a); scc_nonzero(r); set_s(d, r); return true; }
+    case 17: set_s(d, op1(dx::kFirstbitLo, bnot(a))); return true;  // s_ff0_i32_b32
+    case 18: case 20: {  // s_ff0_i32_b64, s_ff1_i32_b64: the lowest clear (set) bit, -1 if none
+      Operand lo, hi;
+      src64(inst, inst.src[0], &lo, &hi);
+      if (inst.op == 18) {
+        lo = bnot(lo);
+        hi = bnot(hi);
+      }
+      const Operand in_hi = select(ne(hi, I(0)), add(op1(dx::kFirstbitLo, hi), I(32)), I(0xFFFFFFFFu));
+      set_s(d, select(ne(lo, I(0)), op1(dx::kFirstbitLo, lo), in_hi));
+      return true;
+    }
     case 19: set_s(d, op1(dx::kFirstbitLo, a)); return true;
     case 21: set_s(d, op1(dx::kFirstbitHi, a)); return true;
+    case 22: case 24: {
+      // s_flbit_i32_b64: leading zeros; s_flbit_i32_i64: leading bits equal
+      // to the sign bit. -1 when there is no such boundary.
+      Operand lo, hi;
+      src64(inst, inst.src[0], &lo, &hi);
+      if (inst.op == 24) {
+        const Operand sign = sar(hi, I(31));
+        lo = bxor(lo, sign);
+        hi = bxor(hi, sign);
+      }
+      const Operand in_lo = select(ne(lo, I(0)), add(op1(dx::kFirstbitHi, lo), I(32)), I(0xFFFFFFFFu));
+      set_s(d, select(ne(hi, I(0)), op1(dx::kFirstbitHi, hi), in_lo));
+      return true;
+    }
+    case 23: set_s(d, op1(dx::kFirstbitShi, a)); return true;  // s_flbit_i32
     case 25: set_s(d, ibfe(I(8), I(0), a)); return true;
     case 26: set_s(d, ibfe(I(16), I(0), a)); return true;
     case 27: case 29: {
@@ -779,6 +1051,21 @@ bool Translator::emit_sop1(const Instruction& inst) {
       if (r == kNoRegister) return true;
       const Operand bit = shl(I(1), a);
       put(r, inst.op == 27 ? band(R(r), bnot(bit)) : bor(R(r), bit));
+      return true;
+    }
+    case 28: case 30: {  // s_bitset0_b64, s_bitset1_b64: bit a[5:0] of the 64-bit destination
+      if (d > 104 && d != rdna::kVccLo && d != rdna::kExecLo) return fail("s_bitset_b64 destination");
+      const uint32_t r0 = sreg(d);
+      const uint32_t r1 = d == rdna::kVccLo ? kVccHiR : d == rdna::kExecLo ? kExecHiR : r0 + 1;
+      const Operand index = band(a, I(63));
+      const Operand bit = shl(I(1), index);  // the shift takes the low five bits
+      const Operand low = ult(index, I(32));
+      const Operand lo_bit = select(low, bit, I(0)), hi_bit = select(low, I(0), bit);
+      if (inst.op == 28) {
+        set_s64(d, band(R(r0), bnot(lo_bit)), band(R(r1), bnot(hi_bit)));
+      } else {
+        set_s64(d, bor(R(r0), lo_bit), bor(R(r1), hi_bit));
+      }
       return true;
     }
     case 36: return saveexec(0);
@@ -794,6 +1081,71 @@ bool Translator::emit_sop1(const Instruction& inst) {
     case 63: return saveexec32(3);
     case 64: return saveexec32(4);
     case 68: return saveexec32(5);
+    case 32: case 33: {
+      // s_setpc_b64 / s_swappc_b64 (swappc: dst = the address of the next
+      // instruction): a jump to the address in src, a block of this program
+      // (decoding found the addresses the program forms).
+      Operand lo, hi;
+      src64(inst, inst.src[0], &lo, &hi);
+      const Operand target = copy(lo);
+      if (inst.op == 33) set_s64(d, I(inst.pc + 4), I(kCodeAddressHi));
+      put(kNextR, target);
+      return true;
+    }
+    case 31:  // s_getpc_b64: the address of the next instruction, in the program's data range
+      set_s64(d, I(inst.pc + 4), I(kCodeAddressHi));
+      return true;
+    case 41: case 42: case 43: case 65: case 66: case 67: {
+      // s_nand/nor/xnor_saveexec (b64, b32): dst = exec; exec = ~(src op exec).
+      // Lane masks keep the lane's own bit only.
+      Operand slo, shi;
+      if (inst.op <= 43) {
+        src64(inst, inst.src[0], &slo, &shi);
+      } else {
+        slo = a;
+      }
+      const Operand e0 = copy(R(kExecLoR)), e1 = copy(R(kExecHiR));
+      const uint32_t kind = inst.op <= 43 ? inst.op - 41 : inst.op - 65;
+      const Operand combined = kind == 0 ? band(slo, e0) : kind == 1 ? bor(slo, e0) : bxor(slo, e0);
+      put(kExecLoR, band(bnot(combined), I(1)));
+      put(kExecHiR, I(0));
+      scc_nonzero(R(kExecLoR));
+      if (inst.op <= 43) {
+        set_s64(d, e0, e1);
+      } else {
+        set_s(d, e0);
+      }
+      return true;
+    }
+    case 57: case 58: case 70: case 71: {
+      // s_andn1/andn2_wrexec (b64, b32): exec = ~src & exec (andn1) or
+      // src & ~exec (andn2); dst = the new exec.
+      const Operand src_lo = copy(a);
+      const Operand e0 = copy(R(kExecLoR));
+      const bool andn1 = inst.op == 57 || inst.op == 70;
+      put(kExecLoR, band(andn1 ? band(bnot(src_lo), e0) : band(src_lo, bnot(e0)), I(1)));
+      put(kExecHiR, I(0));
+      scc_nonzero(R(kExecLoR));
+      if (inst.op <= 58) {
+        set_s64(d, R(kExecLoR), I(0));
+      } else {
+        set_s(d, R(kExecLoR));
+      }
+      return true;
+    }
+    case 59: {  // s_bitreplicate_b64_b32: bit i of the source becomes bits 2i and 2i + 1
+      auto spread = [&](const Operand& half) {
+        Operand x = band(half, I(0xFFFF));
+        x = band(bor(x, shl(x, I(8))), I(0x00FF00FFu));
+        x = band(bor(x, shl(x, I(4))), I(0x0F0F0F0Fu));
+        x = band(bor(x, shl(x, I(2))), I(0x33333333u));
+        x = band(bor(x, shl(x, I(1))), I(0x55555555u));
+        return bor(x, shl(x, I(1)));
+      };
+      const Operand v = copy(a);
+      set_s64(d, spread(v), spread(shr(v, I(16))));
+      return true;
+    }
     case 52: {
       const Operand r = op2(dx::kImax, a, op1(dx::kIneg, a));
       scc_nonzero(r);
@@ -1074,6 +1426,84 @@ void Translator::format_load(uint32_t descriptor, uint32_t components, uint32_t 
   }
 }
 
+// Stores in a buffer format known when the program runs (the descriptor's,
+// or a typed store's): components packed low bits first by width and numeric
+// type (the inverse of format_load), components the instruction lacks as 0.
+// Elements of 8 or 16 bits write only their own bytes; others whole dwords.
+// Format 0 and formats outside the table store nothing.
+void Translator::format_store(const Operand& format, uint32_t components, uint32_t view, uint32_t at,
+                              uint32_t data) {
+  constexpr uint32_t kInvalid = 7;
+  uint32_t words[4];
+  for (uint32_t w = 0; w < 4; ++w) words[w] = fresh();
+  const uint32_t fmt = fresh(), widths = fresh(), numeric = fresh(), offset = fresh();
+  put(fmt, format);
+  put(widths, I(0));
+  put(numeric, I(kInvalid));
+  emit(dx::kSwitch, {R(fmt)});
+  for (uint32_t f = 1; f < 128; ++f) {
+    BufferFormat layout;
+    Numeric type;
+    if (!buffer_format(f, &layout, &type)) continue;
+    emit(dx::kCase, {I(f)});
+    put(widths, I(layout.bits[0] | (layout.bits[1] << 8) | (layout.bits[2] << 16) | (layout.bits[3] << 24)));
+    put(numeric, I(static_cast<uint32_t>(type)));
+    emit(dx::kBreak, {});
+  }
+  emit(dx::kDefault, {});
+  emit(dx::kBreak, {});
+  emit(dx::kEndswitch, {});
+  for (uint32_t w = 0; w < 4; ++w) put(words[w], I(0));
+  put(offset, I(0));
+  for (uint32_t c = 0; c < 4; ++c) {
+    const uint32_t mark = scratch_;
+    const Operand width = in_temp(ubfe(I(8), I(8 * c), R(widths)));
+    const Operand full = in_temp(eq(width, I(32)));
+    const Operand mask = in_temp(select(full, I(0xFFFFFFFFu), add(shl(I(1), width), I(0xFFFFFFFFu))));
+    const Operand v = c < components ? R(vreg(data + c)) : I(0);
+    const Operand top = in_temp(op1(dx::kUtof, mask));
+    const Operand unorm = op1(dx::kFtou, op1(dx::kRoundNe, op2(dx::kMul, op1(dx::kMov, v, dxbc::kSaturate), top)));
+    const Operand half_top = in_temp(op1(dx::kUtof, shr(mask, I(1))));
+    const Operand clamped = op2(dx::kMin, op2(dx::kMax, v, dxbc::immf(-1.0f)), dxbc::immf(1.0f));
+    const Operand snorm = op1(dx::kFtoi, op1(dx::kRoundNe, op2(dx::kMul, clamped, half_top)));
+    const Operand half = op1(dx::kF32tof16, v);
+    const Operand small = select(eq(width, I(16)), half, select(eq(width, I(11)), shr(half, I(4)), shr(half, I(5))));
+    auto is = [&](Numeric type) { return eq(R(numeric), I(static_cast<uint32_t>(type))); };
+    Operand bits = select(is(Numeric::Float), select(full, v, small), v);  // uint and sint as they are
+    bits = select(is(Numeric::Sscaled), op1(dx::kFtoi, v), bits);
+    bits = select(is(Numeric::Uscaled), op1(dx::kFtou, v), bits);
+    bits = select(is(Numeric::Snorm), snorm, bits);
+    bits = select(is(Numeric::Unorm), unorm, bits);
+    const Operand field = in_temp(band(bits, mask));
+    const Operand index = in_temp(shr(R(offset), I(5)));
+    const Operand placed = in_temp(shl(field, band(R(offset), I(31))));
+    const Operand present = in_temp(ne(width, I(0)));
+    for (uint32_t w = 0; w < 4; ++w) {
+      put(words[w], select(band(present, eq(index, I(w))), bor(R(words[w]), placed), R(words[w])));
+    }
+    put(offset, add(R(offset), width));
+    scratch_ = mark;
+  }
+  // R(offset) is now the element's size in bits.
+  if_nz(ne(R(numeric), I(kInvalid)));
+  if_nz(ult(R(offset), I(32)));
+  if_nz(eq(R(offset), I(8)));
+  write_part(view, R(at), R(words[0]), 1);
+  emit(dx::kElse, {});
+  write_part(view, R(at), R(words[0]), 2);
+  end_if();
+  emit(dx::kElse, {});
+  for (uint32_t w = 0; w < 4; ++w) {
+    const uint32_t mark = scratch_;
+    if_nz(ult(I(32 * w), R(offset)));
+    write(view, add(R(at), I(4 * w)), R(words[w]));
+    end_if();
+    scratch_ = mark;
+  }
+  end_if();
+  end_if();
+}
+
 // Decodes `components` components of format `fmt` at (view, at) into the
 // temps `out`.
 bool Translator::decode_format(uint32_t fmt, uint32_t components, uint32_t view, uint32_t at, const uint32_t* out) {
@@ -1168,8 +1598,11 @@ bool Translator::emit_mubuf(const Instruction& inst) {
     // Typed loads: element format from the instruction, component count
     // from the opcode.
     const uint32_t components = (inst.op & 3) + 1;
-    if (inst.op >= 4) {
-      ok = fail("typed buffer store");
+    if (inst.op >= 4 && inst.op <= 7) {
+      use_vgpr(inst.src[1], static_cast<int>(components));
+      format_store(I(inst.ext), components, view, at, data);
+    } else if (inst.op >= 4) {
+      ok = fail(format("MTBUF op %u", inst.op));
     } else {
       ok = typed_load(inst.ext, components, view, at, data);
     }
@@ -1180,6 +1613,10 @@ bool Translator::emit_mubuf(const Instruction& inst) {
     case 0: case 1: case 2: case 3:
       use_vgpr(inst.src[1], static_cast<int>(inst.op) + 1);
       format_load(r + 3, inst.op + 1, view, at, data);
+      break;
+    case 4: case 5: case 6: case 7:
+      use_vgpr(inst.src[1], static_cast<int>(inst.op) - 3);
+      format_store(ubfe(I(7), I(12), R(r + 3)), inst.op - 3, view, at, data);
       break;
     case 8: put(vreg(data), band(read(view, R(at)), I(0xFF))); break;
     case 10: put(vreg(data), band(read(view, R(at)), I(0xFFFF))); break;
@@ -1226,15 +1663,81 @@ bool Translator::emit_ds(const Instruction& inst) {
   auto store = [&](uint32_t at, const Operand& value) {
     emit(dx::kStoreRaw, {dxbc::group_shared(0, dxbc::Access::Store), address(at), value});
   };
-  auto rmw = [&](uint32_t opcode, bool returns) {
+  auto rmw = [&](uint32_t opcode, bool returns, bool negate = false) {
     use_vgpr(inst.src[1]);
     const uint32_t old = fresh();
-    emit(opcode, {D(old), dxbc::group_shared(0, dxbc::Access::Atomic), address(offset), R(vreg(d0))});
+    const Operand value = negate ? sub(I(0), R(vreg(d0))) : R(vreg(d0));
+    emit(opcode, {D(old), dxbc::group_shared(0, dxbc::Access::Atomic), address(offset), value});
     if (returns) put(vreg(inst.dst), R(old));
+  };
+  // Compare and store (documented: DATA is the comparand, DATA2 the value
+  // stored, the reverse of the buffer compare-swap).
+  auto compare_store = [&](bool returns) {
+    use_vgpr(inst.src[1]);
+    use_vgpr(inst.src[2]);
+    const uint32_t old = fresh();
+    emit(dx::kImmAtomicCmpExch,
+         {D(old), dxbc::group_shared(0, dxbc::Access::Atomic), address(offset), R(vreg(d0)), R(vreg(d1))});
+    if (returns) put(vreg(inst.dst), R(old));
+  };
+  // Byte and short stores: the bytes of their word are cleared, then set, with
+  // atomics, so lanes storing neighbouring bytes of one word do not race.
+  // (_d16_hi: the data is the high half of the register.)
+  auto store_part = [&](uint32_t bits, bool high = false) {
+    use_vgpr(inst.src[1]);
+    const Operand shift = shl(band(add(R(addr), I(offset)), I(3)), I(3));
+    const Operand field = I(bits == 8 ? 0xFFu : 0xFFFFu);
+    const Operand at = address(offset);
+    const Operand data = high ? shr(R(vreg(d0)), I(16)) : R(vreg(d0));
+    emit(dx::kAtomicAnd, {dxbc::group_shared(0, dxbc::Access::Atomic), at, bnot(shl(field, shift))});
+    emit(dx::kAtomicOr, {dxbc::group_shared(0, dxbc::Access::Atomic), at, shl(band(data, field), shift)});
+  };
+  // Byte and short loads, sign- or zero-extended.
+  auto load_part = [&](uint32_t bits, bool sign) {
+    const Operand shift = shl(band(add(R(addr), I(offset)), I(3)), I(3));
+    const Operand word = load(offset);
+    put(vreg(inst.dst), sign ? ibfe(I(bits), shift, word) : ubfe(I(bits), shift, word));
+  };
+  // D16 loads (documented): the value, extended to 16 bits, into one half
+  // of the destination; the other half is kept.
+  auto load_half = [&](uint32_t bits, bool sign, bool high) {
+    const Operand shift = shl(band(add(R(addr), I(offset)), I(3)), I(3));
+    const Operand word = load(offset);
+    const Operand value = sign ? ibfe(I(bits), shift, word) : ubfe(I(bits), shift, word);
+    const uint32_t d = vreg(inst.dst);
+    put(d, op4(dx::kBfi, I(16), I(high ? 16 : 0), value, R(d)));
   };
   bool ok = true;
   switch (inst.op) {
     case 13: use_vgpr(inst.src[1]); store(offset, R(vreg(d0))); break;
+    case 160: store_part(8, true); break;   // ds_write_b8_d16_hi
+    case 161: store_part(16, true); break;  // ds_write_b16_d16_hi
+    case 162: load_half(8, false, false); break;   // ds_read_u8_d16
+    case 163: load_half(8, false, true); break;    // ds_read_u8_d16_hi
+    case 164: load_half(8, true, false); break;    // ds_read_i8_d16
+    case 165: load_half(8, true, true); break;     // ds_read_i8_d16_hi
+    case 166: load_half(16, false, false); break;  // ds_read_u16_d16
+    case 167: load_half(16, false, true); break;   // ds_read_u16_d16_hi
+    case 222:  // ds_write_b96
+      use_vgpr(inst.src[1], 3);
+      for (uint32_t i = 0; i < 3; ++i) store(offset + 4 * i, R(vreg(d0 + i)));
+      break;
+    case 61: case 62: {
+      // ds_consume / ds_append (documented): the dword at M0's base plus the
+      // offset is decremented / incremented by the active lanes of the wave
+      // and its previous value returned; a lane mask's wave is the lane alone
+      // (see v_mbcnt), so each lane counts one.
+      if ((inst.raw[0] >> 17) & 1) {
+        ok = fail("ds_append/ds_consume on the global data share");
+        break;
+      }
+      const uint32_t old = fresh();
+      const Operand at = band(add(band(R(kM0R), I(0xFFFF)), I(offset)), I(~3u));
+      emit(dx::kImmAtomicIadd,
+           {D(old), dxbc::group_shared(0, dxbc::Access::Atomic), at, I(inst.op == 62 ? 1u : 0xFFFFFFFFu)});
+      put(vreg(inst.dst), R(old));
+      break;
+    }
     case 14: case 15: {
       use_vgpr(inst.src[1]);
       use_vgpr(inst.src[2]);
@@ -1252,28 +1755,77 @@ bool Translator::emit_ds(const Instruction& inst) {
       break;
     }
     case 77: use_vgpr(inst.src[1], 2); store(offset, R(vreg(d0))); store(offset + 4, R(vreg(d0 + 1))); break;
+    case 78: case 79: {  // ds_write2_b64, ds_write2st64_b64
+      use_vgpr(inst.src[1], 2);
+      use_vgpr(inst.src[2], 2);
+      const uint32_t scale = inst.op == 78 ? 8 : 512;
+      store(offset0 * scale, R(vreg(d0)));
+      store(offset0 * scale + 4, R(vreg(d0 + 1)));
+      store(offset1 * scale, R(vreg(d1)));
+      store(offset1 * scale + 4, R(vreg(d1 + 1)));
+      break;
+    }
+    case 119: case 120: {  // ds_read2_b64, ds_read2st64_b64
+      const uint32_t scale = inst.op == 119 ? 8 : 512;
+      const Operand x0 = load(offset0 * scale), x1 = load(offset0 * scale + 4);
+      const Operand y0 = load(offset1 * scale), y1 = load(offset1 * scale + 4);
+      put(vreg(inst.dst), x0);
+      put(vreg(inst.dst + 1u), x1);
+      put(vreg(inst.dst + 2u), y0);
+      put(vreg(inst.dst + 3u), y1);
+      break;
+    }
+    case 30: store_part(8); break;   // ds_write_b8
+    case 31: store_part(16); break;  // ds_write_b16
+    case 57: load_part(8, true); break;    // ds_read_i8
+    case 58: load_part(8, false); break;   // ds_read_u8
+    case 59: load_part(16, true); break;   // ds_read_i16
+    case 60: load_part(16, false); break;  // ds_read_u16
     case 223:
       use_vgpr(inst.src[1], 4);
       for (uint32_t i = 0; i < 4; ++i) store(offset + 4 * i, R(vreg(d0 + i)));
       break;
-    case 118: case 255: {
-      const uint32_t count = inst.op == 118 ? 2 : 4;
+    case 118: case 254: case 255: {
+      const uint32_t count = inst.op == 118 ? 2 : inst.op == 254 ? 3 : 4;
       std::vector<Operand> values;
       for (uint32_t i = 0; i < count; ++i) values.push_back(load(offset + 4 * i));
       for (uint32_t i = 0; i < count; ++i) put(vreg(inst.dst + i), values[i]);
       break;
     }
     case 0: rmw(dx::kImmAtomicIadd, false); break;
-    case 32: rmw(dx::kImmAtomicIadd, true); break;
+    case 1: rmw(dx::kImmAtomicIadd, false, true); break;
+    case 5: rmw(dx::kImmAtomicImin, false); break;
+    case 6: rmw(dx::kImmAtomicImax, false); break;
     case 7: rmw(dx::kImmAtomicUmin, false); break;
     case 8: rmw(dx::kImmAtomicUmax, false); break;
     case 9: rmw(dx::kImmAtomicAnd, false); break;
     case 10: rmw(dx::kImmAtomicOr, false); break;
+    case 11: rmw(dx::kImmAtomicXor, false); break;
+    case 16: compare_store(false); break;
+    case 32: rmw(dx::kImmAtomicIadd, true); break;
+    case 33: rmw(dx::kImmAtomicIadd, true, true); break;
+    case 37: rmw(dx::kImmAtomicImin, true); break;
+    case 38: rmw(dx::kImmAtomicImax, true); break;
+    case 39: rmw(dx::kImmAtomicUmin, true); break;
+    case 40: rmw(dx::kImmAtomicUmax, true); break;
+    case 41: rmw(dx::kImmAtomicAnd, true); break;
+    case 42: rmw(dx::kImmAtomicOr, true); break;
+    case 43: rmw(dx::kImmAtomicXor, true); break;
+    case 45: rmw(dx::kImmAtomicExch, true); break;
+    case 48: compare_store(true); break;
     default: ok = fail(format("DS op %u", inst.op)); break;
   }
   end_if();
   return ok;
 }
+
+namespace {
+// SDWA instructions whose destination is a VGPR (VOP1 and VOP2; compares
+// write lane masks and have no destination select).
+bool kind_is_vector_result(const Instruction& inst) {
+  return inst.encoding == Encoding::VOP1 || inst.encoding == Encoding::VOP2;
+}
+}  // namespace
 
 bool Translator::emit_vector(const Instruction& inst) {
   if (inst.src[0] == rdna::kDpp16 || inst.src[0] == rdna::kDpp8 || inst.src[0] == rdna::kDpp8Fi) {
@@ -1293,8 +1845,12 @@ bool Translator::emit_vector(const Instruction& inst) {
       const uint32_t shift = sel < 4 ? 8 * sel : 16 * (sel - 4);
       return sext ? ibfe(I(width), I(shift), value) : ubfe(I(width), I(shift), value);
     };
-    if (((e >> 8) & 7) != 6 && inst.encoding != Encoding::VOPC) return fail("SDWA destination select");
-    if ((e >> 20) & 3 || (e >> 28) & 3) return fail("SDWA source modifiers");
+    // Output modifiers (documented): clamp in bit 13, omod in bits 14-15.
+    if (inst.encoding != Encoding::VOPC) {
+      work.clamp = (e >> 13) & 1;
+      work.omod = static_cast<uint8_t>((e >> 14) & 3);
+    }
+    if (inst.encoding != Encoding::VOPC && ((e >> 11) & 3) == 3) return fail("SDWA unused-bits mode 3");
     sdwa_src0 = pick(src(work, real), (e >> 16) & 7, (e >> 19) & 1);
     if (inst.encoding != Encoding::VOP1) sdwa_src1 = pick(src(work, work.src[1]), (e >> 24) & 7, (e >> 27) & 1);
   }
@@ -1303,8 +1859,17 @@ bool Translator::emit_vector(const Instruction& inst) {
     if (sdwa && i == 1) return sdwa_src1;
     return src(work, work.src[i]);
   };
+  // SDWA float modifiers of sources 0 and 1 (documented: negate bits 20/28,
+  // absolute value bits 21/29 of the SDWA dword).
+  auto sdwa_modify = [&](Operand v, int i) {
+    if (!sdwa || i > 1) return v;
+    const uint32_t bits = (inst.ext >> (i == 0 ? 20 : 28)) & 3;
+    if (bits & 2) v = dxbc::abs(in_temp(v));
+    if (bits & 1) v = dxbc::neg(in_temp(v));
+    return v;
+  };
   auto f = [&](int i) {
-    if (sdwa && i < 2) return s(i);
+    if (sdwa && i < 2) return sdwa_modify(s(i), i);
     return fsrc(work, i, work.src[i]);
   };
 
@@ -1323,9 +1888,23 @@ bool Translator::emit_vector(const Instruction& inst) {
   const bool sgpr_result = kind == kVopc || (kind == kVop1 && op == 2);
   const uint32_t dreg = sgpr_result ? kVgprBase : vreg(inst.dst);
   const Operand dval = R(dreg);
+  // SDWA destination select (documented): the result's low byte or word goes
+  // to the selected field; the other bits are zero (unused mode 0), the
+  // field's sign above it and zero below (1) or the register's own (2).
+  const uint32_t dst_sel = sdwa && kind_is_vector_result(inst) ? (inst.ext >> 8) & 7 : 6;
+  const uint32_t dst_unused = (inst.ext >> 11) & 3;
+  auto place = [&](const Operand& value) -> Operand {
+    if (dst_sel >= 6) return value;
+    const uint32_t width = dst_sel < 4 ? 8 : 16;
+    const uint32_t shift = dst_sel < 4 ? 8 * dst_sel : 16 * (dst_sel - 4);
+    if (dst_unused == 2) return op4(dx::kBfi, I(width), I(shift), value, dval);
+    const Operand field = dst_unused == 1 ? ibfe(I(width), I(0), value) : ubfe(I(width), I(0), value);
+    return shift ? shl(field, I(shift)) : field;
+  };
   // Results are written only by active lanes.
   auto set = [&](const Operand& value) {
-    put(dreg, select(on, value[0] & 0x80000000u ? copy(value) : value, dval));
+    const Operand placed = place(value);
+    put(dreg, select(on, placed[0] & 0x80000000u ? copy(placed) : placed, dval));
     return true;
   };
   auto setf = [&](const Operand& value) { return set(fresult(work, value)); };
@@ -1334,6 +1913,30 @@ bool Translator::emit_vector(const Instruction& inst) {
   auto fmul = [&](const Operand& x, const Operand& y) { return op2(dx::kMul, x, y); };
   auto fmad = [&](const Operand& x, const Operand& y, const Operand& z) { return op3(dx::kMad, x, y, z); };
   auto fneg = [&](const Operand& x) { return dxbc::neg(in_temp(x)); };
+  // 16-bit operands: the low half, or (VOP3) the half op_sel names; halves as
+  // floats take the VOP3 abs/neg modifiers. 16-bit results go to the low half
+  // (the high half zero) or, with op_sel bit 3 (VOP3), to the high half,
+  // keeping the low one.
+  auto h16 = [&](int i) {
+    Operand v = s(i);
+    if (e64 && ((inst.opsel >> i) & 1)) v = shr(v, I(16));
+    return band(v, I(0xFFFF));
+  };
+  auto f16 = [&](int i) {
+    Operand v = op1(dx::kF16tof32, h16(i));
+    if (e64 && ((inst.abs >> i) & 1)) v = dxbc::abs(in_temp(v));
+    if (e64 && ((inst.neg >> i) & 1)) v = dxbc::neg(in_temp(v));
+    return sdwa_modify(v, i);
+  };
+  auto sext16 = [&](const Operand& v) { return ibfe(I(16), I(0), v); };
+  auto set16 = [&](const Operand& value) {
+    if (e64 && ((inst.opsel >> 3) & 1)) return set(op4(dx::kBfi, I(16), I(16), value, dval));
+    return set(band(value, I(0xFFFF)));
+  };
+  auto setf16 = [&](Operand value) {
+    if (work.clamp) value = op1(dx::kMov, value, dxbc::kSaturate);
+    return set16(op1(dx::kF32tof16, value));
+  };
 
   if (kind == kVopc) {
     // Compare: the mask bit goes to VCC (e32) or the named SGPRs (e64);
@@ -1372,7 +1975,42 @@ bool Translator::emit_vector(const Instruction& inst) {
       const Operand bit = select(eq(e, I(0)), e0, select(eq(e, I(emax)), emaxed, select(sign, I(3), I(8))));
       return nonzero(band(shr(b, bit), I(1)));
     };
-    if (op < 0x20) {
+    // Float compares by their 16-entry index (f, lt, eq, le, gt, lg, ge, o, u,
+    // nge, nlg, ngt, nle, neq, nlt, tru).
+    auto fcmp = [&](int which, const Operand& x0, const Operand& y0) {
+      const Operand fa = in_temp(x0), fb = in_temp(y0);
+      auto lt = [&](const Operand& x, const Operand& y) { return op2(dx::kLt, x, y); };
+      auto ge = [&](const Operand& x, const Operand& y) { return op2(dx::kGe, x, y); };
+      auto ordered = [&]() { return band(op2(dx::kEq, fa, fa), op2(dx::kEq, fb, fb)); };
+      auto lg = [&]() { return bor(lt(fa, fb), lt(fb, fa)); };
+      switch (which) {
+        case 0: return I(0);
+        case 1: return lt(fa, fb);
+        case 2: return op2(dx::kEq, fa, fb);
+        case 3: return ge(fb, fa);
+        case 4: return lt(fb, fa);
+        case 5: return lg();
+        case 6: return ge(fa, fb);
+        case 7: return ordered();
+        case 8: return bnot(ordered());
+        case 9: return bnot(ge(fa, fb));
+        case 10: return bnot(lg());
+        case 11: return bnot(lt(fb, fa));
+        case 12: return bnot(ge(fb, fa));
+        case 13: return op2(dx::kNe, fa, fb);
+        case 14: return bnot(lt(fa, fb));
+        default: return I(0xFFFFFFFFu);
+      }
+    };
+    if ((base == 0xC0 || base == 0xD0 || base == 0xE0 || base == 0xF0) && index >= 8) {
+      // f16 compares: the first eight at 0xC8 (v_cmpx 0xD8), the others at 0xE8 (0xF8).
+      exec_write = base == 0xD0 || base == 0xF0;
+      cond = fcmp(base >= 0xE0 ? index : index - 8, f16(0), f16(1));
+    } else if ((base == 0xA0 || base == 0xB0) && index >= 9 && index <= 14) {
+      // Unsigned 16-bit compares (lt, eq, le, gt, ne, ge) of the low halves.
+      exec_write = base == 0xB0;
+      cond = icmp_of(false, band(a, I(0xFFFF)), band(b, I(0xFFFF)), index - 8);
+    } else if (op < 0x20) {
       exec_write = op >= 0x10;
       const Operand fa = f(0), fb = f(1);
       auto lt = [&](const Operand& x, const Operand& y) { return op2(dx::kLt, x, y); };
@@ -1504,6 +2142,26 @@ bool Translator::emit_vector(const Instruction& inst) {
         return true;
       }
       case 47: return set(op4(dx::kBfi, I(16), I(16), op1(dx::kF32tof16, f(1)), op1(dx::kF32tof16, f(0))));
+      case 50: return setf16(fadd(f16(0), f16(1)));
+      case 51: return setf16(fadd(f16(0), fneg(f16(1))));
+      case 52: return setf16(fadd(f16(1), fneg(f16(0))));
+      case 53: return setf16(fmul(f16(0), f16(1)));
+      case 54: return setf16(fmad(f16(0), f16(1), op1(dx::kF16tof32, band(dval, I(0xFFFF)))));
+      case 55: return setf16(fmad(f16(0), op1(dx::kF16tof32, I(inst.literal & 0xFFFF)), f16(1)));
+      case 56: return setf16(fmad(f16(0), f16(1), op1(dx::kF16tof32, I(inst.literal & 0xFFFF))));
+      case 57: return setf16(op2(dx::kMax, f16(0), f16(1)));
+      case 58: return setf16(op2(dx::kMin, f16(0), f16(1)));
+      case 59: return setf16(fmul(f16(0), op1(dx::kExp, op1(dx::kItof, sext16(h16(1))))));
+      case 60: {
+        // v_pk_fmac_f16: each half of D += the halves of S0 times S1.
+        const Operand x = in_temp(s(0)), y = in_temp(s(1)), z = in_temp(dval);
+        auto half = [&](const Operand& v, bool high) {
+          return op1(dx::kF16tof32, high ? shr(v, I(16)) : band(v, I(0xFFFF)));
+        };
+        const Operand lo = op1(dx::kF32tof16, fmad(half(x, false), half(y, false), half(z, false)));
+        const Operand hi = op1(dx::kF32tof16, fmad(half(x, true), half(y, true), half(z, true)));
+        return set(bor(band(lo, I(0xFFFF)), shl(hi, I(16))));
+      }
       default: return fail(format("VOP2 op %u", op));
     }
   }
@@ -1514,9 +2172,10 @@ bool Translator::emit_vector(const Instruction& inst) {
       case 0: return true;
       case 1: return set(a);
       case 2:
-        // Graphics stages (compute programs read the first active lane
-        // through an exchange): assumed uniform, the lane's own value (exact
-        // when all lanes agree).
+        // v_readfirstlane_b32: the first lane EXEC enables. Lane masks hold
+        // only this lane's bit (v_mbcnt above), so that lane is this one: the
+        // lane's own value (exact when all lanes agree, and what scalarising
+        // loops and wave-coalesced atomics need).
         set_s(inst.dst, a);
         return true;
       case 5: return setf(op1(dx::kItof, a));
@@ -1568,6 +2227,27 @@ bool Translator::emit_vector(const Instruction& inst) {
         put(other, select(on, old, R(other)));
         return set(a);
       }
+      case 80: return setf16(op1(dx::kUtof, h16(0)));
+      case 81: return setf16(op1(dx::kItof, sext16(h16(0))));
+      case 82: return set16(op1(dx::kFtou, op2(dx::kMin, op2(dx::kMax, f16(0), dxbc::immf(0.0f)), dxbc::immf(65535.0f))));
+      case 83: return set16(op1(dx::kFtoi, op2(dx::kMin, op2(dx::kMax, f16(0), dxbc::immf(-32768.0f)), dxbc::immf(32767.0f))));
+      case 84: return setf16(op1(dx::kRcp, f16(0)));
+      case 85: return setf16(op1(dx::kSqrt, f16(0)));
+      case 86: return setf16(op1(dx::kRsq, f16(0)));
+      case 87: return setf16(op1(dx::kLog, f16(0)));
+      case 88: return setf16(op1(dx::kExp, f16(0)));
+      case 91: return setf16(op1(dx::kRoundNi, f16(0)));
+      case 92: return setf16(op1(dx::kRoundPi, f16(0)));
+      case 93: return setf16(op1(dx::kRoundZ, f16(0)));
+      case 94: return setf16(op1(dx::kRoundNe, f16(0)));
+      case 95: return setf16(op1(dx::kFrc, f16(0)));
+      case 96: case 97: {
+        const uint32_t r = fresh();
+        const Operand angle = fmul(f16(0), dxbc::immf(6.2831853f));
+        if (op == 96) emit(dx::kSincos, {D(r), dxbc::null_dst(), angle});
+        else emit(dx::kSincos, {dxbc::null_dst(), D(r), angle});
+        return setf16(R(r));
+      }
       default: return fail(format("VOP1 op %u", op));
     }
   }
@@ -1577,7 +2257,88 @@ bool Translator::emit_vector(const Instruction& inst) {
   auto med3 = [&](uint32_t mn, uint32_t mx, const Operand& x, const Operand& y, const Operand& z) {
     return op2(mx, op2(mn, x, y), op2(mn, op2(mx, x, y), z));
   };
+  // Cube map coordinates (documented): the major axis is z when |z| is the
+  // largest, else y when |y| >= |x|, else x.
+  auto cube = [&](int which) {
+    const Operand x = in_temp(f(0)), y = in_temp(f(1)), z = in_temp(f(2));
+    const Operand ax = dxbc::abs(x), ay = dxbc::abs(y), az = dxbc::abs(z);
+    const Operand major_z = band(op2(dx::kGe, az, ax), op2(dx::kGe, az, ay));
+    const Operand major_y = band(bnot(major_z), op2(dx::kGe, ay, ax));
+    const Operand zero = dxbc::immf(0.0f);
+    const Operand xn = op2(dx::kLt, x, zero), yn = op2(dx::kLt, y, zero), zn = op2(dx::kLt, z, zero);
+    switch (which) {
+      case 0:  // face id: x+ 0, x- 1, y+ 2, y- 3, z+ 4, z- 5
+        return select(major_z, select(zn, dxbc::immf(5.0f), dxbc::immf(4.0f)),
+                      select(major_y, select(yn, dxbc::immf(3.0f), dxbc::immf(2.0f)),
+                             select(xn, dxbc::immf(1.0f), dxbc::immf(0.0f))));
+      case 1:  // s
+        return select(major_z, select(zn, fneg(x), x), select(major_y, x, select(xn, z, fneg(z))));
+      case 2:  // t
+        return select(major_z, fneg(y), select(major_y, select(yn, fneg(z), z), fneg(y)));
+      default:  // twice the major axis coordinate
+        return fmul(select(major_z, z, select(major_y, y, x)), dxbc::immf(2.0f));
+    }
+  };
   switch (op) {
+    case 0x342: case 0x343: {
+      // v_interp_p1ll_f16 / p1lv_f16: attribute (bits 0-5 of the source-0
+      // field), channel (6-7) and high half (8); the host interpolates, so the
+      // result is the interpolated half as a float (v_interp_p2_f16 finishes).
+      const uint32_t attribute = work.src[0] & 0x3F, channel = (work.src[0] >> 6) & 3, high = (work.src[0] >> 8) & 1;
+      if (stage_ != Stage::Pixel || attribute >= 31) return fail("half interpolation outside a pixel shader");
+      const uint32_t reg = half_param_register(scan_params_, iface_.half_params, attribute) + (channel >> 1);
+      return set(dxbc::input_register(reg, (channel & 1) * 2 + high));
+    }
+    case 0x35a:  // v_interp_p2_f16: the interpolated value (from p1, in src2) as a half
+      if (stage_ != Stage::Pixel) return fail("half interpolation outside a pixel shader");
+      return set16(op1(dx::kF32tof16, s(2)));
+    case 0x140: {  // v_mad_legacy_f32: a zero factor gives a zero product whatever the other
+      const Operand fa = f(0), fb = f(1);
+      const Operand zero = bor(op2(dx::kEq, fa, dxbc::immf(0.0f)), op2(dx::kEq, fb, dxbc::immf(0.0f)));
+      return setf(fadd(select(zero, dxbc::immf(0.0f), fmul(fa, fb)), f(2)));
+    }
+    case 0x144: return setf(cube(0));
+    case 0x145: return setf(cube(1));
+    case 0x146: return setf(cube(2));
+    case 0x147: return setf(cube(3));
+    case 0x15e: {  // v_cvt_pk_u8_f32: src0 as an 8-bit integer into byte src1[1:0] of src2
+      const Operand clamped = op2(dx::kMin, op2(dx::kMax, f(0), dxbc::immf(0.0f)), dxbc::immf(255.0f));
+      const Operand byte = op1(dx::kFtou, op1(dx::kRoundNe, clamped));
+      return set(op4(dx::kBfi, I(8), shl(band(b, I(3)), I(3)), byte, c));
+    }
+    case 0x311: {  // v_pack_b32_f16: two halves, abs/neg applied to their sign bits
+      auto bits = [&](int i) {
+        Operand v = h16(i);
+        if ((inst.abs >> i) & 1) v = band(v, I(0x7FFF));
+        if ((inst.neg >> i) & 1) v = bxor(v, I(0x8000));
+        return v;
+      };
+      return set(bor(bits(0), shl(bits(1), I(16))));
+    }
+    case 0x373: return set(add(mul_lo(h16(0), h16(1)), c));
+    case 0x375: return set(add(mul_lo(sext16(h16(0)), sext16(h16(1))), c));
+    case 0x303: case 0x30d: return set16(add(h16(0), h16(1)));
+    case 0x304: case 0x30e: return set16(sub(h16(0), h16(1)));
+    case 0x305: return set16(mul_lo(h16(0), h16(1)));
+    case 0x307: return set16(shr(h16(1), band(h16(0), I(15))));
+    case 0x308: return set16(sar(sext16(h16(1)), band(h16(0), I(15))));
+    case 0x309: return set16(op2(dx::kUmax, h16(0), h16(1)));
+    case 0x30a: return set16(op2(dx::kImax, sext16(h16(0)), sext16(h16(1))));
+    case 0x30b: return set16(op2(dx::kUmin, h16(0), h16(1)));
+    case 0x30c: return set16(op2(dx::kImin, sext16(h16(0)), sext16(h16(1))));
+    case 0x314: return set16(shl(h16(1), band(h16(0), I(15))));
+    case 0x340: return set16(add(mul_lo(h16(0), h16(1)), h16(2)));
+    case 0x35e: return set16(add(mul_lo(sext16(h16(0)), sext16(h16(1))), sext16(h16(2))));
+    case 0x34b: return setf16(fmad(f16(0), f16(1), f16(2)));
+    case 0x351: return setf16(op2(dx::kMin, op2(dx::kMin, f16(0), f16(1)), f16(2)));
+    case 0x354: return setf16(op2(dx::kMax, op2(dx::kMax, f16(0), f16(1)), f16(2)));
+    case 0x357: return setf16(med3(dx::kMin, dx::kMax, f16(0), f16(1), f16(2)));
+    case 0x352: return set16(op2(dx::kImin, op2(dx::kImin, sext16(h16(0)), sext16(h16(1))), sext16(h16(2))));
+    case 0x355: return set16(op2(dx::kImax, op2(dx::kImax, sext16(h16(0)), sext16(h16(1))), sext16(h16(2))));
+    case 0x358: return set16(med3(dx::kImin, dx::kImax, sext16(h16(0)), sext16(h16(1)), sext16(h16(2))));
+    case 0x353: return set16(op2(dx::kUmin, op2(dx::kUmin, h16(0), h16(1)), h16(2)));
+    case 0x356: return set16(op2(dx::kUmax, op2(dx::kUmax, h16(0), h16(1)), h16(2)));
+    case 0x359: return set16(med3(dx::kUmin, dx::kUmax, h16(0), h16(1), h16(2)));
     case 0x141: case 0x14b: case 0x16f: return setf(fmad(f(0), f(1), f(2)));
     case 0x142: return set(add(mul_lo(ibfe(I(24), I(0), a), ibfe(I(24), I(0), b)), c));
     case 0x143: return set(add(mul_lo(band(a, I(0xFFFFFF)), band(b, I(0xFFFFFF))), c));
@@ -1655,17 +2416,48 @@ bool Translator::emit_vector(const Instruction& inst) {
     case 0x362: return setf(fmul(f(0), op1(dx::kExp, op1(dx::kItof, b))));
     case 0x363: return set(shl(add(shl(I(1), a), I(0xFFFFFFFFu)), b));
     case 0x364: return set(add(op1(dx::kCountbits, a), b));
+    case 0x368: case 0x369: {
+      // v_cvt_pknorm_i16_f32 / v_cvt_pknorm_u16_f32: S0 and S1 as 16-bit
+      // signed / unsigned normalised values in the low and high halves.
+      const bool is_signed = op == 0x368;
+      auto norm = [&](const Operand& v) {
+        const Operand clamped = is_signed ? op2(dx::kMax, op2(dx::kMin, v, dxbc::immf(1.0f)), dxbc::immf(-1.0f))
+                                          : op1(dx::kMov, v, dxbc::kSaturate);
+        const Operand scaled = op1(dx::kRoundNe, fmul(clamped, dxbc::immf(is_signed ? 32767.0f : 65535.0f)));
+        return band(is_signed ? op1(dx::kFtoi, scaled) : op1(dx::kFtou, scaled), I(0xFFFF));
+      };
+      return set(bor(norm(f(0)), shl(norm(f(1)), I(16))));
+    }
+    case 0x36a:  // v_cvt_pk_u16_u32: S0 and S1 saturated to 16 bits
+      return set(bor(op2(dx::kUmin, a, I(0xFFFF)), shl(op2(dx::kUmin, b, I(0xFFFF)), I(16))));
+    case 0x36b: {  // v_cvt_pk_i16_i32
+      auto sat = [&](const Operand& v) {
+        return band(op2(dx::kImax, op2(dx::kImin, v, I(0x7FFF)), I(0xFFFF8000u)), I(0xFFFF));
+      };
+      return set(bor(sat(a), shl(sat(b), I(16))));
+    }
     case 0x361: {
       // v_writelane_b32: the lane named by src1 gets src0, whatever EXEC says.
       const Operand lane = band(b, I(info_.wave_size - 1));
       put(dreg, select(eq(R(kLaneR), lane), a, dval));
       return true;
     }
-    case 0x365: case 0x366:
-      // Only the lane-index idiom (full mask) is expressible per lane.
-      if (work.src[0] != 193) return fail("v_mbcnt with a lane mask");
-      if (op == 0x365) return set(add(op2(dx::kUmin, R(kLaneR), I(32)), b));
-      return set(add(select(ult(I(32), R(kLaneR)), add(R(kLaneR), I(0xFFFFFFE0u)), I(0)), b));
+    case 0x365: case 0x366: {
+      // v_mbcnt_lo/hi_u32_b32: the mask's bits below this lane (of lanes 0-31
+      // / 32-63), plus src1. A constant mask counts by the lane's index in the
+      // wave (-1: the lane-index idiom). A mask in a register is a lane mask,
+      // which holds only this lane's bit: the wave of one lane it describes
+      // has no lane below this one (consistent with s_bcnt1 of such masks
+      // counting 1 and v_readfirstlane reading the lane's own value, as the
+      // console compiler's wave-coalesced atomics expect).
+      const uint16_t m = work.src[0];
+      const bool constant = (m >= 128 && m <= 208) || (m >= 240 && m <= 248) || m == 255;
+      if (!constant) return set(b);
+      const Operand lane = R(kLaneR);
+      const Operand below_lo = select(ult(lane, I(32)), sub(shl(I(1), lane), I(1)), I(0xFFFFFFFFu));
+      const Operand below_hi = select(ult(lane, I(32)), I(0), sub(shl(I(1), sub(lane, I(32))), I(1)));
+      return set(add(op1(dx::kCountbits, band(a, op == 0x365 ? below_lo : below_hi)), b));
+    }
     case 0x36d: return set(add(add(a, b), c));
     case 0x36f: return set(bor(shl(a, b), c));
     case 0x371: return set(bor(band(a, b), c));
@@ -1677,6 +2469,7 @@ bool Translator::emit_vector(const Instruction& inst) {
 }
 
 bool Translator::emit_export(const Instruction& inst) {
+  if (stage_ == Stage::Ngg) return ngg_export(inst);
   const uint32_t target = inst.target;
   if (target == 9) return true;  // null export
   auto vgpr = [&](int i) { return R(vreg(inst.src[i] - rdna::kVgpr0)); };
@@ -1729,22 +2522,30 @@ bool Translator::emit_export(const Instruction& inst) {
 // of the image descriptor (s[srsrc]), the sampler index dword 0 of the
 // sampler descriptor (s[ssamp]). Address registers in the hardware order:
 // bias or depth reference first, then the coordinates, then the LOD.
+//
+// D16 (bit 63, documented): data is 16 bits a component, two components a
+// register (component 2k in the low half of data register k, 2k + 1 in the
+// high half). Host views are float views, so values pass as half floats.
 bool Translator::emit_image(const Instruction& inst) {
   const uint32_t op = inst.op;
-  if ((inst.raw[1] >> 31) & 1) return fail("16-bit image data");
+  const bool d16 = (inst.raw[1] >> 31) & 1;
   const uint32_t nsa = (inst.raw[0] >> 1) & 3;
-  if (nsa > 1) return fail("image address list longer than five registers");
   struct Dim {
     uint32_t coords;
     uint32_t slot;
   };
-  static const Dim kDims[8] = {{1, kImage1D}, {2, kImage2D}, {3, kImage3D}, {3, 0xFF}, {2, kImage1DArray},
-                               {3, kImage2DArray}, {3, 0xFF}, {4, 0xFF}};
+  // Dimensions: 3 cube (face coordinates s, t and the face; see cube_direction),
+  // 6 multisampled 2D (x, y, then the sample for loads).
+  static const Dim kDims[8] = {{1, kImage1D}, {2, kImage2D}, {3, kImage3D}, {3, kImageCube}, {2, kImage1DArray},
+                               {3, kImage2DArray}, {2, kImage2DMS}, {3, 0xFF}};
   const Dim dim = kDims[inst.dim & 7];
-  if (dim.slot == 0xFF) return fail(format("image dimension %u (cube or multisampled)", inst.dim));
+  if (dim.slot == 0xFF) return fail(format("image dimension %u (multisampled array)", inst.dim));
+  const bool cube = dim.slot == kImageCube;
+  if (dim.slot == kImage2DMS && op != 0 && op != 14) return fail(format("image instruction %u on a multisampled image", op));
+  if (cube && (op == 0 || op == 1 || op == 8 || op == 9)) return fail("image load or store on a cube");
   auto address = [&](uint32_t i) {
     if (i == 0 || !nsa) return R(vreg(inst.src[0] - rdna::kVgpr0 + i));
-    return R(vreg((inst.ext >> (8 * (i - 1))) & 0xFF));
+    return R(vreg(inst.nsa[(i - 1) % 12]));
   };
   const uint32_t data = inst.src[1] - rdna::kVgpr0;
   const Operand index = copy(R(inst.src[2]));
@@ -1757,18 +2558,37 @@ bool Translator::emit_image(const Instruction& inst) {
     for (uint32_t c = count + (extra ? 1 : 0); c < 4; ++c) emit(dx::kMov, {dxbc::temp_dst_mask(t, 1u << c), I(0)});
     return t;
   };
-  auto results = [&](uint32_t result) {
+  // Result components in order into the data registers (packed with D16).
+  auto write_results = [&](uint32_t result, uint32_t mask) {
     uint32_t k = 0;
     for (uint32_t c = 0; c < 4; ++c) {
-      if (!(inst.dmask & (1u << c))) continue;
-      const uint32_t d = vreg(data + k++);
-      put(d, select(active(), dxbc::temp(result, c), R(d)));
+      if (!(mask & (1u << c))) continue;
+      if (!d16) {
+        const uint32_t d = vreg(data + k++);
+        put(d, select(active(), dxbc::temp(result, c), R(d)));
+        continue;
+      }
+      const uint32_t d = vreg(data + k / 2);
+      const Operand half = op1(dx::kF32tof16, dxbc::temp(result, c));
+      const Operand merged = op4(dx::kBfi, I(16), I(k % 2 ? 16 : 0), half, R(d));
+      put(d, select(active(), merged, R(d)));
+      ++k;
     }
   };
+  auto results = [&](uint32_t result) { write_results(result, inst.dmask); };
   const uint32_t texture_id = 10 + dim.slot, uav_id = 2 + dim.slot;
-  if (op != 8 && op != 9) textures_used_ |= 1u << dim.slot;
+  const bool atomic = op >= 15 && op <= 26 && op != 19;
+  if (op != 8 && op != 9 && !atomic) textures_used_ |= 1u << dim.slot;
   switch (op) {
     case 0: case 1: {  // image_load, image_load_mip: integer coordinates (+ mip)
+      if (dim.slot == kImage2DMS) {
+        // Multisampled: x, y, then the sample index.
+        const uint32_t coords = pack(0, 2, nullptr);
+        const uint32_t result = fresh();
+        emit(dx::kLdMs, {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg), address(2)});
+        results(result);
+        return true;
+      }
       const Operand mip = op == 1 ? address(dim.coords) : I(0);
       const uint32_t coords = pack(0, dim.coords, &mip);
       const uint32_t result = fresh();
@@ -1788,7 +2608,16 @@ bool Translator::emit_image(const Instruction& inst) {
       const uint32_t value = fresh();
       uint32_t k = 0;
       for (uint32_t c = 0; c < 4; ++c) {
-        const Operand v = (inst.dmask & (1u << c)) ? R(vreg(data + k++)) : I(0);
+        Operand v = I(0);
+        if (inst.dmask & (1u << c)) {
+          if (d16) {
+            const Operand packed = R(vreg(data + k / 2));
+            v = op1(dx::kF16tof32, k % 2 ? shr(packed, I(16)) : packed);
+          } else {
+            v = R(vreg(data + k));
+          }
+          ++k;
+        }
         emit(dx::kMov, {dxbc::temp_dst_mask(value, 1u << c), v});
       }
       if_nz(active());
@@ -1797,7 +2626,37 @@ bool Translator::emit_image(const Instruction& inst) {
       end_if();
       return true;
     }
+    case 15: case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 24: case 25: case 26: {
+      // Image atomics (documented): on the 32-bit texel at integer
+      // coordinates, with the data in vdata (cmpswap: the new value, then the
+      // value compared); with GLC the texel's previous value returns in vdata.
+      if (cube || dim.slot == kImage2DMS) return fail(format("image atomic %u on a cube or multisampled image", op));
+      if (!d16 && inst.dmask == 3 && op != 16) return image_atomic64(inst, dim.slot, dim.coords, index_reg);
+      if (d16 || (inst.dmask != 1 && !(op == 16 && inst.dmask == 3))) {
+        return fail(format("image atomic %u of other than 32 bits", op));
+      }
+      integer_uavs_used_ |= 1u << dim.slot;
+      const uint32_t coords = pack(0, dim.coords, nullptr);
+      const Operand uav = dxbc::typed_uav_atomic(30 + dim.slot, index_reg);
+      const Operand value = R(vreg(data));
+      const uint32_t old = fresh();
+      if_nz(active());
+      if (op == 16) {
+        emit(dx::kImmAtomicCmpExch, {D(old), uav, dxbc::temp_xyzw(coords), R(vreg(data + 1)), value});
+      } else if (op == 18) {
+        emit(dx::kImmAtomicIadd, {D(old), uav, dxbc::temp_xyzw(coords), op1(dx::kIneg, value)});
+      } else {
+        static const uint32_t kOps[] = {dx::kImmAtomicExch, 0, dx::kImmAtomicIadd, 0, 0, dx::kImmAtomicImin,
+                                        dx::kImmAtomicUmin, dx::kImmAtomicImax, dx::kImmAtomicUmax,
+                                        dx::kImmAtomicAnd, dx::kImmAtomicOr, dx::kImmAtomicXor};
+        emit(kOps[op - 15], {D(old), uav, dxbc::temp_xyzw(coords), value});
+      }
+      if (inst.glc) put(vreg(data), R(old));
+      end_if();
+      return true;
+    }
     case 14: {  // image_get_resinfo: width, height, depth or layers, mip levels of the given level
+      if (d16) return fail("image_get_resinfo with 16-bit data");
       const uint32_t result = fresh();
       emit(dx::kResinfo, {D(result), address(0), dxbc::texture_indexed(texture_id, index_reg)}, 2u << 11);
       // resinfo_uint gives width, height, depth/elements, levels.
@@ -1812,8 +2671,28 @@ bool Translator::emit_image(const Instruction& inst) {
     default: break;
   }
   // Sampling (loads and stores take integer coordinates whatever the
-  // unnormalised bit says).
-  if ((inst.raw[0] >> 12) & 1) return fail("unnormalised image coordinates");
+  // unnormalised bit says). Unnormalised coordinates (texels) are divided by
+  // the size of level 0 (array slices and cube faces stay as they are).
+  const bool unnormalised = (inst.raw[0] >> 12) & 1;
+  if (unnormalised && cube) return fail("unnormalised cube coordinates");
+  uint32_t size_reg = kNoRegister;
+  if (unnormalised) {
+    size_reg = fresh();
+    emit(dx::kResinfo, {D(size_reg), I(0), dxbc::texture_indexed(texture_id, index_reg)});
+  }
+  const uint32_t scaled = dim.slot == kImage1D || dim.slot == kImage1DArray ? 1 : dim.slot == kImage3D ? 3 : 2;
+  // Coordinates from address `first` on, as a vector: cube face coordinates
+  // become a direction, unnormalised ones normalised.
+  auto coordinates = [&](uint32_t first) {
+    const uint32_t t = pack(first, dim.coords, nullptr);
+    if (cube) cube_direction(t);
+    if (unnormalised) {
+      for (uint32_t c = 0; c < scaled; ++c) {
+        emit(dx::kDiv, {dxbc::temp_dst_mask(t, 1u << c), dxbc::temp(t, c), dxbc::temp(size_reg, c)});
+      }
+    }
+    return t;
+  };
   samplers_used_ = true;
   const Operand sampler_index = copy(R(inst.src[3]));
   const uint32_t sampler_reg = kScratch + scratch_ - 1;
@@ -1821,15 +2700,18 @@ bool Translator::emit_image(const Instruction& inst) {
   // Gathers (level 0 whatever the variant asks, as on the desktop): the
   // offsets (6-bit signed x in bits 0-5, y in bits 8-13), then the depth
   // reference, then the coordinates; dmask names the gathered component.
-  const bool gather = op == 64 || op == 71 || op == 72 || op == 79 || op == 80 || op == 87 || op == 88 || op == 95;
+  // (gather4_l 68 / 84 with offsets and gather4_c_l 76 / 92 read level 0
+  // too; their level follows the coordinates and is not read.)
+  const bool gather = op == 64 || op == 68 || op == 71 || op == 72 || op == 76 || op == 79 || op == 80 || op == 84 ||
+                      op == 87 || op == 88 || op == 92 || op == 95;
   if (gather) {
     const bool offsets = op >= 80;
-    const bool compare = op == 72 || op == 79 || op == 88 || op == 95;
+    const bool compare = op == 72 || op == 76 || op == 79 || op == 88 || op == 92 || op == 95;
     uint32_t component = 0;
     while (component < 4 && !(inst.dmask & (1u << component))) ++component;
     if (component == 4 || (inst.dmask & ~(1u << component))) return fail("gather of several components");
     const uint32_t at = (offsets ? 1 : 0) + (compare ? 1 : 0);
-    const uint32_t coords = pack(at, dim.coords, nullptr);
+    const uint32_t coords = coordinates(at);
     const uint32_t result = fresh();
     std::vector<Operand> operands = {D(result), dxbc::temp_xyzw(coords)};
     if (offsets) {
@@ -1844,11 +2726,9 @@ bool Translator::emit_image(const Instruction& inst) {
     if (compare) operands.push_back(address(offsets ? 1 : 0));
     const uint32_t opcode = offsets ? (compare ? dx::kGather4PoC : dx::kGather4Po) : (compare ? dx::kGather4C : dx::kGather4);
     emit(opcode, operands);
-    // All four gathered texels come back, in registers data .. data + 3.
-    for (uint32_t c = 0; c < 4; ++c) {
-      const uint32_t d = vreg(data + c);
-      put(d, select(active(), dxbc::temp(result, c), R(d)));
-    }
+    // All four gathered texels come back, in registers data .. data + 3
+    // (data .. data + 1 with D16).
+    write_results(result, 0xF);
     return true;
   }
   uint32_t first = 0;
@@ -1862,9 +2742,48 @@ bool Translator::emit_image(const Instruction& inst) {
     case 39: opcode = dx::kSampleL; break;                                   // image_sample_lz
     case 40: opcode = pixel ? dx::kSampleC : dx::kSampleCLz; first = 1; break;  // image_sample_c
     case 47: opcode = dx::kSampleCLz; first = 1; break;                      // image_sample_c_lz
+    case 34: case 35: case 42: case 43: {
+      // image_sample_d (c_d: a depth reference first, sampled at level 0 as
+      // the desktop has no compare with gradients): the x gradients, the y
+      // gradients (one per dimension), then the coordinates (_cl: then a
+      // level clamp, not applied).
+      // (Cubes: face-coordinate gradients, two each, made direction gradients
+      // on the coordinates' face.)
+      const uint32_t grads = scaled;
+      const uint32_t at = op >= 42 ? 1 : 0;
+      const uint32_t dx_reg = pack(at, grads, nullptr), dy_reg = pack(at + grads, grads, nullptr);
+      if (cube) {
+        const Operand face = in_temp(band(op1(dx::kFtou, address(at + 2 * grads + 2)), I(7)));
+        for (const uint32_t g : {dx_reg, dy_reg}) {
+          const Operand gs = in_temp(dxbc::temp(g, 0)), gt = in_temp(dxbc::temp(g, 1));
+          cube_vector(g, face, gs, gt, 0.0f);
+        }
+      }
+      const uint32_t coords = coordinates(at + 2 * grads);
+      const uint32_t result = fresh();
+      if (op <= 35) {
+        emit(dx::kSampleD, {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
+                            dxbc::sampler_indexed(0, sampler_reg), dxbc::temp_xyzw(dx_reg), dxbc::temp_xyzw(dy_reg)});
+      } else {
+        emit(dx::kSampleCLz, {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
+                              dxbc::sampler_indexed(0, sampler_reg), address(0)});
+      }
+      results(result);
+      return true;
+    }
+    case 96: {
+      // image_get_lod: the level a sample would use (clamped, unclamped).
+      if (!pixel) return fail("image_get_lod outside a pixel shader");
+      const uint32_t coords = coordinates(0);
+      const uint32_t result = fresh();
+      emit(dx::kLod, {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
+                      dxbc::sampler_indexed(0, sampler_reg)});
+      results(result);
+      return true;
+    }
     default: return fail(format("image instruction %u", op));
   }
-  const uint32_t coords = pack(first, dim.coords, nullptr);
+  const uint32_t coords = coordinates(first);
   const uint32_t result = fresh();
   std::vector<Operand> operands = {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
                                    dxbc::sampler_indexed(0, sampler_reg)};
@@ -1882,6 +2801,84 @@ bool Translator::emit_image(const Instruction& inst) {
   (void)index;
   emit(opcode, operands);
   results(result);
+  return true;
+}
+
+// 64-bit image atomics (documented: dmask 0x3, the value in two registers,
+// low dword first; observed: titles' visibility buffers keep the maximum of
+// depth and an id this way). The host bytecode has no 64-bit atomics and no
+// typed atomics on 64-bit texels: the texel (two 32-bit channels) is read,
+// combined and written. In pixel programs the view is rasterizer-ordered,
+// which makes that exclusive and ordered per pixel (exact when, as observed,
+// lanes access their own pixel); elsewhere it is not atomic.
+bool Translator::image_atomic64(const Instruction& inst, uint32_t slot, uint32_t coord_count, uint32_t index_reg) {
+  const uint32_t op = inst.op;
+  if (op == 27 || op == 28 || op > 26) return fail(format("64-bit image atomic %u", op));
+  const uint32_t data = inst.src[1] - rdna::kVgpr0;
+  integer_uavs_used_ |= 1u << slot;
+  features_ |= dxbc::kRequiresTypedUavLoadAdditionalFormats;
+  if (stage_ == Stage::Pixel) {
+    ordered_uavs_ = true;
+    features_ |= dxbc::kRequiresRovs;
+  }
+  const uint32_t coords = fresh();
+  for (uint32_t c = 0; c < 4; ++c) {
+    const Operand v = c < coord_count ? R(vreg(inst.src[0] - rdna::kVgpr0 + c)) : I(0);
+    emit(dx::kMov, {dxbc::temp_dst_mask(coords, 1u << c), v});
+  }
+  if (inst.raw[0] & 6) return fail("64-bit image atomic with separate address registers");
+  if_nz(active());
+  const uint32_t old = fresh();
+  emit(dx::kLdUavTyped,
+       {dxbc::temp_dst_mask(old, 0x3), dxbc::temp_xyzw(coords), dxbc::typed_uav_indexed(30 + slot, index_reg, false)});
+  const Operand lo_old = in_temp(dxbc::temp(old, 0)), hi_old = in_temp(dxbc::temp(old, 1));
+  const Operand lo = in_temp(R(vreg(data))), hi = in_temp(R(vreg(data + 1)));
+  Operand lo_new, hi_new;
+  if (op == 20 || op == 21 || op == 22 || op == 23) {
+    // Signed (20 min, 22 max) or unsigned (21, 23) 64-bit comparisons: the
+    // high dwords decide, the low ones (unsigned) when they are equal.
+    const bool is_signed = op == 20 || op == 22, is_max = op == 22 || op == 23;
+    const Operand hi_less = is_signed ? op2(dx::kIlt, hi, hi_old) : ult(hi, hi_old);
+    const Operand hi_more = is_signed ? op2(dx::kIlt, hi_old, hi) : ult(hi_old, hi);
+    const Operand lo_less = ult(lo, lo_old), lo_more = ult(lo_old, lo);
+    const Operand wins = in_temp(is_max ? bor(hi_more, band(eq(hi, hi_old), lo_more))
+                                        : bor(hi_less, band(eq(hi, hi_old), lo_less)));
+    lo_new = select(wins, lo, lo_old);
+    hi_new = select(wins, hi, hi_old);
+  } else if (op == 24) {
+    lo_new = band(lo, lo_old);
+    hi_new = band(hi, hi_old);
+  } else if (op == 25) {
+    lo_new = bor(lo, lo_old);
+    hi_new = bor(hi, hi_old);
+  } else if (op == 26) {
+    lo_new = bxor(lo, lo_old);
+    hi_new = bxor(hi, hi_old);
+  } else if (op == 15) {
+    lo_new = lo;
+    hi_new = hi;
+  } else if (op == 17 || op == 18) {
+    // Add (sub: of the negated value) with the carry into the high dword.
+    const Operand nlo = op == 18 ? in_temp(op1(dx::kIneg, lo)) : lo;
+    const Operand nhi = op == 18 ? in_temp(sub(bnot(hi), select(eq(lo, I(0)), I(0xFFFFFFFFu), I(0)))) : hi;
+    const Operand sum = in_temp(add(lo_old, nlo));
+    lo_new = sum;
+    hi_new = add(add(hi_old, nhi), band(ult(sum, lo_old), I(1)));
+  } else {
+    end_if();
+    return fail(format("64-bit image atomic %u", op));
+  }
+  const uint32_t value = fresh();
+  emit(dx::kMov, {dxbc::temp_dst_mask(value, 1), lo_new});
+  emit(dx::kMov, {dxbc::temp_dst_mask(value, 2), hi_new});
+  emit(dx::kMov, {dxbc::temp_dst_mask(value, 0xC), I(0)});
+  emit(dx::kStoreUavTyped,
+       {dxbc::typed_uav_indexed(30 + slot, index_reg, true), dxbc::temp_xyzw(coords), dxbc::temp_xyzw(value)});
+  if (inst.glc) {
+    put(vreg(data), lo_old);
+    put(vreg(data + 1), hi_old);
+  }
+  end_if();
   return true;
 }
 
@@ -1917,8 +2914,80 @@ bool Translator::emit_vop3p(const Instruction& inst) {
       put(d, select(active(), merged, R(d)));
       return true;
     }
-    default: return fail(format("VOP3P op %u", inst.op));
+    default: break;
   }
+  // Packed 16-bit operations (documented): each half of the result takes, from
+  // each source, the half op_sel (low result) or op_sel_hi (high result) names;
+  // float sources are negated by neg (low) or neg_hi (high).
+  const uint32_t op = inst.op;
+  auto half = [&](int i, bool high) {
+    const Operand v = src(inst, inst.src[i]);
+    const bool upper = ((high ? inst.opsel_hi : inst.opsel) >> i) & 1;
+    return upper ? shr(v, I(16)) : band(v, I(0xFFFF));
+  };
+  auto fhalf = [&](int i, bool high) {
+    Operand f = op1(dx::kF16tof32, half(i, high));
+    if (((high ? inst.neg_hi : inst.neg) >> i) & 1) f = dxbc::neg(f);
+    return f;
+  };
+  auto sext16 = [&](const Operand& v) { return ibfe(I(16), I(0), v); };
+  auto lane = [&](bool high) -> Operand {
+    switch (op) {
+      case 0: return add(mul_lo(sext16(half(0, high)), sext16(half(1, high))), sext16(half(2, high)));
+      case 1: return mul_lo(half(0, high), half(1, high));
+      case 2: case 10: return add(half(0, high), half(1, high));
+      case 3: case 11: return sub(half(0, high), half(1, high));
+      case 4: return shl(half(1, high), band(half(0, high), I(15)));
+      case 5: return shr(half(1, high), band(half(0, high), I(15)));
+      case 6: return sar(sext16(half(1, high)), band(half(0, high), I(15)));
+      case 7: return op2(dx::kImax, sext16(half(0, high)), sext16(half(1, high)));
+      case 8: return op2(dx::kImin, sext16(half(0, high)), sext16(half(1, high)));
+      case 9: return add(mul_lo(half(0, high), half(1, high)), half(2, high));
+      case 12: return op2(dx::kUmax, half(0, high), half(1, high));
+      case 13: return op2(dx::kUmin, half(0, high), half(1, high));
+      default: break;
+    }
+    Operand f;
+    switch (op) {
+      case 14: f = op3(dx::kMad, fhalf(0, high), fhalf(1, high), fhalf(2, high)); break;
+      case 15: f = op2(dx::kAdd, fhalf(0, high), fhalf(1, high)); break;
+      case 16: f = op2(dx::kMul, fhalf(0, high), fhalf(1, high)); break;
+      case 17: f = op2(dx::kMin, fhalf(0, high), fhalf(1, high)); break;
+      default: f = op2(dx::kMax, fhalf(0, high), fhalf(1, high)); break;
+    }
+    if (inst.clamp) f = op1(dx::kMov, f, dxbc::kSaturate);
+    return op1(dx::kF32tof16, f);
+  };
+  if (op <= 18) {
+    if (inst.clamp && op <= 13) return fail(format("VOP3P op %u with clamp", op));
+    const Operand lo = band(lane(false), I(0xFFFF));
+    const Operand hi = shl(lane(true), I(16));
+    put(d, select(active(), bor(lo, hi), R(d)));
+    return true;
+  }
+  // Dot products into 32 bits: halves (bytes, nibbles) in order, plus src2.
+  if (op == 19) {  // v_dot2_f32_f16
+    Operand sum = op3(dx::kMad, fhalf(0, false), fhalf(1, false), src(inst, inst.src[2]));
+    sum = op3(dx::kMad, fhalf(0, true), fhalf(1, true), sum);
+    if (inst.clamp) sum = op1(dx::kMov, sum, dxbc::kSaturate);
+    put(d, select(active(), sum, R(d)));
+    return true;
+  }
+  if (op >= 20 && op <= 25) {
+    if (inst.clamp) return fail(format("VOP3P op %u with clamp", op));
+    const bool is_signed = op == 20 || op == 22 || op == 24;
+    const uint32_t bits = op <= 21 ? 16 : op <= 23 ? 8 : 4;
+    const Operand a = in_temp(src(inst, inst.src[0])), b = in_temp(src(inst, inst.src[1]));
+    Operand sum = src(inst, inst.src[2]);
+    for (uint32_t at = 0; at < 32; at += bits) {
+      const Operand x = is_signed ? ibfe(I(bits), I(at), a) : ubfe(I(bits), I(at), a);
+      const Operand y = is_signed ? ibfe(I(bits), I(at), b) : ubfe(I(bits), I(at), b);
+      sum = add(mul_lo(x, y), sum);
+    }
+    put(d, select(active(), sum, R(d)));
+    return true;
+  }
+  return fail(format("VOP3P op %u", op));
 }
 
 bool Translator::cross_lane(const Instruction& inst) {
@@ -1927,18 +2996,16 @@ bool Translator::cross_lane(const Instruction& inst) {
   if (vector && (inst.src[0] == rdna::kDpp16 || inst.src[0] == rdna::kDpp8 || inst.src[0] == rdna::kDpp8Fi)) {
     return true;
   }
+  // ds_swizzle_b32 and ds_bpermute_b32 read other lanes through the exchange.
+  if (inst.encoding == Encoding::DS && (inst.op == 53 || inst.op == 179)) return true;
   return inst.encoding == Encoding::VOP3 && (inst.op == 0x360 || inst.op == 0x377 || inst.op == 0x378);
-}
-
-bool Translator::read_first_lane(const Instruction& inst) {
-  return (inst.encoding == Encoding::VOP1 && inst.op == 2 && inst.src[0] != rdna::kSdwa) ||
-         (inst.encoding == Encoding::VOP3 && inst.op == 0x182);
 }
 
 namespace {
 // The VGPR whose value an exchange carries.
 uint16_t exchanged_vgpr(const Instruction& inst) {
-  if (inst.encoding == Encoding::VOP3 || (inst.encoding == Encoding::VOP1 && inst.op == 2)) return inst.src[0];
+  if (inst.encoding == Encoding::DS) return inst.src[1];
+  if (inst.encoding == Encoding::VOP3) return inst.src[0];
   return static_cast<uint16_t>(rdna::kVgpr0 + (inst.ext & 0xFF));
 }
 }  // namespace
@@ -1959,15 +3026,23 @@ bool Translator::exchange_read(const Instruction& inst) {
   // Source lane and whether this lane writes, per operation.
   Operand source, valid = I(0xFFFFFFFFu), write = I(0xFFFFFFFFu);
   bool fetch_inactive = false, bound_zero = false;
-  const bool first_lane = read_first_lane(inst);
-  if (first_lane) {
-    // v_readfirstlane_b32: the lowest lane EXEC enables (lane 0 when none).
-    const Operand hi = info_.wave_size == 64
-                           ? add(op1(dx::kFirstbitLo, R(kExecHiR)), I(32))
-                           : I(0);
-    const Operand from_hi = select(nonzero(R(kExecHiR)), hi, I(0));
-    source = select(nonzero(R(kExecLoR)), op1(dx::kFirstbitLo, R(kExecLoR)), from_hi);
-    fetch_inactive = true;
+  if (inst.encoding == Encoding::DS) {
+    // Documented: ds_bpermute_b32 reads lane (address + offset) / 4;
+    // ds_swizzle_b32 reads within groups of four lanes (offset bit 15: two
+    // bits a lane in offset[7:0]) or within groups of 32 lanes by masks
+    // (((lane & and) | or) ^ xor, the masks in offset[4:0], [9:5], [14:10]).
+    // An inactive source lane gives 0.
+    const uint32_t offset = static_cast<uint32_t>(inst.imm) & 0xFFFF;
+    if (inst.op == 179) {
+      const Operand address = add(R(vreg(inst.src[0] - rdna::kVgpr0)), I(offset));
+      source = band(shr(address, I(2)), I(info_.wave_size - 1));
+    } else if (offset & 0x8000) {
+      source = add(band(lane, I(~3u)), band(shr(I(offset), shl(band(lane, I(3)), I(1))), I(3)));
+    } else {
+      const uint32_t and_mask = offset & 31, or_mask = (offset >> 5) & 31, xor_mask = (offset >> 10) & 31;
+      source = add(band(lane, I(~31u)), bxor(bor(band(lane, I(and_mask)), I(or_mask)), I(xor_mask)));
+    }
+    bound_zero = true;
   } else if (inst.encoding == Encoding::VOP3 && inst.op == 0x360) {
     // v_readlane_b32 sdst, vsrc, lane: every lane reads the same lane.
     source = band(src(inst, inst.src[1]), I(info_.wave_size - 1));
@@ -2035,15 +3110,19 @@ bool Translator::exchange_read(const Instruction& inst) {
 // the lanes that write.
 bool Translator::finish_exchange(const Instruction& inst, uint32_t value, Operand valid, Operand write,
                                  bool fetch_inactive, bool bound_zero, const Operand& source_active) {
-  const bool first_lane = read_first_lane(inst);
   if (!fetch_inactive) valid = band(valid, nonzero(source_active));
   if (bound_zero) {
     put(value, select(valid, R(value), I(0)));
   } else {
     write = band(write, valid);
   }
-  if (first_lane || (inst.encoding == Encoding::VOP3 && inst.op == 0x360)) {
+  if (inst.encoding == Encoding::VOP3 && inst.op == 0x360) {
     set_s(inst.dst, R(value));
+    return true;
+  }
+  if (inst.encoding == Encoding::DS) {
+    const uint32_t d = vreg(inst.dst);
+    put(d, select(active(), R(value), R(d)));
     return true;
   }
   Instruction work = inst;
@@ -2078,48 +3157,210 @@ bool Translator::finish_exchange(const Instruction& inst, uint32_t value, Operan
   return ok;
 }
 
-// Pixel programs: DPP quad permutes (the console compiler's derivatives).
-// There is no exchange memory in a host pixel shader, but fine derivatives
-// carry a quad neighbour's value as a difference: with x the value, the
-// horizontal neighbour's is x + ddx_fine(x) in the left column and
-// x - ddx_fine(x) in the right one, likewise vertically, and the diagonal
-// one is the vertical neighbour of the horizontal one. Values are exchanged
-// as two floats holding 16 and 17 bits (the low half and the source lane's
-// EXEC bit), so every step is exact. The quad position (console lane order:
-// lane 0 top left, 1 top right, 2 bottom left, 3 bottom right) comes from
-// the pixel position. Like implicit-derivative sampling, this requires the
-// four lanes of a quad to reach the instruction together.
+// Cross-lane operations in pixel (and vertex) programs. A host pixel shader
+// has no exchange memory, but fine derivatives carry a quad neighbour's value
+// as a difference: with x the value, the horizontal neighbour's is
+// x + ddx_fine(x) in the left column and x - ddx_fine(x) in the right one,
+// likewise vertically, and the diagonal one is the vertical neighbour of the
+// horizontal one. Values are exchanged as two floats holding 16 and 17 bits
+// (the low half and the source lane's EXEC bit), so every step is exact. The
+// quad position (console lane order: lane 0 top left, 1 top right, 2 bottom
+// left, 3 bottom right) comes from the pixel position. Like
+// implicit-derivative sampling, this requires the four lanes of a quad to
+// reach the instruction together.
+//
+// The wave is taken to hold this quad alone, as lanes 0-3 (a packing the
+// console GPU may also choose: programs cannot rely on others): an operation
+// reading a lane outside it reads a lane without a pixel. Such lanes hold, in
+// whole-wave code, what the program gives inactive lanes: the console
+// compiler's reductions give them the identity of the reduction's operation.
+// So a lane outside the quad reads as the identity of the operation consuming
+// it where there is one (exact reductions over the quad), as an invalid
+// source for moves (no write, or zero with bound control), and as the lane's
+// own value for lane reads (the reduced value every quad lane then holds).
+// Vertex programs have no quads: their wave is the lane alone.
 bool Translator::quad_read(const Instruction& inst) {
-  if (inst.src[0] != rdna::kDpp16) return fail("DPP8 in a pixel program");
-  const uint32_t control = (inst.ext >> 8) & 0x1FF;
-  if (control >= 0x100) return fail(format("DPP control 0x%x in a pixel program", control));
-  if (((inst.ext >> 24) & 0xFF) != 0xFF) return fail("DPP row or bank mask in a pixel program");
-  const bool fetch_inactive = (inst.ext >> 18) & 1, bound_zero = (inst.ext >> 19) & 1;
-  quad_ = true;
-  const Operand x = band(op1(dx::kFtou, dxbc::input_register(0, 0)), I(1));
-  const Operand y = band(op1(dx::kFtou, dxbc::input_register(0, 1)), I(1));
-  const Operand x_sign = select(x, I(0xBF800000u), I(0x3F800000u));  // -1 in the right column
-  const Operand y_sign = select(y, I(0xBF800000u), I(0x3F800000u));  // -1 in the bottom row
-  const Operand me = bor(x, shl(y, I(1)));
-  // The quad lane this lane reads, relative to it (0 itself, 1 horizontal,
-  // 2 vertical, 3 diagonal neighbour).
-  const Operand relative = bxor(band(shr(I(control), shl(me, I(1))), I(3)), me);
-  const Operand v = in_temp(src(inst, exchanged_vgpr(inst)));
-  const Operand halves[2] = {op1(dx::kUtof, bor(band(v, I(0xFFFF)), shl(active(), I(16)))),
-                             op1(dx::kUtof, shr(v, I(16)))};
-  Operand picked[2];
-  for (int i = 0; i < 2; ++i) {
-    const Operand f = in_temp(halves[i]);
-    const Operand h = op3(dx::kMad, x_sign, op1(dx::kDerivRtxFine, f), f);
-    const Operand c = op3(dx::kMad, y_sign, op1(dx::kDerivRtyFine, f), f);
-    const Operand d = op3(dx::kMad, y_sign, op1(dx::kDerivRtyFine, h), h);
-    picked[i] = op1(dx::kFtou, select(band(relative, I(2)), select(band(relative, I(1)), d, c),
-                                      select(band(relative, I(1)), h, f)));
+  const bool quad = stage_ == Stage::Pixel;
+  Operand me = I(0);
+  Operand x, y;
+  if (quad) {
+    quad_ = true;
+    x = band(op1(dx::kFtou, dxbc::input_register(0, 0)), I(1));
+    y = band(op1(dx::kFtou, dxbc::input_register(0, 1)), I(1));
+    me = in_temp(bor(x, shl(y, I(1))));
   }
-  const uint32_t value = fresh();
-  put(value, bor(band(picked[0], I(0xFFFF)), shl(picked[1], I(16))));
-  return finish_exchange(inst, value, I(0xFFFFFFFFu), I(0xFFFFFFFFu), fetch_inactive, bound_zero,
-                         band(shr(picked[0], I(16)), I(1)));
+  const uint32_t wave = info_.wave_size ? info_.wave_size : 64;
+  Operand source, valid = I(0xFFFFFFFFu), write = I(0xFFFFFFFFu);
+  bool fetch_inactive = false, bound_zero = false;
+  enum class Outside { Invalid, Identity, Own } outside = Outside::Invalid;
+  uint32_t identity = 0;
+  if (inst.encoding == Encoding::DS) {
+    // ds_bpermute_b32 / ds_swizzle_b32 (see exchange_read): an inactive
+    // source lane gives 0.
+    const uint32_t offset = static_cast<uint32_t>(inst.imm) & 0xFFFF;
+    if (inst.op == 179) {
+      const Operand address = add(R(vreg(inst.src[0] - rdna::kVgpr0)), I(offset));
+      source = band(shr(address, I(2)), I(wave - 1));
+    } else if (offset & 0x8000) {
+      source = band(shr(I(offset), shl(me, I(1))), I(3));
+    } else {
+      const uint32_t and_mask = offset & 31, or_mask = (offset >> 5) & 31, xor_mask = (offset >> 10) & 31;
+      source = bxor(bor(band(me, I(and_mask)), I(or_mask)), I(xor_mask));
+    }
+    bound_zero = true;
+  } else if (inst.encoding == Encoding::VOP3 && inst.op == 0x360) {
+    // v_readlane_b32: the named lane; outside the quad, the lane's own value.
+    source = band(src(inst, inst.src[1]), I(wave - 1));
+    fetch_inactive = true;
+    outside = Outside::Own;
+  } else if (inst.encoding == Encoding::VOP3) {
+    // v_permlane16 / v_permlanex16 (see exchange_read).
+    const Operand word = select(ult(me, I(8)), src(inst, inst.src[1]), src(inst, inst.src[2]));
+    const Operand pick = ubfe(I(4), shl(band(me, I(7)), I(2)), word);
+    source = inst.op == 0x378 ? add(pick, I(16)) : pick;
+    fetch_inactive = (inst.opsel & 1) != 0;
+    bound_zero = (inst.opsel & 2) != 0;
+    outside = consumer_identity(at_, inst.dst, &identity) ? Outside::Identity : Outside::Own;
+  } else if (inst.src[0] == rdna::kDpp8 || inst.src[0] == rdna::kDpp8Fi) {
+    source = ubfe(I(3), mul_lo(I(3), me), I(inst.ext >> 8));
+    fetch_inactive = inst.src[0] == rdna::kDpp8Fi;
+    bound_zero = true;
+    if (source_identity(inst, &identity)) outside = Outside::Identity;
+  } else {
+    const uint32_t control = (inst.ext >> 8) & 0x1FF;
+    fetch_inactive = (inst.ext >> 18) & 1;
+    bound_zero = (inst.ext >> 19) & 1;
+    const uint32_t n = control & 15;
+    if (control < 0x100) {
+      source = band(shr(I(control), shl(me, I(1))), I(3));
+    } else if (control >= 0x101 && control <= 0x10F) {
+      source = add(me, I(n));
+      valid = ult(source, I(16));  // within the row
+    } else if (control >= 0x111 && control <= 0x11F) {
+      source = sub(me, I(n));
+      valid = op2(dx::kUge, me, I(n));
+    } else if (control >= 0x121 && control <= 0x12F) {
+      source = band(sub(me, I(n)), I(15));
+    } else if (control == 0x140) {
+      source = sub(I(15), me);
+    } else if (control == 0x141) {
+      source = sub(I(7), me);
+    } else if (control >= 0x150 && control <= 0x15F) {
+      source = I(n);
+    } else if (control >= 0x160 && control <= 0x16F) {
+      source = bxor(me, I(n));
+    } else {
+      return fail(format("DPP control 0x%x in a %s program", control, quad ? "pixel" : "vertex"));
+    }
+    // Lanes 0-3 are in row 0 and bank 0.
+    const uint32_t bank_mask = (inst.ext >> 24) & 15, row_mask = (inst.ext >> 28) & 15;
+    if (!(bank_mask & 1) || !(row_mask & 1)) write = I(0);
+    if (source_identity(inst, &identity)) outside = Outside::Identity;
+  }
+  source = in_temp(source);
+  const uint32_t lanes = quad ? 4 : 1;
+  const Operand inside = in_temp(ult(source, I(lanes)));
+  const Operand own = in_temp(src(inst, exchanged_vgpr(inst)));
+  // The value and EXEC bit of the source lane when it is in the quad.
+  const uint32_t value = fresh(), source_active = fresh();
+  if (quad) {
+    const Operand relative = bxor(band(source, I(3)), me);
+    const Operand x_sign = select(x, I(0xBF800000u), I(0x3F800000u));  // -1 in the right column
+    const Operand y_sign = select(y, I(0xBF800000u), I(0x3F800000u));  // -1 in the bottom row
+    const Operand halves[2] = {op1(dx::kUtof, bor(band(own, I(0xFFFF)), shl(active(), I(16)))),
+                               op1(dx::kUtof, shr(own, I(16)))};
+    Operand picked[2];
+    for (int i = 0; i < 2; ++i) {
+      const Operand f = in_temp(halves[i]);
+      const Operand h = op3(dx::kMad, x_sign, op1(dx::kDerivRtxFine, f), f);
+      const Operand c = op3(dx::kMad, y_sign, op1(dx::kDerivRtyFine, f), f);
+      const Operand d = op3(dx::kMad, y_sign, op1(dx::kDerivRtyFine, h), h);
+      picked[i] = in_temp(op1(dx::kFtou, select(band(relative, I(2)), select(band(relative, I(1)), d, c),
+                                                 select(band(relative, I(1)), h, f))));
+    }
+    put(value, bor(band(picked[0], I(0xFFFF)), shl(picked[1], I(16))));
+    put(source_active, band(shr(picked[0], I(16)), I(1)));
+  } else {
+    put(value, own);
+    put(source_active, active());
+  }
+  // Lanes outside the quad.
+  switch (outside) {
+    case Outside::Identity:
+      put(value, select(inside, R(value), I(identity)));
+      put(source_active, select(inside, R(source_active), I(1)));
+      break;
+    case Outside::Own:
+      put(value, select(inside, R(value), own));
+      put(source_active, select(inside, R(source_active), I(1)));
+      break;
+    case Outside::Invalid:
+      put(source_active, select(inside, R(source_active), I(0)));
+      valid = band(valid, inside);
+      break;
+  }
+  return finish_exchange(inst, value, valid, write, fetch_inactive, bound_zero, R(source_active));
+}
+
+namespace {
+
+// The identity of VOP2 operation `op` for one of its operands (`first`:
+// src0), if it has one: op(identity, x) = x.
+bool vop2_identity(uint32_t op, bool first, uint32_t* identity) {
+  switch (op) {
+    case 0x03: *identity = 0x80000000u; return true;            // v_add_f32 (-0)
+    case 0x05: *identity = 0; return first;                      // v_subrev_f32: src1 - src0
+    case 0x07: case 0x08: *identity = 0x3F800000u; return true;  // v_mul_legacy_f32, v_mul_f32
+    case 0x09: case 0x0B: *identity = 1; return true;            // v_mul_i32_i24, v_mul_u32_u24
+    case 0x0F: *identity = 0x7F800000u; return true;             // v_min_f32
+    case 0x10: *identity = 0xFF800000u; return true;             // v_max_f32
+    case 0x11: *identity = 0x7FFFFFFFu; return true;             // v_min_i32
+    case 0x12: *identity = 0x80000000u; return true;             // v_max_i32
+    case 0x13: *identity = 0xFFFFFFFFu; return true;             // v_min_u32
+    case 0x14: *identity = 0; return true;                       // v_max_u32
+    case 0x16: case 0x18: case 0x1A: *identity = 0; return first;  // shifts by src0
+    case 0x1B: case 0x1E: *identity = 0xFFFFFFFFu; return true;  // v_and_b32, v_xnor_b32
+    case 0x1C: case 0x1D: *identity = 0; return true;            // v_or_b32, v_xor_b32
+    case 0x25: *identity = 0; return true;                       // v_add_nc_u32
+    case 0x27: *identity = 0; return first;                      // v_subrev_nc_u32: src1 - src0
+    case 0x32: *identity = 0x8000u; return true;                 // v_add_f16 (-0)
+    case 0x35: *identity = 0x3C00u; return true;                 // v_mul_f16
+    case 0x39: *identity = 0xFC00u; return true;                 // v_max_f16
+    case 0x3A: *identity = 0x7C00u; return true;                 // v_min_f16
+    default: return false;
+  }
+}
+
+}  // namespace
+
+bool Translator::source_identity(const Instruction& inst, uint32_t* identity) const {
+  if (inst.encoding != Encoding::VOP2) return false;
+  // Modifiers on the exchanged operand change what an identity is.
+  if (inst.src[0] == rdna::kDpp16 && ((inst.ext >> 20) & 3)) return false;
+  return vop2_identity(inst.op, true, identity);
+}
+
+bool Translator::consumer_identity(size_t from, uint16_t vgpr, uint32_t* identity) const {
+  for (size_t i = from + 1; i < program_.size() && i < from + 8; ++i) {
+    const Instruction& next = program_[i];
+    uint32_t op = 0xFFFFFFFFu;
+    if (next.encoding == Encoding::VOP2 && next.src[0] != rdna::kDpp16 && next.src[0] != rdna::kDpp8 &&
+        next.src[0] != rdna::kDpp8Fi && next.src[0] != rdna::kSdwa) {
+      op = next.op;
+    } else if (next.encoding == Encoding::VOP3 && next.op >= 0x100 && next.op < 0x140 && !next.abs && !next.neg &&
+               !next.omod && !next.clamp) {
+      op = next.op - 0x100u;
+    }
+    const uint16_t reg = static_cast<uint16_t>(rdna::kVgpr0 + vgpr);
+    const bool reads0 = next.src[0] == reg, reads1 = next.src[1] == reg;
+    if (op != 0xFFFFFFFFu && (reads0 || reads1)) return vop2_identity(op, reads0, identity);
+    if (reads0 || reads1 || next.src[2] == reg) return false;  // another kind of use
+    if (next.dst == vgpr && (next.encoding == Encoding::VOP1 || next.encoding == Encoding::VOP2 ||
+                             next.encoding == Encoding::VOP3)) {
+      return false;  // overwritten first
+    }
+  }
+  return false;
 }
 
 bool Translator::emit_interp(const Instruction& inst) {
@@ -2153,7 +3394,7 @@ bool Translator::emit(const Instruction& inst) {
     case Encoding::MUBUF:
     case Encoding::MTBUF: return emit_mubuf(inst);
     case Encoding::DS:
-      if (stage_ != Stage::Compute) return fail("group shared memory in a graphics stage");
+      if (!computeish()) return fail("group shared memory in a graphics stage");
       return emit_ds(inst);
     case Encoding::EXP: return emit_export(inst);
     case Encoding::MIMG: return emit_image(inst);
@@ -2164,17 +3405,69 @@ bool Translator::emit(const Instruction& inst) {
 }
 
 bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
-  // Decode everything up to s_code_end.
-  for (uint32_t pc = 0; pc + 4 <= size_;) {
-    Instruction inst;
-    if (!rdna::decode(code_, size_, pc, &inst)) break;
-    if (inst.encoding == Encoding::SOPP && inst.op == 31) break;  // s_code_end
-    program_.push_back(inst);
-    pc += 4 * inst.words;
+  // Decode what control flow reaches, from the entry: programs keep data
+  // after s_endpgm (tables they read through the program counter), which is
+  // not code. Calls and jumps through registers (s_swappc_b64, s_setpc_b64)
+  // reach the address the compiler's idiom forms: s_getpc_b64 into the
+  // register pair, then s_add_u32 of a literal to its low half.
+  {
+    std::map<uint32_t, Instruction> decoded;
+    std::vector<uint32_t> work = {0};
+    while (!work.empty()) {
+      uint32_t pc = work.back();
+      work.pop_back();
+      uint16_t pc_reg = 0xFFFF;  // SGPR pair holding a program address, and that address
+      uint32_t pc_value = 0;
+      while (pc + 4 <= size_ && !decoded.count(pc)) {
+        Instruction inst;
+        if (!rdna::decode(code_, size_, pc, &inst)) break;
+        if (inst.encoding == Encoding::SOPP && inst.op == 31) break;  // s_code_end
+        decoded[pc] = inst;
+        const uint32_t next = pc + 4 * inst.words;
+        bool stop = false;
+        if (inst.encoding == Encoding::SOPP) {
+          const uint32_t target = static_cast<uint32_t>(pc + 4 + 4 * inst.imm);
+          if (inst.op == 1) stop = true;  // s_endpgm
+          if (inst.op == 2) {             // s_branch
+            work.push_back(target);
+            stop = true;
+          }
+          if (inst.op >= 4 && inst.op <= 9) work.push_back(target);
+        } else if (inst.encoding == Encoding::SOP1 && inst.op == 31) {
+          pc_reg = inst.dst;
+          pc_value = next;
+        } else if (inst.encoding == Encoding::SOP2 && inst.op == 0 && inst.dst == pc_reg && inst.src[0] == pc_reg &&
+                   inst.src[1] == 255) {
+          pc_value += inst.literal;  // s_add_u32 of a literal
+        } else if (inst.encoding == Encoding::SOP1 && (inst.op == 32 || inst.op == 33)) {
+          if (inst.src[0] == pc_reg) {
+            work.push_back(pc_value);
+            indirect_targets_.insert(pc_value);
+          }
+          stop = inst.op == 32;  // s_setpc_b64 does not return; s_swappc_b64 returns after itself
+        } else if (inst.dst == pc_reg || inst.dst == pc_reg + 1) {
+          if (inst.encoding == Encoding::SOP1 || inst.encoding == Encoding::SOP2 || inst.encoding == Encoding::SOPK ||
+              inst.encoding == Encoding::SMEM) {
+            pc_reg = 0xFFFF;  // overwritten
+          }
+        }
+        if (stop) break;
+        pc = next;
+      }
+    }
+    for (auto& [pc, inst] : decoded) program_.push_back(inst);
   }
   if (program_.empty()) {
     *error = "empty program";
     return false;
+  }
+  for (const Instruction& inst : program_) {
+    if (inst.encoding == Encoding::SOP1 && inst.op == 31) code_data_ = true;  // s_getpc_b64
+  }
+  if (code_data_) {
+    // Tables follow the code: the last 64 KiB of a larger program are kept.
+    code_first_ = size_ > kCodeDataLimit ? static_cast<uint32_t>(size_ - kCodeDataLimit) & ~15u : 0;
+    code_bytes_ = static_cast<uint32_t>(size_) - code_first_;
   }
   if (info_.wave_size == 0) {
     info_.wave_size = 32;
@@ -2191,15 +3484,35 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
     }
   }
 
+  if (stage_ == Stage::Pixel) {
+    // Attributes read whole and as 16-bit halves, so half attributes get
+    // their registers before the code is translated.
+    for (const Instruction& inst : program_) {
+      if (inst.encoding == Encoding::VINTRP && inst.imm < 31) scan_params_ |= 1u << inst.imm;
+      if (inst.encoding == Encoding::VOP3 && (inst.op == 0x342 || inst.op == 0x343 || inst.op == 0x35A) &&
+          (inst.src[0] & 0x3F) < 31) {
+        iface_.half_params |= 1u << (inst.src[0] & 0x3F);
+      }
+    }
+  }
+  if (stage_ == Stage::Ngg && !ngg_scan()) {
+    *error = error_;
+    return false;
+  }
+
   // Block leaders: entry, branch targets, instructions after branches.
   std::set<uint32_t> leaders = {0};
+  leaders.insert(indirect_targets_.begin(), indirect_targets_.end());
   auto is_branch = [](const Instruction& i) {
-    return i.encoding == Encoding::SOPP && (i.op == 2 || (i.op >= 4 && i.op <= 9) || i.op == 1 || i.op == 10);
+    return (i.encoding == Encoding::SOPP && (i.op == 2 || (i.op >= 4 && i.op <= 9) || i.op == 1 || i.op == 10)) ||
+           (i.encoding == Encoding::SOP1 && (i.op == 32 || i.op == 33));
   };
   for (size_t i = 0; i < program_.size(); ++i) {
     const Instruction& inst = program_[i];
     if (!is_branch(inst)) continue;
-    if (inst.op != 1 && inst.op != 10) leaders.insert(static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm));
+    if (inst.encoding == Encoding::SOPP && inst.op != 1 && inst.op != 10) {
+      leaders.insert(static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm));
+    }
     if (i + 1 < program_.size()) leaders.insert(program_[i + 1].pc);
   }
 
@@ -2208,6 +3521,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   std::vector<std::pair<uint32_t, dxbc::Program>> blocks;
   for (size_t i = 0; i < program_.size(); ++i) {
     const Instruction& inst = program_[i];
+    at_ = i;
     scratch_ = 0;
     if (leaders.count(inst.pc)) {
       if (i != 0) {
@@ -2240,15 +3554,15 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
         default: continue;  // waits, priorities, messages, prefetch hints
       }
     }
-    if (cross_lane(inst) || (stage_ == Stage::Compute && read_first_lane(inst))) {
-      if (stage_ == Stage::Pixel && cross_lane(inst) && inst.encoding != Encoding::VOP3) {
+    if (cross_lane(inst)) {
+      if ((stage_ == Stage::Pixel || stage_ == Stage::Vertex) && cross_lane(inst)) {
         if (!quad_read(inst) || !error_.empty()) {
           *error = format("at 0x%x: %s", inst.pc, error_.c_str());
           return false;
         }
         continue;
       }
-      if (stage_ != Stage::Compute) {
+      if (!computeish()) {
         *error = format("at 0x%x: cross-lane operation outside a compute program", inst.pc);
         return false;
       }
@@ -2275,7 +3589,14 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       return false;
     }
   }
-  end_program();
+  {
+    // Past the last instruction the program ends, unless it jumps (a
+    // subroutine's return at the end of the program, for instance).
+    const Instruction& last = program_.back();
+    const bool jumps = (last.encoding == Encoding::SOPP && (last.op == 1 || last.op == 2)) ||
+                       (last.encoding == Encoding::SOP1 && (last.op == 32 || last.op == 33));
+    if (!jumps) end_program();
+  }
   blocks.back().second = std::move(p_);
   p_ = dxbc::Program();
   dxbc::Program body;
@@ -2303,22 +3624,32 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
     *error = "an attribute is read both with and without interpolation";
     return false;
   }
-  dxbc::Program program(stage_ == Stage::Compute  ? dxbc::ProgramType::Compute
+  dxbc::Program program(computeish()              ? dxbc::ProgramType::Compute
                         : stage_ == Stage::Vertex ? dxbc::ProgramType::Vertex
                                                   : dxbc::ProgramType::Pixel);
   std::vector<dxbc::SignatureElement> inputs, outputs;
   program.dcl_global_flags(1);  // refactoring allowed
   program.dcl_constant_buffer(0, kTranslatedSpace, kSystemVectors, true);
   program.dcl_uav_raw_range(0, 0, kRegionTableSize - 1, kTranslatedSpace);
-  static const dxbc::ResourceDimension kSlotDimension[6] = {dxbc::kTexture2D, dxbc::kTexture2DArray,
-                                                             dxbc::kTexture3D, dxbc::kTextureCube,
-                                                             dxbc::kTexture1D, dxbc::kTexture1DArray};
+  if (code_data_) {
+    std::vector<uint32_t> words((code_bytes_ + 3) / 4, 0);
+    std::memcpy(words.data(), code_ + code_first_, code_bytes_);
+    program.dcl_immediate_constant_buffer(words);
+  }
+  static const dxbc::ResourceDimension kSlotDimension[kImageSlots] = {
+      dxbc::kTexture2D, dxbc::kTexture2DArray, dxbc::kTexture3D, dxbc::kTextureCube,
+      dxbc::kTexture1D, dxbc::kTexture1DArray, dxbc::kTexture2DMS};
   if (samplers_used_) program.dcl_sampler_range(0, kTextureSpace);
-  for (uint32_t slot = 0; slot < 6; ++slot) {
+  for (uint32_t slot = 0; slot < kImageSlots; ++slot) {
     if (textures_used_ & (1u << slot)) program.dcl_texture_range(10 + slot, kSlotDimension[slot], kTextureSpace + slot);
     if (uavs_used_ & (1u << slot)) program.dcl_typed_uav_range(2 + slot, kSlotDimension[slot], kTextureSpace + slot);
+    if (integer_uavs_used_ & (1u << slot)) {
+      program.dcl_typed_uav_range(30 + slot, kSlotDimension[slot], kIntegerImageSpace + slot, true,
+                                  ordered_uavs_);
+    }
   }
-  if (stage_ == Stage::Compute) {
+  if (stage_ == Stage::Ngg) program.dcl_uav_raw_range(1, 0, 0, kNggSpace);
+  if (computeish()) {
     program.dcl_input(dxbc::kThreadGroupId, 0x7);
     program.dcl_input(dxbc::kThreadIdInGroup, 0x7);
     program.dcl_input(dxbc::kThreadIdInGroupFlattened, 0);
@@ -2330,9 +3661,21 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
     program.dcl_output_siv(0, 0xF, dxbc::kPosition);
     outputs.push_back({"SV_Position", 0, dxbc::kPosition, dxbc::kFloat32, 0, 0xF, 0});
     for (uint32_t n = 0; n < 32; ++n) {
-      if (!(iface_.params & (1u << n))) continue;
+      if (!(iface_.params & (1u << n)) || !outputs_register(n + 1)) continue;
       program.dcl_output(n + 1, 0xF);
       outputs.push_back({"TEXCOORD", n, dxbc::kUndefined, dxbc::kFloat32, n + 1, 0xF, 0});
+    }
+    for (uint32_t n = 0; consumer_ && n < 32; ++n) {
+      if (!((consumer_->half_params & iface_.params) & (1u << n))) continue;
+      const uint32_t reg = half_param_register(consumer_->params, consumer_->half_params, n);
+      if (reg + 1 >= 32) {
+        *error = "too many attributes for the host's outputs";
+        return false;
+      }
+      for (uint32_t j = 0; j < 2; ++j) {
+        program.dcl_output(reg + j, 0xF);
+        outputs.push_back({"HALFPARAM", 2 * n + j, dxbc::kUndefined, dxbc::kFloat32, reg + j, 0xF, 0});
+      }
     }
   } else {
     if (quad_) {
@@ -2345,6 +3688,22 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       const bool flat = (iface_.flat_params & (1u << n)) != 0;
       program.dcl_input_ps(n + 1, 0xF, flat ? dxbc::kConstant : dxbc::kLinear);
       inputs.push_back({"TEXCOORD", n, dxbc::kUndefined, dxbc::kFloat32, n + 1, 0xF, 0xF});
+    }
+    if ((iface_.params & ~scan_params_) != 0 && iface_.half_params) {
+      *error = "attributes read whole beyond those the scan found";
+      return false;
+    }
+    for (uint32_t n = 0; n < 32; ++n) {
+      if (!(iface_.half_params & (1u << n))) continue;
+      const uint32_t reg = half_param_register(scan_params_, iface_.half_params, n);
+      if (reg + 1 >= 32) {
+        *error = "too many attributes for the host's inputs";
+        return false;
+      }
+      for (uint32_t j = 0; j < 2; ++j) {
+        program.dcl_input_ps(reg + j, 0xF, dxbc::kLinear);
+        inputs.push_back({"HALFPARAM", 2 * n + j, dxbc::kUndefined, dxbc::kFloat32, reg + j, 0xF, 0xF});
+      }
     }
     for (uint32_t t = 0; t < 8; ++t) {
       if (!(iface_.targets & (1u << t))) continue;
@@ -2359,7 +3718,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   bool any_output = false;
   for (uint8_t mask : written_) any_output = any_output || mask != 0;
   program.dcl_temps(any_output ? kOutputBase + 4 * kOutputRegisters : kVgprBase + vgprs_);
-  if (stage_ == Stage::Compute) {
+  if (computeish()) {
     // Group shared memory: the program's (up to the host's 32 KiB, less the
     // exchange area) and the exchange area (two buffers of 8 bytes a thread).
     const uint32_t exchange = exchange_ ? 2 * 8 * info_.threads[0] * info_.threads[1] * info_.threads[2] : 0;
@@ -2391,7 +3750,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   for (uint32_t i = 0; i < info_.user_sgprs && i < 16; ++i) {
     init(i, dxbc::cb(0, kSystemUserVector + i / 4, i % 4));
   }
-  if (stage_ == Stage::Compute) {
+  if (computeish()) {
     uint32_t next_sgpr = info_.user_sgprs;
     for (uint32_t axis = 0; axis < 3; ++axis) {
       if (info_.tgid_enabled[axis]) init(next_sgpr++, dxbc::input(dxbc::kThreadGroupId, axis));
@@ -2407,7 +3766,11 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       program.emit(dx::kIshl, {D(reg), R(reg), I(6)});
       program.emit(dx::kOr, {D(reg), R(reg), I(waves & 0x3F)});
     }
-    for (uint32_t axis = 0; axis < 3; ++axis) init(kVgprBase + axis, dxbc::input(dxbc::kThreadIdInGroup, axis));
+    if (stage_ == Stage::Ngg) {
+      ngg_prologue(program);
+    } else {
+      for (uint32_t axis = 0; axis < 3; ++axis) init(kVgprBase + axis, dxbc::input(dxbc::kThreadIdInGroup, axis));
+    }
     program.emit(dx::kAnd, {D(kLaneR), dxbc::input(dxbc::kThreadIdInGroupFlattened, 0), I(info_.wave_size - 1)});
   } else {
     init(kLaneR, I(0));
@@ -2438,7 +3801,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
     program.emit(dx::kEndloop, {});
   }
   epilogue(program);
-  *out = program.container(inputs, outputs);
+  *out = program.container(inputs, outputs, features_);
   return true;
 }
 
@@ -2469,12 +3832,103 @@ bool native_graphics_stage(const uint8_t* code, size_t size, GraphicsStage* stag
   return true;
 }
 
+bool native_ngg_program(const uint8_t* code, size_t size) {
+  rdna::Instruction inst;
+  for (uint32_t pc = 0; rdna::decode(code, size, pc, &inst); pc += 4 * inst.words) {
+    if (inst.encoding == Encoding::EXP && inst.target == 20) return true;  // a primitive export
+    if (inst.encoding == Encoding::SOPP && inst.op == 31) break;           // s_code_end
+  }
+  return false;
+}
+
+bool translate_ngg(const uint8_t* code, size_t size, std::vector<uint8_t>* dxbc, ShaderInterface* link, NggInfo* info,
+                   std::string* error) {
+  Translator translator(code, size, Translator::NggTag{});
+  if (!translator.run(dxbc, error)) return false;
+  if (link) *link = translator.link();
+  if (info) *info = translator.ngg();
+  return true;
+}
+
+uint32_t half_param_register(uint32_t params, uint32_t half_params, uint32_t n) {
+  uint32_t top = 0;
+  for (uint32_t i = 0; i < 32; ++i) {
+    if (params & (1u << i)) top = i + 1;
+  }
+  uint32_t rank = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    if (half_params & (1u << i)) ++rank;
+  }
+  return top + 1 + 2 * rank;
+}
+
+std::vector<uint8_t> ngg_vertex_program(uint32_t stride, uint32_t params, uint32_t half_params) {
+  dxbc::Program program(dxbc::ProgramType::Vertex);
+  std::vector<dxbc::SignatureElement> inputs, outputs;
+  program.dcl_global_flags(1);
+  program.dcl_resource_raw_range(0, 0, 0, kNggSpace);
+  program.dcl_input_sgv(0, 1, dxbc::kVertexId);
+  inputs.push_back({"SV_VertexID", 0, dxbc::kVertexId, dxbc::kUint32, 0, 1, 1});
+  program.dcl_output_siv(0, 0xF, dxbc::kPosition);
+  outputs.push_back({"SV_Position", 0, dxbc::kPosition, dxbc::kFloat32, 0, 0xF, 0});
+  for (uint32_t n = 0; n < 32; ++n) {
+    if (!(params & (1u << n))) continue;
+    program.dcl_output(n + 1, 0xF);
+    outputs.push_back({"TEXCOORD", n, dxbc::kUndefined, dxbc::kFloat32, n + 1, 0xF, 0});
+  }
+  for (uint32_t n = 0; n < 32; ++n) {
+    if (!(half_params & (1u << n))) continue;
+    const uint32_t reg = half_param_register(params, half_params, n);
+    for (uint32_t j = 0; j < 2; ++j) {
+      program.dcl_output(reg + j, 0xF);
+      outputs.push_back({"HALFPARAM", 2 * n + j, dxbc::kUndefined, dxbc::kFloat32, reg + j, 0xF, 0});
+    }
+  }
+  program.dcl_temps(3);
+  // r0.x: the record's address; r1: a loaded vector; r2.x: an address.
+  program.emit(dx::kUmad, {dxbc::temp_dst(0), dxbc::input_register(0, 0), I(stride), I(0)});
+  auto copy_vector = [&](uint32_t offset, uint32_t out) {
+    program.emit(dx::kIadd, {dxbc::temp_dst(2), dxbc::temp(0), I(offset)});
+    program.emit(dx::kLdRaw, {dxbc::temp_dst_mask(1, 0xF), dxbc::temp(2), dxbc::srv_xyzw(0, 0)});
+    program.emit(dx::kMov, {dxbc::output_register(out, 0xF), dxbc::temp_xyzw(1)});
+  };
+  copy_vector(0, 0);
+  for (uint32_t n = 0; n < 32; ++n) {
+    if (params & (1u << n)) copy_vector(16 * (1 + n), n + 1);
+  }
+  // Half attributes: each channel's two halves as floats.
+  for (uint32_t n = 0; n < 32; ++n) {
+    if (!(half_params & (1u << n))) continue;
+    const uint32_t reg = half_param_register(params, half_params, n);
+    program.emit(dx::kIadd, {dxbc::temp_dst(2), dxbc::temp(0), I(16 * (1 + n))});
+    program.emit(dx::kLdRaw, {dxbc::temp_dst_mask(1, 0xF), dxbc::temp(2), dxbc::srv_xyzw(0, 0)});
+    for (uint32_t c = 0; c < 4; ++c) {
+      const uint32_t out = reg + (c >> 1), component = (c & 1) * 2;
+      program.emit(dx::kF16tof32, {dxbc::output_register(out, 1u << component), dxbc::temp(1, c)});
+      program.emit(dx::kUshr, {dxbc::temp_dst(2), dxbc::temp(1, c), I(16)});
+      program.emit(dx::kF16tof32, {dxbc::output_register(out, 1u << (component + 1)), dxbc::temp(2)});
+    }
+  }
+  program.emit(dx::kRet, {});
+  return program.container(inputs, outputs);
+}
+
 bool translate_graphics(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,
-                        ShaderInterface* link, std::string* error) {
+                        ShaderInterface* link, std::string* error, const ShaderInterface* consumer) {
   Translator translator(code, size, stage);
+  if (stage == GraphicsStage::Vertex) translator.set_consumer(consumer);
   if (!translator.run(dxbc, error)) return false;
   if (link) *link = translator.link();
   return true;
 }
 
+}  // namespace holy::d3d12
+
+namespace holy::d3d12 {
+const char* dxbc_build();
+const char* rdna_build();
+
+std::string translator_build() {
+  return std::string(__DATE__ " " __TIME__) + "/" + dxbc_build() + "/" + rdna_build();
+}
 }  // namespace holy::d3d12

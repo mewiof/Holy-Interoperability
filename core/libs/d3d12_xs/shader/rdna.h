@@ -45,6 +45,7 @@ struct Instruction {
   uint32_t literal = 0;
   int32_t imm = 0;       // SOPK/SOPP immediate, SMEM/MUBUF/FLAT offsets
   uint32_t ext = 0;      // SDWA/DPP extension dword
+  uint8_t nsa[12] = {};  // MIMG non-sequential addresses 1-12 (address 0 is src[0])
   uint32_t raw[3] = {};  // the instruction words
   // VOP3 modifiers
   uint8_t abs = 0, neg = 0, omod = 0, opsel = 0;

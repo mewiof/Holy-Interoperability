@@ -210,7 +210,8 @@ D3D12_GPU_DESCRIPTOR_HANDLE write_region_views(Device* device, const DescriptorH
 }
 
 // The system constants of shader/translate.h, written into the ring.
-uint64_t write_system(Device* device, const Regions& regions, const uint32_t (&user)[16]) {
+uint64_t write_system(Device* device, const Regions& regions, const uint32_t (&user)[16],
+                      const NggPass* ngg = nullptr) {
   uint8_t* block = ring_alloc(kSystemVectors * 16);
   if (!block) return 0;
   auto* v = reinterpret_cast<uint32_t*>(block);
@@ -223,6 +224,12 @@ uint64_t write_system(Device* device, const Regions& regions, const uint32_t (&u
   }
   std::memcpy(&v[4 * kSystemUserVector], user, sizeof(user));
   v[4 * kSystemCountsVector] = regions.count;
+  if (ngg) {
+    v[4 * kSystemNggVector + 0] = ngg->index_offset;
+    v[4 * kSystemNggVector + 1] = ngg->groups;
+    v[4 * kSystemNggVector + 2] = ngg->first_vertex;
+    v[4 * kSystemNggVector + 3] = ngg->first_instance;
+  }
   return translate_gpu_va(device, reinterpret_cast<uint64_t>(block));
 }
 
@@ -307,7 +314,7 @@ const RootLayout* root_layout(const void* signature) {
   return found == layouts().end() ? nullptr : &found->second;
 }
 
-bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t start_instance) {
+bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t start_instance, const NggPass* ngg) {
   Device* device = list->device;
   if (!list->heaps[0] || list->heaps[0]->host_count <= kReservedViews) {
     LIB_LOG(lib::kError, "d3d12", "a translated draw without a bound shader-visible heap");
@@ -342,9 +349,12 @@ bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t 
   pack_root(list, list->graphics, user, 8, 16);
   report_overflow(regions);
   const D3D12_GPU_DESCRIPTOR_HANDLE views = write_region_views(device, list->heaps[0], regions);
-  const uint64_t system = write_system(device, regions, user);
+  const uint64_t system = write_system(device, regions, user, ngg);
   if (!system) return false;
-  bind_common(list, false, views, system);
+  // An NGG draw's compute pass reads the graphics bindings (it is the
+  // console's vertex stage) and writes the draw's records.
+  bind_common(list, ngg != nullptr, views, system);
+  if (ngg) list->host->SetComputeRootUnorderedAccessView(kRootNggOutput, ngg->records);
   return true;
 }
 

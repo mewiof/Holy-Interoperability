@@ -93,7 +93,14 @@ static_assert(offsetof(ViewAtAddress, address) == 40);
 void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_RESOURCE_DESC* resource,
                                                       const ViewAtAddress* view, SIZE_T dest) {
   if (!resource || !view) return;
-  if (static_cast<uint32_t>(resource->Dimension) > D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+  // A resource description has a known dimension and plausible sizes (titles
+  // pass other blocks too: not established).
+  const bool plausible = static_cast<uint32_t>(resource->Dimension) <= D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                         (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+                          (resource->Width <= 65536 && resource->Height <= 65536 && resource->MipLevels <= 17 &&
+                           resource->SampleDesc.Count >= 1 && resource->SampleDesc.Count <= 16 &&
+                           static_cast<uint32_t>(resource->Format) < 256));
+  if (!plausible) {
     const auto* words = reinterpret_cast<const uint32_t*>(resource);
     const auto* v = reinterpret_cast<const uint32_t*>(view);
     LIB_LOG(lib::kWarn, "d3d12",
@@ -245,7 +252,12 @@ void STDMETHODCALLTYPE create_render_target_view(Device* self, void* resource,
 
 void STDMETHODCALLTYPE create_depth_stencil_view(Device* self, void* resource,
                                                  const D3D12_DEPTH_STENCIL_VIEW_DESC* desc, SIZE_T dest) {
-  self->host->CreateDepthStencilView(host_resource(resource), desc, host_cpu_handle(dest));
+  D3D12_DEPTH_STENCIL_VIEW_DESC host{};
+  if (desc) {
+    host = *desc;
+    host.Format = desktop_format(desc->Format);
+  }
+  self->host->CreateDepthStencilView(host_resource(resource), desc ? &host : nullptr, host_cpu_handle(dest));
 }
 
 void STDMETHODCALLTYPE create_sampler(Device* self, const D3D12_SAMPLER_DESC* desc, SIZE_T dest) {

@@ -216,24 +216,49 @@ TEST(translated_graphics_stages_link) {
   EXPECT(!translate_compute(vs_code.data(), vs_code.size(), ComputeShaderInfo{}, &vs, &error));
 }
 
+TEST(vertex_programs_output_what_their_pixel_program_reads) {
+  // Vertex: exp param0 v0..v3; exp param1 v0..v3; exp pos0 v0..v3 done; s_endpgm.
+  const std::vector<uint8_t> vs_code =
+      words({0xF800020Fu, 0x03020100u, 0xF800021Fu, 0x03020100u, 0xF80008CFu, 0x03020100u, 0xBF810000u});
+  // A pixel program reading attribute 0 whole and attribute 1 as halves.
+  ShaderInterface consumer;
+  consumer.params = 1;
+  consumer.half_params = 2;
+  std::vector<uint8_t> vs;
+  ShaderInterface vs_link;
+  std::string error;
+  EXPECT(translate_graphics(vs_code.data(), vs_code.size(), GraphicsStage::Vertex, &vs, &vs_link, &error, &consumer));
+  EXPECT(error.empty());
+  EXPECT(vs_link.params == 3);  // what the program exports
+  const std::string text = disassemble(vs);
+  EXPECT(text.find("dcl_output o1.xyzw") != std::string::npos);  // TEXCOORD0
+  // Attribute 1's halves, after the whole attributes: HALFPARAM2 and 3 in o2 and o3.
+  EXPECT(text.find("HALFPARAM") != std::string::npos);
+  EXPECT(text.find("dcl_output o2.xyzw") != std::string::npos);
+  EXPECT(text.find("dcl_output o3.xyzw") != std::string::npos);
+  EXPECT(text.find("f16tof32") != std::string::npos);
+  EXPECT(half_param_register(consumer.params, consumer.half_params, 1) == 2);
+}
+
 TEST(untranslatable_code_is_reported) {
-  // v_mov_b32 with a DPP16 row_shr:1 operand (reads outside the quad), then
-  // s_endpgm: a pixel shader has no group shared memory to exchange through.
-  const std::vector<uint8_t> code = words({0x7E0202FAu, 0xFF011100u, 0xBF810000u});
+  // v_mov_b32 with a DPP16 row_bcast:15 operand (a control the hardware
+  // generation lacks), then s_endpgm, in each stage.
+  const std::vector<uint8_t> broadcast = words({0x7E0202FAu, 0xFF014200u, 0xBF810000u});
   std::vector<uint8_t> bytecode;
   ShaderInterface link;
   std::string error;
-  EXPECT(!translate_graphics(code.data(), code.size(), GraphicsStage::Pixel, &bytecode, &link, &error));
-  EXPECT(error.find("DPP control 0x111 in a pixel program") != std::string::npos);
+  EXPECT(!translate_graphics(broadcast.data(), broadcast.size(), GraphicsStage::Pixel, &bytecode, &link, &error));
+  EXPECT(error.find("DPP control 0x142 in a pixel program") != std::string::npos);
   EXPECT(error.find("0x0") != std::string::npos);
-  // A vertex program has no quads.
-  const std::vector<uint8_t> quad = words({0x7E0202FAu, 0xFF001B00u, 0xBF810000u});
-  EXPECT(!translate_graphics(quad.data(), quad.size(), GraphicsStage::Vertex, &bytecode, &link, &error));
-  EXPECT(error.find("cross-lane") != std::string::npos);
-  // A DPP control the hardware generation lacks (row_bcast:15) is reported.
-  const std::vector<uint8_t> broadcast = words({0x7E0202FAu, 0xFF014200u, 0xBF810000u});
+  EXPECT(!translate_graphics(broadcast.data(), broadcast.size(), GraphicsStage::Vertex, &bytecode, &link, &error));
+  EXPECT(error.find("DPP control 0x142 in a vertex program") != std::string::npos);
   EXPECT(!translate_compute(broadcast.data(), broadcast.size(), ComputeShaderInfo{}, &bytecode, &error));
   EXPECT(error.find("DPP control 0x142") != std::string::npos);
+  // Reads outside the quad translate (as lanes without a pixel), in pixel
+  // and vertex programs: v_mov_b32 with row_shr:1.
+  const std::vector<uint8_t> shifted = words({0x7E0202FAu, 0xFF011100u, 0xBF810000u});
+  EXPECT(translate_graphics(shifted.data(), shifted.size(), GraphicsStage::Pixel, &bytecode, &link, &error));
+  EXPECT(translate_graphics(shifted.data(), shifted.size(), GraphicsStage::Vertex, &bytecode, &link, &error));
 }
 
 TEST(cross_lane_operations_exchange_through_group_memory) {
@@ -302,6 +327,83 @@ TEST(typed_loads_gathers_and_half_class_tests_translate) {
   const std::vector<uint8_t> bad = words({0xEBC32000u, 0x80000004u, 0xBF810000u});
   EXPECT(!translate_compute(bad.data(), bad.size(), info, &bytecode, &error));
   EXPECT(error.find("typed buffer format 120") != std::string::npos);
+}
+
+TEST(image_data_of_16_bits_is_packed_in_halves) {
+  // image_sample_lz v[0:1], v[4:5], s[8:15], s[16:19] dmask:0xf dim:2D d16;
+  // image_store v[0:1], v[4:5], s[8:15] dmask:0xf dim:2D d16; s_endpgm.
+  const std::vector<uint8_t> code = words({0xF09C0F08u, 0x80820004u, 0xF0200F08u, 0x80020004u, 0xBF810000u});
+  ComputeShaderInfo info;
+  info.threads[0] = 64;
+  std::vector<uint8_t> bytecode;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &bytecode, &error));
+  EXPECT(error.empty());
+  const std::string text = disassemble(bytecode);
+  EXPECT(text.find("f32tof16") != std::string::npos);  // sampled values packed as halves
+  EXPECT(text.find("f16tof32") != std::string::npos);  // stored halves unpacked
+  EXPECT(text.find("store_uav_typed") != std::string::npos);
+}
+
+TEST(cube_multisampled_and_gradient_images_translate) {
+  // image_sample_d v[0:3], v[4:9], s[8:15], s[16:19] dmask:0xf dim:2D;
+  // image_sample_lz v[0:3], v[4:6], s[8:15], s[16:19] dmask:0xf dim:CUBE;
+  // image_load v[0:3], v[4:6], s[8:15] dmask:0xf dim:2D_MSAA;
+  // image_sample_lz v[0:3], v[4:5], s[8:15], s[16:19] dmask:0xf dim:2D unorm;
+  // image_gather4_l v[0:3], v[4:6], s[8:15], s[16:19] dmask:0x1 dim:2D; s_endpgm.
+  const std::vector<uint8_t> code =
+      words({0xF0880F08u, 0x00820004u, 0xF09C0F18u, 0x00820004u, 0xF0000F30u, 0x00020004u, 0xF09C1F08u,
+             0x00820004u, 0xF1100108u, 0x00820004u, 0xBF810000u});
+  ComputeShaderInfo info;
+  info.threads[0] = 64;
+  std::vector<uint8_t> bytecode;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &bytecode, &error));
+  EXPECT(error.empty());
+  const std::string text = disassemble(bytecode);
+  EXPECT(text.find("sample_d") != std::string::npos);
+  EXPECT(text.find("texturecube") != std::string::npos);
+  EXPECT(text.find("texture2dms") != std::string::npos);
+  EXPECT(text.find("ldms") != std::string::npos);
+  EXPECT(text.find("resinfo") != std::string::npos);  // unnormalised coordinates over the size
+  EXPECT(text.find("div ") != std::string::npos);
+  EXPECT(text.find("gather4") != std::string::npos);
+  // image_get_lod outside a pixel program is reported.
+  const std::vector<uint8_t> lod = words({0xF1800F08u, 0x00820004u, 0xBF810000u});
+  EXPECT(!translate_compute(lod.data(), lod.size(), info, &bytecode, &error));
+  EXPECT(error.find("image_get_lod") != std::string::npos);
+}
+
+TEST(image_atomics_use_integer_views) {
+  // image_atomic_umin v1, v[2:3], s[8:15] dmask:0x1 dim:2D glc;
+  // image_atomic_cmpswap v[4:5], v[2:3], s[8:15] dmask:0x3 dim:2D; s_endpgm.
+  const std::vector<uint8_t> code = words({0xF0542108u, 0x00020102u, 0xF0400308u, 0x00020402u, 0xBF810000u});
+  ComputeShaderInfo info;
+  info.threads[0] = 64;
+  std::vector<uint8_t> bytecode;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &bytecode, &error));
+  EXPECT(error.empty());
+  const std::string text = disassemble(bytecode);
+  EXPECT(text.find("imm_atomic_umin") != std::string::npos);
+  EXPECT(text.find("imm_atomic_cmp_exch") != std::string::npos);
+  EXPECT(text.find("(uint,uint,uint,uint)") != std::string::npos);  // an integer declaration
+}
+
+TEST(image_atomics_of_64_bits_read_combine_and_write) {
+  // image_atomic_umax v[8:9], v[4:5], s[32:39] dmask:0x3 dim:2D (as titles'
+  // pixel programs carry it); exp mrt0 off done; s_endpgm.
+  const std::vector<uint8_t> code = words({0xF05C1308u, 0x00080804u, 0xF8000800u, 0x00000000u, 0xBF810000u});
+  std::vector<uint8_t> bytecode;
+  ShaderInterface link;
+  std::string error;
+  EXPECT(translate_graphics(code.data(), code.size(), GraphicsStage::Pixel, &bytecode, &link, &error));
+  EXPECT(error.empty());
+  const std::string text = disassemble(bytecode);
+  EXPECT(text.find("ld_uav_typed") != std::string::npos);
+  EXPECT(text.find("store_uav_typed") != std::string::npos);
+  EXPECT(text.find("_rov") != std::string::npos);           // rasterizer-ordered: per pixel
+  EXPECT(text.find("Raster Ordered UAVs") != std::string::npos);  // declared in the features part
 }
 
 TEST(scalar_64_bit_field_mask_translates) {

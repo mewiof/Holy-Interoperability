@@ -12,5 +12,8 @@ HRESULT schedule_frame_event(uint32_t type, uint64_t offset_us, uint32_t flags);
 // Waits for the next occurrence of a scheduled frame event and returns a
 // frame pipeline token for it.
 HRESULT wait_frame_event(uint32_t type, uint32_t timeout_ms, uint64_t* token);
+// Sleeps until the next frame interval boundary (interval origin + n *
+// length) after now; returns at once when no interval is set.
+void wait_frame_boundary();
 
 }  // namespace holy::d3d12

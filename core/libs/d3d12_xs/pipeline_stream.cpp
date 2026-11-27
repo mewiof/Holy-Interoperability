@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cwchar>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -26,6 +27,7 @@
 #include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/d3d12_xs/shader_container.h"
 #include "core/libs/d3d12_xs/shader_dump.h"
+#include "core/libs/d3d12_xs/translation_cache.h"
 #include "core/libs/support.h"
 
 namespace holy::d3d12 {
@@ -177,6 +179,9 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
       std::memcpy(&bytecode, copy.data() + inner, sizeof(bytecode));
       if (type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
         dump_shader(bytecode.pShaderBytecode, bytecode.BytecodeLength, "pipeline");
+        LIB_LOG(lib::kError, "d3d12", "pipeline stream: native-only shader %016llx in subobject type %u",
+                static_cast<unsigned long long>(shader_hash(bytecode.pShaderBytecode, bytecode.BytecodeLength)),
+                static_cast<unsigned>(type));
         HolyUnimplementedFrom(kLibrary, "graphics pipeline with a native-only shader other than vertex and pixel",
                               caller);
         return E_NOTIMPL;
@@ -243,7 +248,7 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
                                               pipeline);
   LIB_LOG(lib::kDebug, "d3d12", "pipeline stream of %llu bytes (subobjects %s) -> 0x%08lX",
           static_cast<unsigned long long>(desc->SizeInBytes), summary.c_str(), static_cast<unsigned long>(hr));
-  if (FAILED(hr)) discard_host_caches_after_run();
+  if (FAILED(hr)) discard_host_caches_after_run(hr);
   return hr;
 }
 
@@ -345,18 +350,38 @@ std::map<const Wrapper*, HANDLE>& compiles() {
   return *map;
 }
 
+// Observed host behaviour: compiling several very large translated programs
+// at once makes the host driver refuse some with E_OUTOFMEMORY. Programs
+// above kHeavyProgram bytes compile one at a time, and a refusal for lack of
+// memory is retried once that way.
+constexpr size_t kHeavyProgram = 256 * 1024;
+std::mutex g_heavy_compile;
+
 void CALLBACK compile_pipeline(PTP_CALLBACK_INSTANCE, void* context) {
   auto* job = static_cast<Compile*>(context);
   ID3D12Device2* device2 = nullptr;
   ID3D12PipelineState* state = nullptr;
   HRESULT hr = job->device->host->QueryInterface(IID_PPV_ARGS(&device2));
   if (SUCCEEDED(hr)) {
+    size_t program_bytes = 0;
+    if (job->recipe->blobs) {
+      for (const auto& blob : *job->recipe->blobs) program_bytes += blob.size();
+    }
     const D3D12_PIPELINE_STATE_STREAM_DESC host_desc{job->recipe->stream.size(), job->recipe->stream.data()};
-    hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
+    if (program_bytes > kHeavyProgram) {
+      std::lock_guard<std::mutex> guard(g_heavy_compile);
+      hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
+    } else {
+      hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
+      if (hr == E_OUTOFMEMORY) {
+        std::lock_guard<std::mutex> guard(g_heavy_compile);
+        hr = device2->CreatePipelineState(&host_desc, IID_PPV_ARGS(&state));
+      }
+    }
     device2->Release();
   }
   if (FAILED(hr) || !state) {
-    discard_host_caches_after_run();
+    discard_host_caches_after_run(hr);
     LIB_LOG(lib::kError, "d3d12", "the host refused pipeline %p (0x%08lX)", static_cast<void*>(job->wrapper),
             static_cast<unsigned long>(hr));
   }
@@ -383,13 +408,17 @@ HRESULT create_from_recipe(Device* device, std::shared_ptr<Recipe> recipe, const
     recipes()[wrapper] = std::move(recipe);
   }
   static PTP_CALLBACK_ENVIRON environment = [] {
-    // A small pool: compiles must not take the processor from the title's
-    // own start-up work.
+    // A third of the host's processors: compiles must not take the
+    // processor from the title's own start-up work, but titles create
+    // pipelines by the thousand while loading.
     auto* env = new TP_CALLBACK_ENVIRON();
     InitializeThreadpoolEnvironment(env);
     PTP_POOL pool = CreateThreadpool(nullptr);
     if (!pool) return static_cast<PTP_CALLBACK_ENVIRON>(nullptr);
-    SetThreadpoolThreadMaximum(pool, 3);
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const DWORD threads = system.dwNumberOfProcessors / 3 > 3 ? system.dwNumberOfProcessors / 3 : 3;
+    SetThreadpoolThreadMaximum(pool, threads);
     SetThreadpoolThreadMinimum(pool, 1);
     SetThreadpoolCallbackPool(env, pool);
     return env;
@@ -529,14 +558,15 @@ ID3D12PipelineState* pipeline_host(const void* pipeline) {
 }
 
 bool translate_graphics_cached(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,
-                               ShaderInterface* link, std::string* error) {
+                               ShaderInterface* link, std::string* error, const ShaderInterface* consumer) {
   struct Entry {
     std::vector<uint8_t> dxbc;
     ShaderInterface link;
   };
   static std::mutex lock;
-  static auto* cache = new std::map<std::pair<uint64_t, int>, Entry>();
-  const auto key = std::make_pair(shader_hash(code, size), static_cast<int>(stage));
+  static auto* cache = new std::map<std::tuple<uint64_t, int, uint64_t>, Entry>();
+  const uint64_t reads = consumer ? (static_cast<uint64_t>(consumer->params) << 32 | consumer->half_params) : 0;
+  const auto key = std::make_tuple(shader_hash(code, size), static_cast<int>(stage), reads);
   {
     std::lock_guard<std::mutex> guard(lock);
     auto found = cache->find(key);
@@ -546,10 +576,14 @@ bool translate_graphics_cached(const uint8_t* code, size_t size, GraphicsStage s
       return true;
     }
   }
-  if (!translate_graphics(code, size, stage, dxbc, link, error)) return false;
+  const uint64_t disk_key = graphics_translation_key(code, size, stage, consumer).value();
+  if (!load_translation(disk_key, dxbc, link)) {
+    if (!translate_graphics(code, size, stage, dxbc, link, error, consumer)) return false;
+    store_translation(disk_key, *dxbc, link);
+  }
   if (HolyLogEnabled(lib::kDebug)) dump_shader(code, size, stage == GraphicsStage::Vertex ? "vertex" : "pixel");
   LIB_LOG(lib::kDebug, "d3d12", "native %s program %016llx -> host %016llx",
-          stage == GraphicsStage::Vertex ? "vertex" : "pixel", static_cast<unsigned long long>(key.first),
+          stage == GraphicsStage::Vertex ? "vertex" : "pixel", static_cast<unsigned long long>(std::get<0>(key)),
           static_cast<unsigned long long>(shader_hash(dxbc->data(), dxbc->size())));
   std::lock_guard<std::mutex> guard(lock);
   (*cache)[key] = Entry{*dxbc, *link};

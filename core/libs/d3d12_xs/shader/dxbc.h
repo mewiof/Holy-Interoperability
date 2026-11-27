@@ -17,7 +17,7 @@ namespace holy::d3d12::dxbc {
 
 enum Opcode : uint32_t {
   kAdd = 0, kAnd = 1, kBreak = 2, kBreakc = 3, kCase = 6, kDefault = 10, kDiv = 14, kElse = 18, kEndif = 21,
-  kLd = 45, kResinfo = 61, kGather4 = 109, kGather4C = 126, kGather4Po = 127, kGather4PoC = 128, kSample = 69, kSampleC = 70, kSampleCLz = 71, kSampleL = 72, kSampleB = 74,
+  kLd = 45, kLdMs = 46, kSampleD = 73, kLod = 108, kResinfo = 61, kGather4 = 109, kGather4C = 126, kGather4Po = 127, kGather4PoC = 128, kSample = 69, kSampleC = 70, kSampleCLz = 71, kSampleL = 72, kSampleB = 74,
   kLdUavTyped = 163, kStoreUavTyped = 164, kDclResource = 88, kDclSampler = 90, kDclUavTyped = 156,
   kEndloop = 22, kEndswitch = 23, kEq = 24, kExp = 25, kFrc = 26, kFtoi = 27, kFtou = 28, kGe = 29, kIadd = 30,
   kIf = 31, kIeq = 32, kIge = 33, kIlt = 34, kImad = 35, kImax = 36, kImin = 37, kImul = 38, kIne = 39,
@@ -47,7 +47,7 @@ inline constexpr uint32_t kSyncUavGlobal = 1u << 14;
 // Operand types.
 enum OperandType : uint32_t {
   kTemp = 0, kInput = 1, kOutput = 2, kImmediate32 = 4, kSampler = 6, kResource = 7, kConstantBuffer = 8,
-  kOutputDepth = 12, kNull = 13,
+  kImmediateConstantBuffer = 9, kOutputDepth = 12, kNull = 13,
   kUav = 30, kGroupShared = 31,
   kThreadId = 32, kThreadGroupId = 33, kThreadIdInGroup = 34, kThreadIdInGroupFlattened = 36,
 };
@@ -90,7 +90,15 @@ enum class ProgramType : uint32_t { Pixel = 0, Vertex = 1, Compute = 5 };
 Operand cb(uint32_t id, uint32_t reg, uint32_t component);
 Operand cb_indexed(uint32_t id, uint32_t temp_index, uint32_t reg, uint32_t component);
 
+// icb[temp.x].component: the immediate constant buffer indexed by a temp.
+Operand icb_indexed(uint32_t temp_index, uint32_t component);
+
 enum class Access { Load, Store, Atomic };
+
+// Shader feature bits of the SFI0 part (the desktop runtime's documented
+// D3D_SHADER_REQUIRES_* values).
+inline constexpr uint64_t kRequiresTypedUavLoadAdditionalFormats = 0x800;
+inline constexpr uint64_t kRequiresRovs = 0x1000;
 // Un[0][temp.x] (non-uniform) and gN.
 Operand uav_indexed(uint32_t id, uint32_t temp_index, Access access);
 Operand group_shared(uint32_t id, Access access);
@@ -104,13 +112,16 @@ Operand temp_xyzw(uint32_t index);
 // Tn[temp.x], Un[temp.x] (typed, .xyzw) and Sn[temp.x], all non-uniform.
 Operand texture_indexed(uint32_t id, uint32_t temp_index);
 Operand typed_uav_indexed(uint32_t id, uint32_t temp_index, bool store);
+// A typed UAV array element as the destination of an atomic operation.
+Operand typed_uav_atomic(uint32_t id, uint32_t temp_index);
 Operand sampler_indexed(uint32_t id, uint32_t temp_index);
 // Sn[temp.x].c: the sampler of a gather, selecting the gathered component.
 Operand sampler_indexed_select(uint32_t id, uint32_t temp_index, uint32_t component);
 
 // Resource dimensions of declarations.
 enum ResourceDimension : uint32_t {
-  kTexture1D = 2, kTexture2D = 3, kTexture3D = 5, kTextureCube = 6, kTexture1DArray = 7, kTexture2DArray = 8,
+  kTexture1D = 2, kTexture2D = 3, kTexture2DMS = 4, kTexture3D = 5, kTextureCube = 6, kTexture1DArray = 7,
+  kTexture2DArray = 8,
 };
 
 class Program {
@@ -122,12 +133,18 @@ class Program {
   void emit(uint32_t opcode) { emit(opcode, {}); }
 
   void dcl_global_flags(uint32_t flags);
+  // An immediate constant buffer of `data` (padded to whole vectors; at most
+  // 4096 vectors).
+  void dcl_immediate_constant_buffer(const std::vector<uint32_t>& data);
   void dcl_constant_buffer(uint32_t id, uint32_t space, uint32_t vectors, bool dynamic);
   void dcl_uav_raw_range(uint32_t id, uint32_t first, uint32_t last, uint32_t space);
   void dcl_resource_raw_range(uint32_t id, uint32_t first, uint32_t last, uint32_t space);
   // Float textures and typed UAVs of a dimension, and samplers, at [0, unbounded).
   void dcl_texture_range(uint32_t id, ResourceDimension dimension, uint32_t space);
-  void dcl_typed_uav_range(uint32_t id, ResourceDimension dimension, uint32_t space);
+  // `ordered`: a rasterizer-ordered view (pixel shaders: one pixel's accesses
+  // happen in primitive order, one at a time).
+  void dcl_typed_uav_range(uint32_t id, ResourceDimension dimension, uint32_t space, bool integer = false,
+                           bool ordered = false);
   void dcl_sampler_range(uint32_t id, uint32_t space);
   void dcl_input(OperandType type, uint32_t mask);
   void dcl_temps(uint32_t count);
@@ -144,9 +161,10 @@ class Program {
   void append(const Program& other);
   size_t size() const { return tokens_.size(); }
 
-  // The complete DXBC container (input/output signatures, SHEX, checksum).
+  // The complete DXBC container (input/output signatures, SHEX, checksum;
+  // with `features`, the SFI0 part declaring them: kRequires* bits).
   std::vector<uint8_t> container(const std::vector<SignatureElement>& inputs = {},
-                                 const std::vector<SignatureElement>& outputs = {}) const;
+                                 const std::vector<SignatureElement>& outputs = {}, uint64_t features = 0) const;
 
  private:
   std::vector<uint32_t> tokens_;

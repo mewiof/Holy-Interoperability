@@ -73,6 +73,13 @@ Operand cb_indexed(uint32_t id, uint32_t temp_index, uint32_t reg, uint32_t comp
   out.insert(out.end(), rel.begin(), rel.end());
   return out;
 }
+Operand icb_indexed(uint32_t temp_index, uint32_t component) {
+  // One index: immediate plus relative (representation 3), immediate 0.
+  Operand out{select(component) | type_bits(kImmediateConstantBuffer) | dimension(1) | (3u << 22), 0};
+  const Operand rel = temp(temp_index);
+  out.insert(out.end(), rel.begin(), rel.end());
+  return out;
+}
 Operand uav_indexed(uint32_t id, uint32_t temp_index, Access access) {
   uint32_t components = access == Access::Load ? swizzle_xxxx() : access == Access::Store ? mask_x() : 0u;
   Operand out{kExtended | components | type_bits(kUav) | dimension(2) | relative_index(1),
@@ -114,6 +121,7 @@ Operand typed_uav_indexed(uint32_t id, uint32_t temp_index, bool store) {
   return indexed(kUav, store ? (kFourComponents | kMaskMode | (0xFu << 4)) : (swizzle_xxxx() | (0xE4u << 4)), id,
                  temp_index);
 }
+Operand typed_uav_atomic(uint32_t id, uint32_t temp_index) { return indexed(kUav, 0, id, temp_index); }
 Operand sampler_indexed(uint32_t id, uint32_t temp_index) { return indexed(kSampler, 0, id, temp_index); }
 Operand sampler_indexed_select(uint32_t id, uint32_t temp_index, uint32_t component) {
   return indexed(kSampler, select(component), id, temp_index);
@@ -134,6 +142,16 @@ void Program::emit(uint32_t opcode, const std::vector<Operand>& operands, uint32
 }
 
 void Program::dcl_global_flags(uint32_t flags) { tokens_.push_back(kDclGlobalFlags | (flags << 11) | (1u << 24)); }
+
+void Program::dcl_immediate_constant_buffer(const std::vector<uint32_t>& data) {
+  // Custom-data block (opcode 53, class 3): the length token counts the whole
+  // block, both header tokens included.
+  std::vector<uint32_t> padded = data;
+  while (padded.size() % 4) padded.push_back(0);
+  tokens_.push_back(53u | (3u << 11));
+  tokens_.push_back(static_cast<uint32_t>(padded.size() + 2));
+  tokens_.insert(tokens_.end(), padded.begin(), padded.end());
+}
 
 void Program::dcl_constant_buffer(uint32_t id, uint32_t space, uint32_t vectors, bool dynamic) {
   tokens_.push_back(kDclConstantBuffer | (dynamic ? 1u << 11 : 0u) | (7u << 24));
@@ -159,10 +177,14 @@ void Program::dcl_texture_range(uint32_t id, ResourceDimension dimension, uint32
                                  0xFFFFFFFFu, 0x5555u, space});
 }
 
-void Program::dcl_typed_uav_range(uint32_t id, ResourceDimension dimension, uint32_t space) {
-  tokens_.push_back(kDclUavTyped | (static_cast<uint32_t>(dimension) << 11) | (7u << 24));
+void Program::dcl_typed_uav_range(uint32_t id, ResourceDimension dimension, uint32_t space, bool integer,
+                                  bool ordered) {
+  // Opcode flag 0x20000: rasterizer-ordered access.
+  tokens_.push_back(kDclUavTyped | (static_cast<uint32_t>(dimension) << 11) | (ordered ? 0x20000u : 0u) |
+                    (7u << 24));
+  // Return type per component: 5 float, 4 unsigned integer.
   tokens_.insert(tokens_.end(), {swizzle_xxxx() | (0xE4u << 4) | type_bits(kUav) | dimension_bits(3), id, 0u,
-                                 0xFFFFFFFFu, 0x5555u, space});
+                                 0xFFFFFFFFu, integer ? 0x4444u : 0x5555u, space});
 }
 
 void Program::dcl_sampler_range(uint32_t id, uint32_t space) {
@@ -242,25 +264,33 @@ std::vector<uint8_t> signature_chunk(const std::vector<SignatureElement>& elemen
 }  // namespace
 
 std::vector<uint8_t> Program::container(const std::vector<SignatureElement>& inputs,
-                                        const std::vector<SignatureElement>& outputs) const {
+                                        const std::vector<SignatureElement>& outputs, uint64_t features) const {
   std::vector<uint32_t> shex = tokens_;
   shex[1] = static_cast<uint32_t>(shex.size());
-  // Chunks: ISGN, OSGN, SHEX.
+  // Chunks: ISGN, OSGN, SHEX, and SFI0 (8 bytes of feature bits) if any.
   const std::vector<uint8_t> in_chunk = signature_chunk(inputs), out_chunk = signature_chunk(outputs);
-  const uint32_t header = 32 + 3 * 4;
+  const uint32_t chunks = features ? 4 : 3;
+  const uint32_t header = 32 + chunks * 4;
   const uint32_t isgn = header, osgn = isgn + 8 + static_cast<uint32_t>(in_chunk.size());
   const uint32_t code = osgn + 8 + static_cast<uint32_t>(out_chunk.size());
-  const uint32_t total = code + 8 + static_cast<uint32_t>(shex.size() * 4);
+  const uint32_t sfi0 = code + 8 + static_cast<uint32_t>(shex.size() * 4);
+  const uint32_t total = sfi0 + (features ? 16 : 0);
   std::vector<uint8_t> out(total);
   auto put = [&](uint32_t at, const void* data, size_t size) { std::memcpy(out.data() + at, data, size); };
   auto put32 = [&](uint32_t at, uint32_t value) { put(at, &value, 4); };
   put(0, "DXBC", 4);
   put32(20, 1);
   put32(24, total);
-  put32(28, 3);
+  put32(28, chunks);
   put32(32, isgn);
   put32(36, osgn);
   put32(40, code);
+  if (features) {
+    put32(44, sfi0);
+    put(sfi0, "SFI0", 4);
+    put32(sfi0 + 4, 8);
+    put(sfi0 + 8, &features, 8);
+  }
   put(isgn, "ISGN", 4);
   put32(isgn + 4, static_cast<uint32_t>(in_chunk.size()));
   put(isgn + 8, in_chunk.data(), in_chunk.size());
@@ -275,3 +305,7 @@ std::vector<uint8_t> Program::container(const std::vector<SignatureElement>& inp
 }
 
 }  // namespace holy::d3d12::dxbc
+
+namespace holy::d3d12 {
+const char* dxbc_build() { return __DATE__ " " __TIME__; }
+}  // namespace holy::d3d12

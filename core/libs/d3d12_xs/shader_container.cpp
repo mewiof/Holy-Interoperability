@@ -320,7 +320,9 @@ bool native_compute_registers(const uint32_t* registers, size_t size, ComputeSha
   }
   info->threads[0] = registers[3] & 0xFFFF;
   info->threads[1] = registers[3] >> 16;
-  info->threads[2] = registers[4];
+  // Observed: dword 4's high half is not always zero (0x10 seen); the depth is
+  // the low half.
+  info->threads[2] = registers[4] & 0xFFFF;
   if (!info->threads[0] || !info->threads[1] || !info->threads[2] ||
       info->threads[0] * info->threads[1] * info->threads[2] > 1024) {
     *error = "thread group shape";

@@ -18,6 +18,8 @@ holy_add_system_library(holy_lib_d3d12_xs
     frame_pacing.h
     gpu_memory.cpp
     gpu_memory.h
+    ngg.cpp
+    ngg.h
     pipeline_stream.cpp
     pipeline_stream.h
     present.cpp
@@ -38,6 +40,8 @@ holy_add_system_library(holy_lib_d3d12_xs
     shader_dump.h
     texture_upload.cpp
     texture_upload.h
+    translation_cache.cpp
+    translation_cache.h
     views.cpp
     views.h
     queue.cpp

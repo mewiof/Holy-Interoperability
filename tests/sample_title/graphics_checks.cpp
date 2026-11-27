@@ -99,6 +99,28 @@ void test_graphics() {
     for (int i = 0; value && *value != 12 && i < 2000; ++i) Sleep(1);
     check(value && *value == 12, "a fence's value address follows the GPU's signals");
   }
+  if (queue && list && allocator && fence) {
+    // Titles reset a list and submit it again while its previous submission may
+    // still be executing, and set the console's rectangle-list topology (17).
+    // Work after either must run (the host device is not removed).
+    auto* marker = static_cast<volatile uint32_t*>(
+        VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    const auto address = reinterpret_cast<uint64_t>(marker);
+    void* lists[] = {list};
+    bool recorded = true;
+    for (uint32_t round = 0; round < 2 && marker; ++round) {
+      recorded = recorded && call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
+      call<void>(list, 20, static_cast<D3D12_PRIMITIVE_TOPOLOGY>(17));
+      call<void>(list, 71, address + 4 * round, 0x1234u + round, UINT64{0}, 0u);
+      recorded = recorded && call<HRESULT>(list, 9) == S_OK;
+      call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+    }
+    const auto* value = call<const volatile uint64_t*>(fence, 12);
+    check(call<HRESULT>(queue, 16, fence, UINT64{20}) == S_OK, "a queue signals a fence after resubmitted work");
+    for (int i = 0; value && *value < 20 && i < 5000; ++i) Sleep(1);
+    check(recorded && marker && value && *value == 20 && marker[0] == 0x1234 && marker[1] == 0x1235,
+          "a list reset and submitted again, with a rectangle-list topology set, runs on the GPU");
+  }
   // Frame tokens: the current frame's without waiting (flag 2), and a wait for
   // a frame no present has reached yet returns at once.
   UINT64 token = 0;

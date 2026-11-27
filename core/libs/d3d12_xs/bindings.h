@@ -39,7 +39,18 @@ struct RootBinding {
 
 // Binds what a translated pipeline reads (user SGPRs, region table, images
 // and samplers) for the next draw or dispatch. False (logged) if it cannot.
-bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t start_instance);
+// An NGG draw's compute pass (shader/translate.h, translate_ngg): what it
+// adds to the graphics bindings, which it binds on the compute side.
+struct NggPass {
+  uint32_t index_offset = 0;  // byte offset of the primitive records
+  uint32_t groups = 0;        // vertex groups per instance
+  uint32_t first_vertex = 0;
+  uint32_t first_instance = 0;
+  uint64_t records = 0;  // host GPU address of the records
+};
+
+bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t start_instance,
+                              const NggPass* ngg = nullptr);
 bool bind_translated_compute(CommandList* list);
 
 // Re-binds the title's root signature and arguments on the host list after a

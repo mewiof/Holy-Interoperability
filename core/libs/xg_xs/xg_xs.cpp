@@ -17,6 +17,7 @@
 // mean linear).
 //
 // Present state: work in progress; unbound computer slots report themselves.
+#include <d3d12.h>
 #include <windows.h>
 
 #include <atomic>
@@ -91,12 +92,51 @@ HRESULT STDMETHODCALLTYPE copy_into_subresource(Computer* self, void* destinatio
   return S_OK;
 }
 
+// Observed: slot 10 takes (tile count*, packed mip info*, tile shape*,
+// subresource tiling count* (in/out, 16 seen), first subresource tiling,
+// subresource tilings*): the arguments of the desktop
+// ID3D12Device::GetResourceTiling after its resource (titles stream tiled
+// textures in 64 KiB pages). Host: the answer the host gives for a reserved
+// resource of the same description (console flag bits dropped).
+ID3D12Device* tiling_device() {
+  static ID3D12Device* device = [] {
+    ID3D12Device* made = nullptr;
+    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&made)))) made = nullptr;
+    return made;
+  }();
+  return device;
+}
+
+HRESULT STDMETHODCALLTYPE get_resource_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INFO* packed,
+                                              D3D12_TILE_SHAPE* shape, UINT* count, UINT first,
+                                              D3D12_SUBRESOURCE_TILING* tilings) {
+  ID3D12Device* device = tiling_device();
+  if (!device) return E_FAIL;
+  D3D12_RESOURCE_DESC desc;
+  std::memcpy(&desc, self->desc, sizeof(desc));
+  desc.Alignment = 0;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+  desc.Flags &= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+  ID3D12Resource* reserved = nullptr;
+  const HRESULT hr = device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&reserved));
+  if (FAILED(hr)) {
+    LIB_LOG(holy::lib::kError, "xg", "resource tiling of format %u %llux%u: the host refuses a reserved resource (0x%08lX)",
+            desc.Format, static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<unsigned long>(hr));
+    return hr;
+  }
+  device->GetResourceTiling(reserved, tiles, packed, shape, count, first, tilings);
+  reserved->Release();
+  return S_OK;
+}
+
 const auto kComputerVtable = [] {
   auto table = holy::lib::make_reporting_vtable<kComputerSlots>();
   table[0] = reinterpret_cast<void*>(&computer_query_interface);
   table[1] = reinterpret_cast<void*>(&computer_add_ref);
   table[2] = reinterpret_cast<void*>(&computer_release);
   table[8] = reinterpret_cast<void*>(&copy_into_subresource);
+  table[10] = reinterpret_cast<void*>(&get_resource_tiling);
   return table;
 }();
 

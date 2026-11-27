@@ -35,4 +35,7 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
 ID3D12Resource* placed_texture(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address,
                                UINT initial_layout, const D3D12_CLEAR_VALUE* clear);
 
+// How many host textures there are and their bytes in title memory, for the log.
+void host_texture_totals(uint64_t* count, uint64_t* bytes);
+
 }  // namespace holy::d3d12

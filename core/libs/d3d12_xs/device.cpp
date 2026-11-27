@@ -31,10 +31,12 @@
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/frame_pacing.h"
 #include "core/libs/d3d12_xs/present.h"
+#include "core/libs/d3d12_xs/ngg.h"
 #include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/d3d12_xs/shader_container.h"
 #include "core/libs/d3d12_xs/shader_dump.h"
+#include "core/libs/d3d12_xs/translation_cache.h"
 #include "core/libs/d3d12_xs/views.h"
 #include "core/libs/support.h"
 
@@ -252,6 +254,25 @@ HRESULT STDMETHODCALLTYPE wait_frame_event_x(Device*, UINT type, UINT timeout_ms
   LIB_LOG(lib::kError, "d3d12", "WaitFrameEventX type %u flags 0x%x", type, flags);
   HolyUnimplementedFrom(kLibrary, "WaitFrameEventX(event type)", _ReturnAddress());
   return E_NOTIMPL;
+}
+
+// Observed: slot 81 takes (frame token, type mask, count*, records*) and
+// returns an HRESULT: titles pass the token of a frame a few frames back, the
+// mask 0x11100, a count of 6 and room for six 56-byte records, and use the
+// records only when the call succeeds with a nonzero count: each record's
+// dword 0 is one bit of the mask (0x1000 and 0x10000 are looked at), byte 8 a
+// flag and bytes 0x18-0x1F a 64-bit value. Assumed: statistics of a frame's
+// events (timing). Host: no such statistics are kept; the call succeeds with
+// no records.
+HRESULT STDMETHODCALLTYPE get_frame_statistics_x(Device*, UINT64 token, UINT mask, UINT* count, void* records) {
+  if (!count) return E_POINTER;
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true)) {
+    LIB_LOG(lib::kInfo, "d3d12", "frame statistics asked for (token %llu, mask 0x%x, %u records at %p): none kept",
+            static_cast<unsigned long long>(token), mask, *count, records);
+  }
+  *count = 0;
+  return S_OK;
 }
 
 // Slot 15: GetDescriptorHandleIncrementSize(type), as on the desktop.
@@ -660,11 +681,12 @@ ID3D12RootSignature* translated_root_signature(Device* device) {
   std::lock_guard<std::mutex> guard(lock);
   if (device->translated_root) return device->translated_root;
   D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, kRegionTableSize, 0, kTranslatedSpace, 0};
-  constexpr uint32_t kSlots = 6;  // ImageSlot values 0-5
-  D3D12_DESCRIPTOR_RANGE images[2 * kSlots]{};
+  constexpr uint32_t kSlots = kImageSlots;
+  D3D12_DESCRIPTOR_RANGE images[3 * kSlots]{};
   for (uint32_t slot = 0; slot < kSlots; ++slot) {
     images[slot] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, kTextureSpace + slot, 0};
     images[kSlots + slot] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UINT_MAX, 0, kTextureSpace + slot, 0};
+    images[2 * kSlots + slot] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UINT_MAX, 0, kIntegerImageSpace + slot, 0};
   }
   D3D12_DESCRIPTOR_RANGE samplers{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, kTextureSpace, 0};
   D3D12_ROOT_PARAMETER parameters[kTranslatedRootParameters]{};
@@ -673,9 +695,13 @@ ID3D12RootSignature* translated_root_signature(Device* device) {
   parameters[kRootSystem].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   parameters[kRootSystem].Descriptor = {0, kTranslatedSpace};
   parameters[kRootImages].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  parameters[kRootImages].DescriptorTable = {2 * kSlots, images};
+  parameters[kRootImages].DescriptorTable = {3 * kSlots, images};
   parameters[kRootSamplers].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   parameters[kRootSamplers].DescriptorTable = {1, &samplers};
+  parameters[kRootNggOutput].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameters[kRootNggOutput].Descriptor = {0, kNggSpace};
+  parameters[kRootNggInput].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+  parameters[kRootNggInput].Descriptor = {0, kNggSpace};
   const D3D12_ROOT_SIGNATURE_DESC desc{kTranslatedRootParameters, parameters, 0, nullptr,
                                        D3D12_ROOT_SIGNATURE_FLAG_NONE};
   ID3DBlob* blob = nullptr;
@@ -703,7 +729,11 @@ HRESULT create_compute_pipeline_from_code(Device* self, const uint8_t* code, siz
   std::vector<uint8_t> bytecode;
   std::string error;
   const ULONGLONG start = GetTickCount64();
-  if (!translate_compute(code, size, info, &bytecode, &error)) {
+  const uint64_t key = compute_translation_key(code, size, info).value();
+  const bool cached = load_translation(key, &bytecode, nullptr);
+  const bool translated = cached || translate_compute(code, size, info, &bytecode, &error);
+  if (translated && !cached) store_translation(key, bytecode, nullptr);
+  if (!translated) {
     dump_shader(dump, dump_size, "compute");
     LIB_LOG(lib::kError, "d3d12", "native compute shader not translatable: %s", error.c_str());
     HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), caller);
@@ -711,32 +741,24 @@ HRESULT create_compute_pipeline_from_code(Device* self, const uint8_t* code, siz
   }
   ID3D12RootSignature* root = translated_root_signature(self);
   if (!root) return E_FAIL;
-  D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
-  host.pRootSignature = root;
-  host.CS = {bytecode.data(), bytecode.size()};
-  ID3D12PipelineState* state = nullptr;
-  const HRESULT hr = self->host->CreateComputePipelineState(&host, IID_PPV_ARGS(&state));
-  PROCESS_MEMORY_COUNTERS_EX memory{};
-  GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory));
-  LIB_LOG(lib::kInfo, "d3d12",
-          "translated compute shader (%u threads, %zu bytes of host bytecode) in %llu ms: 0x%08lX (process commit %llu MiB)",
-          info.threads[0] * info.threads[1] * info.threads[2], bytecode.size(),
-          static_cast<unsigned long long>(GetTickCount64() - start), static_cast<unsigned long>(hr),
-          static_cast<unsigned long long>(memory.PrivateUsage >> 20));
-  if (FAILED(hr)) {
-    dump_shader(dump, dump_size, "compute");
-    return hr;
-  }
-  Wrapper* wrapper = wrap(state, &kPipelineInfo, kPipelineVtable.data());
-  wrapper->flags = kTranslatedPipeline;
+  LIB_LOG(cached ? lib::kDebug : lib::kInfo, "d3d12", "%s compute shader (%u threads, %zu bytes of host bytecode) in %llu ms",
+          cached ? "cached" : "translated", info.threads[0] * info.threads[1] * info.threads[2], bytecode.size(),
+          static_cast<unsigned long long>(GetTickCount64() - start));
   if (HolyLogEnabled(lib::kDebug)) {
     LIB_LOG(lib::kDebug, "d3d12", "native compute program %016llx -> host %016llx",
             static_cast<unsigned long long>(shader_hash(dump, dump_size)),
             static_cast<unsigned long long>(shader_hash(bytecode.data(), bytecode.size())));
-    label_pipeline(wrapper, {bytecode});
   }
-  *pipeline = wrapper;
-  return S_OK;
+  // The host compile runs in the background, as for graphics pipelines
+  // (pipeline_stream.cpp): titles create pipelines by the thousand.
+  std::vector<std::vector<uint8_t>> blobs;
+  blobs.push_back(std::move(bytecode));
+  std::vector<uint8_t> stream;
+  stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, sizeof(root));
+  const D3D12_SHADER_BYTECODE cs{blobs[0].data(), blobs[0].size()};
+  stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &cs, sizeof(cs));
+  return create_recorded_pipeline(self, std::move(stream), std::move(blobs), true, &kPipelineInfo,
+                                  kPipelineVtable.data(), pipeline);
 }
 
 // A compute pipeline from the native code inside a shader container.
@@ -791,7 +813,7 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline_state_x(Device* self, const D3
   ID3D12PipelineState* state = nullptr;
   const HRESULT hr = self->host->CreateComputePipelineState(&host, IID_PPV_ARGS(&state));
   if (FAILED(hr)) {
-    discard_host_caches_after_run();
+    discard_host_caches_after_run(hr);
     remember_host_refusal(hash);
     // Console containers keep a desktop-compatible DXIL program next to the
     // native code; when the host refuses the former, the latter is used.
@@ -831,6 +853,8 @@ HRESULT STDMETHODCALLTYPE create_native_pipeline(Device* self, const uint64_t* d
   ComputeShaderInfo info;
   std::string error;
   if (!native_compute_registers(registers, desc[2], &info, &error)) {
+    LIB_LOG(lib::kError, "d3d12", "native compute registers (%s): %08x %08x %08x %08x %08x %08x %08x", error.c_str(),
+            registers[0], registers[1], registers[2], registers[3], registers[4], registers[5], registers[6]);
     dump_shader(code, code_size, "native compute");
     HolyUnimplementedFrom(kLibrary, ("compute pipeline from native code: " + error).c_str(), _ReturnAddress());
     return E_NOTIMPL;
@@ -927,19 +951,73 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   std::vector<uint8_t> vs, ps;
   ShaderInterface vs_link, ps_link;
   auto translate = [&](const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* bytecode,
-                       ShaderInterface* link) {
-    if (translate_graphics_cached(code, size, stage, bytecode, link, &error)) return true;
+                       ShaderInterface* link, const ShaderInterface* consumer = nullptr) {
+    if (translate_graphics_cached(code, size, stage, bytecode, link, &error, consumer)) return true;
     dump_shader(code, size, "native graphics");
-    LIB_LOG(lib::kError, "d3d12", "native %s shader not translatable: %s",
-            stage == GraphicsStage::Vertex ? "vertex" : "pixel", error.c_str());
+    LIB_LOG(lib::kError, "d3d12", "native %s shader %016llx not translatable: %s",
+            stage == GraphicsStage::Vertex ? "vertex" : "pixel", static_cast<unsigned long long>(shader_hash(code, size)),
+            error.c_str());
     HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), _ReturnAddress());
     return false;
   };
-  if (!translate(native.vertex_code, native.vertex_size, GraphicsStage::Vertex, &vs, &vs_link)) return E_NOTIMPL;
+  // NGG vertex programs run as a compute pass before a draw of its records
+  // (ngg.h).
+  const bool ngg = native_ngg_program(native.vertex_code, native.vertex_size);
+  NggInfo ngg_info;
+  void* ngg_compute = nullptr;
+  if (ngg) {
+    std::vector<uint8_t> cs;
+    const uint64_t key = ngg_translation_key(native.vertex_code, native.vertex_size).value();
+    if (!load_translation(key, &cs, &vs_link, &ngg_info)) {
+      if (!translate_ngg(native.vertex_code, native.vertex_size, &cs, &vs_link, &ngg_info, &error)) {
+        dump_shader(native.vertex_code, native.vertex_size, "native graphics");
+        LIB_LOG(lib::kError, "d3d12", "native NGG program %016llx not translatable: %s",
+                static_cast<unsigned long long>(shader_hash(native.vertex_code, native.vertex_size)), error.c_str());
+        HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), _ReturnAddress());
+        return E_NOTIMPL;
+      }
+      store_translation(key, cs, &vs_link, &ngg_info);
+    }
+    ID3D12RootSignature* root = translated_root_signature(self);
+    if (!root) return E_FAIL;
+    std::vector<std::vector<uint8_t>> blobs;
+    blobs.push_back(std::move(cs));
+    std::vector<uint8_t> stream;
+    stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, sizeof(root));
+    const D3D12_SHADER_BYTECODE program{blobs[0].data(), blobs[0].size()};
+    stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &program, sizeof(program));
+    const HRESULT made = create_recorded_pipeline(self, std::move(stream), std::move(blobs), true, &kPipelineInfo,
+                                                  kPipelineVtable.data(), &ngg_compute);
+    if (FAILED(made)) return made;
+    // Written once the pixel program's attributes are known.
+  } else if (!translate(native.vertex_code, native.vertex_size, GraphicsStage::Vertex, &vs, &vs_link)) {
+    return E_NOTIMPL;
+  }
   if (native.pixel_code && !translate(native.pixel_code, native.pixel_size, GraphicsStage::Pixel, &ps, &ps_link)) {
     return E_NOTIMPL;
   }
-  if ((ps_link.params & ~vs_link.params) != 0) {
+  if (ngg) {
+    // The records hold what the NGG program exports; the vertex program
+    // passes on what the pixel program reads, half attributes unpacked.
+    if (((ps_link.params | ps_link.half_params) & ~vs_link.params) != 0) {
+      LIB_LOG(lib::kError, "d3d12", "pixel shader reads attributes 0x%x/0x%x the NGG program does not export (0x%x)",
+              ps_link.params, ps_link.half_params, vs_link.params);
+      return E_INVALIDARG;
+    }
+    vs = ngg_vertex_program(ngg_info.stride, ps.empty() ? 0 : ps_link.params, ps.empty() ? 0 : ps_link.half_params);
+  } else if (ps_link.half_params) {
+    // The vertex program again, outputting what the pixel program reads (its
+    // half attributes unpacked).
+    if ((ps_link.half_params & ~vs_link.params) != 0) {
+      LIB_LOG(lib::kError, "d3d12", "pixel shader reads half attributes 0x%x the vertex shader does not export (0x%x)",
+              ps_link.half_params, vs_link.params);
+      return E_INVALIDARG;
+    }
+    if (!translate(native.vertex_code, native.vertex_size, GraphicsStage::Vertex, &vs, &vs_link, &ps_link)) {
+      return E_NOTIMPL;
+    }
+  }
+  if (!ngg && (ps_link.params & ~vs_link.params) != 0) {
     LIB_LOG(lib::kError, "d3d12", "pixel shader reads attributes 0x%x the vertex shader does not export (0x%x)",
             ps_link.params, vs_link.params);
     return E_INVALIDARG;
@@ -977,7 +1055,8 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   host.RasterizerState.FrontCounterClockwise = ((mode >> 2) & 1) == 0;
   host.RasterizerState.DepthClipEnable = TRUE;
   host.DepthStencilState.DepthEnable = FALSE;
-  host.PrimitiveTopologyType = static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(native.topology_type);
+  host.PrimitiveTopologyType = ngg ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+                                  : static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(native.topology_type);
   host.NumRenderTargets = native.render_targets;
   for (uint32_t i = 0; i < native.render_targets; ++i) host.RTVFormats[i] = static_cast<DXGI_FORMAT>(native.formats[i]);
   host.SampleDesc = {native.sample_count, 0};
@@ -1004,6 +1083,7 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   if (!ps.empty()) blobs.push_back(std::move(ps));
   const HRESULT hr = create_recorded_pipeline(self, std::move(stream), std::move(blobs), true, &kPipelineInfo,
                                               kPipelineVtable.data(), out);
+  if (SUCCEEDED(hr) && ngg) register_ngg_pipeline(*out, ngg_compute, ngg_info);
   LIB_LOG(lib::kDebug, "d3d12",
           "native graphics pipeline: target format %u, blend 0x%08X, mode 0x%08X, vertex exports 0x%x, pixel reads "
           "0x%x -> 0x%08lX",
@@ -1042,6 +1122,7 @@ const auto kDeviceVtable = [] {
   table[27] = reinterpret_cast<void*>(&create_committed_resource_desktop);
   table[36] = reinterpret_cast<void*>(&create_fence);
   table[80] = reinterpret_cast<void*>(&wait_frame_event_x);
+  table[81] = reinterpret_cast<void*>(&get_frame_statistics_x);
   table[39] = reinterpret_cast<void*>(&create_query_heap);
   table[41] = reinterpret_cast<void*>(&create_command_signature);
   table[48] = reinterpret_cast<void*>(&create_queue_x);

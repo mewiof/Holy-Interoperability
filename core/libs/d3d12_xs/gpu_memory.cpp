@@ -60,6 +60,15 @@ bool finish_record(Device* device, ID3D12Heap* heap, HeapRecord* record) {
   return true;
 }
 
+ID3D12Device13* device13(Device* device) {
+  static ID3D12Device13* cached = [&] {
+    ID3D12Device13* d13 = nullptr;
+    device->host->QueryInterface(IID_PPV_ARGS(&d13));
+    return d13;
+  }();
+  return cached;
+}
+
 ID3D12Device3* device3(Device* device) {
   static ID3D12Device3* cached = [&] {
     ID3D12Device3* d3 = nullptr;
@@ -91,6 +100,8 @@ bool locate(Device* device, uint64_t title_va, Backing* out) {
       }
       HeapRecord record;
       if (!finish_record(device, heap, &record)) return false;
+      LIB_LOG(lib::kDebug, "d3d12", "GPU heap over physical pages: section %p, 0x%llx bytes, host %p", section,
+              static_cast<unsigned long long>(record.size), reinterpret_cast<void*>(record.host_gpu_va));
       found = section_heaps().emplace(section, record).first;
     }
     *out = Backing{found->second.heap, offset, run, found->second.host_gpu_va + offset, found->second.whole, 0,
@@ -108,25 +119,68 @@ bool locate(Device* device, uint64_t title_va, Backing* out) {
   }
   MEMORY_BASIC_INFORMATION info;
   if (!VirtualQuery(reinterpret_cast<void*>(title_va), &info, sizeof(info)) || info.State == MEM_FREE) return false;
-  const auto base = reinterpret_cast<uintptr_t>(info.AllocationBase);
-  uintptr_t end = base;
+  const auto allocation = reinterpret_cast<uintptr_t>(info.AllocationBase);
+  uintptr_t allocation_end = allocation;
   for (;;) {
     MEMORY_BASIC_INFORMATION part;
-    if (!VirtualQuery(reinterpret_cast<void*>(end), &part, sizeof(part))) break;
-    if (reinterpret_cast<uintptr_t>(part.AllocationBase) != base || part.State == MEM_FREE) break;
-    end = reinterpret_cast<uintptr_t>(part.BaseAddress) + part.RegionSize;
+    if (!VirtualQuery(reinterpret_cast<void*>(allocation_end), &part, sizeof(part))) break;
+    if (reinterpret_cast<uintptr_t>(part.AllocationBase) != allocation || part.State == MEM_FREE) break;
+    allocation_end = reinterpret_cast<uintptr_t>(part.BaseAddress) + part.RegionSize;
   }
-  if (!HolyEnsureCommitted(reinterpret_cast<void*>(base), end - base)) return false;
+  if (!HolyEnsureCommitted(reinterpret_cast<void*>(allocation), allocation_end - allocation)) return false;
+  // Observed: titles commit stretches of a reservation and leave reserved
+  // gaps between them. The host opens heaps from an address only over a
+  // wholly committed allocation, or (ID3D12Device13) over a committed stretch
+  // given with its size: such allocations get a heap per stretch.
+  uintptr_t base = allocation, end = allocation_end;
+  bool whole = true;
+  for (uintptr_t at = allocation; at < allocation_end;) {
+    MEMORY_BASIC_INFORMATION part;
+    if (!VirtualQuery(reinterpret_cast<void*>(at), &part, sizeof(part))) break;
+    if (part.State != MEM_COMMIT) whole = false;
+    at = reinterpret_cast<uintptr_t>(part.BaseAddress) + part.RegionSize;
+  }
   ID3D12Heap* heap = nullptr;
-  const HRESULT hr = d3->OpenExistingHeapFromAddress(reinterpret_cast<void*>(base), IID_PPV_ARGS(&heap));
+  HRESULT hr = E_FAIL;
+  if (whole) {
+    hr = d3->OpenExistingHeapFromAddress(reinterpret_cast<void*>(base), IID_PPV_ARGS(&heap));
+  } else {
+    if (!VirtualQuery(reinterpret_cast<void*>(title_va), &info, sizeof(info)) || info.State != MEM_COMMIT) return false;
+    base = reinterpret_cast<uintptr_t>(info.BaseAddress);
+    end = base + info.RegionSize;
+    for (;;) {  // committed regions before and after (protection changes split regions)
+      MEMORY_BASIC_INFORMATION part;
+      if (base <= allocation || !VirtualQuery(reinterpret_cast<void*>(base - 1), &part, sizeof(part)) ||
+          part.State != MEM_COMMIT) {
+        break;
+      }
+      base = reinterpret_cast<uintptr_t>(part.BaseAddress);
+    }
+    for (;;) {
+      MEMORY_BASIC_INFORMATION part;
+      if (end >= allocation_end || !VirtualQuery(reinterpret_cast<void*>(end), &part, sizeof(part)) ||
+          part.State != MEM_COMMIT) {
+        break;
+      }
+      end = reinterpret_cast<uintptr_t>(part.BaseAddress) + part.RegionSize;
+    }
+    if (ID3D12Device13* d13 = device13(device)) {
+      hr = d13->OpenExistingHeapFromAddress1(reinterpret_cast<void*>(base), end - base, IID_PPV_ARGS(&heap));
+    }
+  }
   if (FAILED(hr)) {
-    LIB_LOG(lib::kError, "d3d12", "cannot open a GPU heap over title memory at %p (0x%08lX)",
-            reinterpret_cast<void*>(base), static_cast<unsigned long>(hr));
+    LIB_LOG(lib::kError, "d3d12", "cannot open a GPU heap over title memory at %p, 0x%llx bytes%s (0x%08lX)",
+            reinterpret_cast<void*>(base), static_cast<unsigned long long>(end - base),
+            whole ? "" : " (a committed stretch)", static_cast<unsigned long>(hr));
     return false;
   }
   HeapRecord record;
   if (!finish_record(device, heap, &record)) return false;
-  region_heaps().emplace(base + record.size, std::make_pair(base, record));
+  LIB_LOG(lib::kDebug, "d3d12", "GPU heap over title memory at %p: 0x%llx bytes (allocation %p + 0x%llx), host %p",
+          reinterpret_cast<void*>(base), static_cast<unsigned long long>(record.size),
+          reinterpret_cast<void*>(allocation), static_cast<unsigned long long>(allocation_end - allocation),
+          reinterpret_cast<void*>(record.host_gpu_va));
+  region_heaps()[base + record.size] = std::make_pair(base, record);
   const uint64_t at = title_va - base;
   *out = Backing{heap, at, record.size - at, record.host_gpu_va + at, record.whole, base, record.size};
   return true;

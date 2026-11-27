@@ -26,10 +26,10 @@ HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream,
                                  std::vector<std::vector<uint8_t>> blobs, bool translated,
                                  const lib::VtableInfo* info, void* const* vtable, void** pipeline);
 
-// translate_graphics with results kept by code hash: titles create many
-// pipelines from the same programs.
+// translate_graphics with results kept by code hash (and consumer): titles
+// create many pipelines from the same programs.
 bool translate_graphics_cached(const uint8_t* code, size_t size, GraphicsStage stage, std::vector<uint8_t>* dxbc,
-                               ShaderInterface* link, std::string* error);
+                               ShaderInterface* link, std::string* error, const ShaderInterface* consumer = nullptr);
 
 // With debug logging: a label naming a pipeline's host programs by hash
 // (translations log which native program each host program comes from), set

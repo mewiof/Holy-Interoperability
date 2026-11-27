@@ -4,6 +4,7 @@
 #include <dxgi1_4.h>
 #include <windows.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -43,9 +44,13 @@ struct Gpu {
   ID3D12Resource* readback = nullptr;
   ID3D12Resource* constants = nullptr;
   ID3D12Resource* memory = nullptr;  // "title memory": region 0, view u0
+  ID3D12Resource* cube = nullptr;    // make_cube
+  ID3D12DescriptorHeap* samplers = nullptr;
   UINT64 fence_value = 0;
 
   ~Gpu() {
+    release(samplers);
+    release(cube);
     release(memory);
     release(constants);
     release(readback);
@@ -95,14 +100,27 @@ struct Gpu {
     range.NumDescriptors = kRegionTableSize;
     range.RegisterSpace = kTranslatedSpace;
     range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
-    D3D12_ROOT_PARAMETER1 parameters[2] = {};
+    // Cube images (make_cube) and samplers as translated programs index them.
+    D3D12_DESCRIPTOR_RANGE1 images{};
+    images.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    images.NumDescriptors = UINT_MAX;
+    images.RegisterSpace = kTextureSpace + kImageCube;
+    images.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+    D3D12_DESCRIPTOR_RANGE1 sampler_range = images;
+    sampler_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+    sampler_range.RegisterSpace = kTextureSpace;
+    D3D12_ROOT_PARAMETER1 parameters[4] = {};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[0].Descriptor.RegisterSpace = kTranslatedSpace;
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[1].DescriptorTable = {1, &range};
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[2].DescriptorTable = {1, &images};
+    parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[3].DescriptorTable = {1, &sampler_range};
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
     desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    desc.Desc_1_1.NumParameters = 2;
+    desc.Desc_1_1.NumParameters = 4;
     desc.Desc_1_1.pParameters = parameters;
     ID3DBlob* blob = nullptr;
     if (FAILED(D3D12SerializeVersionedRootSignature(&desc, &blob, nullptr))) return false;
@@ -113,7 +131,8 @@ struct Gpu {
   }
 
   bool make_resources() {
-    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRegionTableSize,
+    // The region views, then one image (make_cube).
+    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRegionTableSize + 1,
                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(device->CreateDescriptorHeap(&heap, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&views)))) {
       return false;
@@ -203,6 +222,92 @@ struct Gpu {
     return true;
   }
 
+  // A 2 x 2 R32_FLOAT cube whose texel (u, v) of face f holds 4f + 2v + u,
+  // as cube image 0, and a point sampler as sampler 0.
+  bool make_cube() {
+    const D3D12_HEAP_PROPERTIES local = heap_of(D3D12_HEAP_TYPE_DEFAULT);
+    const D3D12_HEAP_PROPERTIES upload = heap_of(D3D12_HEAP_TYPE_UPLOAD);
+    D3D12_RESOURCE_DESC texture{};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = texture.Height = 2;
+    texture.DepthOrArraySize = 6;
+    texture.MipLevels = 1;
+    texture.Format = DXGI_FORMAT_R32_FLOAT;
+    texture.SampleDesc.Count = 1;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = 6 * 512;  // a face every 512 bytes, rows 256 bytes apart
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* staging = nullptr;
+    if (FAILED(device->CreateCommittedResource(&local, D3D12_HEAP_FLAG_NONE, &texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                                               nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void**>(&cube))) ||
+        FAILED(device->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &buffer,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, __uuidof(ID3D12Resource),
+                                               reinterpret_cast<void**>(&staging)))) {
+      return false;
+    }
+    uint8_t* mapped = nullptr;
+    if (FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) {
+      staging->Release();
+      return false;
+    }
+    for (uint32_t f = 0; f < 6; ++f) {
+      for (uint32_t v = 0; v < 2; ++v) {
+        for (uint32_t u = 0; u < 2; ++u) {
+          const float value = static_cast<float>(4 * f + 2 * v + u);
+          std::memcpy(mapped + 512 * f + 256 * v + 4 * u, &value, 4);
+        }
+      }
+    }
+    staging->Unmap(0, nullptr);
+    allocator->Reset();
+    list->Reset(allocator, nullptr);
+    for (UINT f = 0; f < 6; ++f) {
+      D3D12_TEXTURE_COPY_LOCATION from{};
+      from.pResource = staging;
+      from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      from.PlacedFootprint.Offset = 512ull * f;
+      from.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, 2, 2, 1, 256};
+      D3D12_TEXTURE_COPY_LOCATION to{};
+      to.pResource = cube;
+      to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      to.SubresourceIndex = f;
+      list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    }
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Transition = {cube, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE};
+    list->ResourceBarrier(1, &barrier);
+    list->Close();
+    ID3D12CommandList* lists[] = {list};
+    queue->ExecuteCommandLists(1, lists);
+    queue->Signal(fence, ++fence_value);
+    fence->SetEventOnCompletion(fence_value, nullptr);
+    staging->Release();
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = DXGI_FORMAT_R32_FLOAT;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.TextureCube.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE at = views->GetCPUDescriptorHandleForHeapStart();
+    at.ptr += static_cast<SIZE_T>(kRegionTableSize) *
+              device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    device->CreateShaderResourceView(cube, &view, at);
+    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(device->CreateDescriptorHeap(&heap, __uuidof(ID3D12DescriptorHeap),
+                                            reinterpret_cast<void**>(&samplers)))) {
+      return false;
+    }
+    D3D12_SAMPLER_DESC point{};
+    point.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    point.AddressU = point.AddressV = point.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    point.MaxLOD = D3D12_FLOAT32_MAX;
+    device->CreateSampler(&point, samplers->GetCPUDescriptorHandleForHeapStart());
+    return true;
+  }
+
   // Fills title memory with `contents`, runs one group of `cs` and returns
   // title memory afterwards (64 words); empty when the host refuses.
   std::vector<uint32_t> dispatch(const std::vector<uint8_t>& cs, const std::vector<uint32_t>& contents) {
@@ -227,9 +332,17 @@ struct Gpu {
     barrier.Transition = {memory, 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
     list->ResourceBarrier(1, &barrier);
     list->SetComputeRootSignature(root);
-    list->SetDescriptorHeaps(1, &views);
+    ID3D12DescriptorHeap* heaps[] = {views, samplers};
+    list->SetDescriptorHeaps(samplers ? 2 : 1, heaps);
     list->SetComputeRootConstantBufferView(0, constants->GetGPUVirtualAddress());
     list->SetComputeRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
+    if (samplers) {
+      D3D12_GPU_DESCRIPTOR_HANDLE images = views->GetGPUDescriptorHandleForHeapStart();
+      images.ptr += static_cast<UINT64>(kRegionTableSize) *
+                    device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      list->SetComputeRootDescriptorTable(2, images);
+      list->SetComputeRootDescriptorTable(3, samplers->GetGPUDescriptorHandleForHeapStart());
+    }
     list->Dispatch(1, 1, 1);
     barrier.Transition = {memory, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON};
     list->ResourceBarrier(1, &barrier);
@@ -465,4 +578,549 @@ TEST(format_loads_take_format_and_selects_from_the_descriptor) {
     EXPECT(as_float(halves[16]) == -1.0f && as_float(halves[17]) == 1.0f);
     EXPECT(halves[18] == 0 && as_float(halves[19]) == 1.0f);
   }
+}
+
+TEST(scalar_bit_counts_and_searches_run_as_documented) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // s[4:5] = 0x100, s[12:13] = 0xFFFFFFFF_FFFF0000, s[16:17] = 0;
+  // s6 = s_ff1_i32_b64 s[4:5]; s7 = s_flbit_i32 0x40000000;
+  // s8 = s_flbit_i32_b64 s[4:5]; s9 = s_bcnt0_i32_b64 s[4:5];
+  // s10 = s_flbit_i32_i64 s[12:13]; s[14:15] = s_brev_b64 s[4:5];
+  // s_bitset1_b64 s[16:17], 40; v0-v7 = s6-s10, s14, s15, s17;
+  // buffer_store_dwordx4 v[0:3] offset:64; v[4:7] offset:80; s_endpgm.
+  const std::vector<uint32_t> program = {
+      0xBE8403FFu, 0x00000100u, 0xBE850380u, 0xBE8C03FFu, 0xFFFF0000u, 0xBE8D03C1u, 0xBE900380u, 0xBE910380u,
+      0xBE861404u, 0xBE8717FFu, 0x40000000u, 0xBE881604u, 0xBE890E04u, 0xBE8A180Cu, 0xBE8E0C04u, 0xBE901EA8u,
+      0x7E000206u, 0x7E020207u, 0x7E040208u, 0x7E060209u, 0x7E08020Au, 0x7E0A020Eu, 0x7E0C020Fu, 0x7E0E0211u,
+      0xE0780040u, 0x80000000u, 0xE0780050u, 0x80000400u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  const std::vector<uint32_t> after = gpu.dispatch(cs, {0});
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[16] == 8);           // lowest set bit of 0x100
+  EXPECT(after[17] == 1);           // one leading bit equal to the sign of 0x40000000
+  EXPECT(after[18] == 55);          // leading zeros of the 64-bit 0x100
+  EXPECT(after[19] == 63);          // zero bits of the 64-bit 0x100
+  EXPECT(after[20] == 48);          // leading sign bits of 0xFFFFFFFF_FFFF0000
+  EXPECT(after[21] == 0 && after[22] == 0x00800000u);  // 0x100 reversed over 64 bits
+  EXPECT(after[23] == 0x100);       // bit 40 set: bit 8 of the high half
+}
+
+TEST(sub_dword_destination_selects_place_and_extend) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v0 = 0x12345678; v1 = v2 = 0xAAAABBBB; v3 = 0xF0;
+  // v_mov_b32_sdwa v1, v0 dst_sel:WORD_1 dst_unused:PRESERVE src0_sel:BYTE_0;
+  // v_mov_b32_sdwa v2, v3 dst_sel:BYTE_1 dst_unused:SEXT src0_sel:BYTE_0;
+  // buffer_store_dwordx4 v[0:3] offset:64; s_endpgm.
+  const std::vector<uint32_t> program = {0x7E0002FFu, 0x12345678u, 0x7E0202FFu, 0xAAAABBBBu, 0x7E0402FFu, 0xAAAABBBBu,
+                                         0x7E0602FFu, 0x000000F0u, 0x7E0202F9u, 0x00001500u, 0x7E0402F9u, 0x00000903u,
+                                         0xE0780040u, 0x80000000u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  const std::vector<uint32_t> after = gpu.dispatch(cs, {0});
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[16] == 0x12345678u);
+  EXPECT(after[17] == 0x0078BBBBu);  // byte 0 of v0 into the high word, the low word kept
+  EXPECT(after[18] == 0xFFFFF000u);  // 0xF0 sign-extended above byte 1, zero below
+  EXPECT(after[19] == 0x000000F0u);
+}
+
+TEST(local_data_share_pairs_bytes_and_shorts) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v0 = 0; v1 = 0x11223344; v2 = 0x55667788; v3 = 0xAABBCCDD; v4 = 0x99;
+  // ds_write2st64_b64 v0, v[1:2], v[3:4] offset1:1; ds_read2st64_b64 v[8:11], v0 offset1:1;
+  // ds_write_b8 v0, v4 offset:1; ds_read_i8 v12, v0 offset:1; ds_read_u16 v13, v0 offset:2;
+  // buffer_store_dwordx4 v[8:11] offset:64; buffer_store_dwordx2 v[12:13] offset:80; s_endpgm.
+  const std::vector<uint32_t> program = {
+      0x7E000280u, 0x7E0202FFu, 0x11223344u, 0x7E0402FFu, 0x55667788u, 0x7E0602FFu, 0xAABBCCDDu, 0x7E0802FFu,
+      0x00000099u, 0xD93C0100u, 0x00030100u, 0xD9E00100u, 0x08000000u, 0xD8780001u, 0x00000400u, 0xD8E40001u,
+      0x0C000000u, 0xD8F00002u, 0x0D000000u, 0xE0780040u, 0x80000800u, 0xE0740050u, 0x80000C00u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  const std::vector<uint32_t> after = gpu.dispatch(cs, {0});
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[16] == 0x11223344u && after[17] == 0x55667788u);  // first pair at 0
+  EXPECT(after[18] == 0xAABBCCDDu && after[19] == 0x00000099u);  // second pair 64 elements on
+  EXPECT(after[20] == 0xFFFFFF99u);  // the stored byte, sign-extended
+  EXPECT(after[21] == 0x00001122u);  // the untouched high half of the word
+}
+
+TEST(program_data_is_read_through_the_program_counter) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // s_getpc_b64 s[4:5]; s_add_u32 s4, s4, 0x34 (the table after s_code_end);
+  // s_movk_i32 s6, 0x100; s_mov_b32 s7, 0; v_mov_b32 v0, 0;
+  // buffer_load_dword v1, off, s[4:7] offset:4; buffer_load_dword v2, off, s[4:7] offset:6;
+  // buffer_store_dwordx2 v[1:2], off, s[0:3] offset:64; s_endpgm; s_code_end; table.
+  const std::vector<uint32_t> program = {0xBE841F00u, 0x8004FF04u, 0x00000034u, 0xB0060100u, 0xBE870380u,
+                                         0x7E000280u, 0xE0300004u, 0x80010100u, 0xE0300006u, 0x80010200u,
+                                         0xE0740040u, 0x80000100u, 0xBF810000u, 0xBF9F0000u, 0x11223344u,
+                                         0x55667788u, 0x99AABBCCu};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  const std::vector<uint32_t> after = gpu.dispatch(cs, {0});
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[16] == 0x55667788u);  // the table's second dword
+  EXPECT(after[17] == 0xBBCC5566u);  // an unaligned dword across the second and third
+}
+
+TEST(packed_half_operations_select_halves) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v0 = {1.5, -2.0} (halves), v1 = {2.0, 0.5}, v5 = 0.25;
+  // v_pk_mul_f16 v2, v0, v1; v_pk_add_u16 v3, v0, v1 op_sel:[1,0] op_sel_hi:[0,1];
+  // v_dot2_f32_f16 v4, v0, v1, v5; buffer_store_dwordx3 v[2:4] offset:64; s_endpgm.
+  const std::vector<uint32_t> program = {0x7E0002FFu, 0xC0003E00u, 0x7E0202FFu, 0x38004000u, 0x7E0A02FFu,
+                                         0x3E800000u, 0xCC104002u, 0x18020300u, 0xCC0A0803u, 0x10020300u,
+                                         0xCC134004u, 0x1C160300u, 0xE07C0040u, 0x80000200u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  const std::vector<uint32_t> after = gpu.dispatch(cs, {0});
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[16] == 0xBC004200u);  // {3.0, -1.0}
+  EXPECT(after[17] == 0x76000000u);  // {0xC000 + 0x4000 (wrapped), 0x3E00 + 0x3800}
+  EXPECT(after[18] == 0x40100000u);  // 1.5 * 2 - 2 * 0.5 + 0.25 = 2.25
+}
+
+TEST(half_legacy_and_cube_operations_run_as_documented) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v0 = 0.0, v1 = +inf, v2 = 2.0, v4 = {-2.0, 1.0}, v5 = {1.5, 2.0} (halves),
+  // v11 = 0.5, v12 = -3.0, v13 = 1.0;
+  // v_mad_legacy_f32 v3, v0, v1, v2; v_add_f16 v6, v4, v5;
+  // v_pack_b32_f16 v7, v4, v5 op_sel:[1,1]; v_mad_u32_u16 v8, v4, v5, v2;
+  // v_cmp_gt_f16 vcc, v5, v4; v_cndmask_b32 v9, 0, v2; v_cubeid_f32 v10, v11, v12, v13;
+  // buffer_store_dwordx4 v[6:9] offset:64; buffer_store_dword v3 offset:80;
+  // buffer_store_dword v10 offset:84; s_endpgm.
+  const std::vector<uint32_t> program = {
+      0x7E000280u, 0x7E0202FFu, 0x7F800000u, 0x7E0402FFu, 0x40000000u, 0x7E0802FFu, 0x3C00C000u, 0x7E0A02FFu,
+      0x40003E00u, 0x7E1602FFu, 0x3F000000u, 0x7E1802FFu, 0xC0400000u, 0x7E1A02FFu, 0x3F800000u, 0xD5400003u,
+      0x040A0300u, 0x640C0B04u, 0xD7111807u, 0x00020B04u, 0xD7730008u, 0x040A0B04u, 0x7D980905u, 0x02120480u,
+      0xD544000Au, 0x0436190Bu, 0xE0780040u, 0x80000600u, 0xE0700050u, 0x80000300u, 0xE0700054u, 0x80000A00u,
+      0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  const std::vector<uint32_t> after = gpu.dispatch(cs, {0});
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[16] == 0x0000B800u);  // -2.0 + 1.5 = -0.5, high half zero
+  EXPECT(after[17] == 0x40003C00u);  // the high halves packed: {1.0, 2.0}
+  EXPECT(after[18] == 0x6E800000u);  // 0xC000 * 0x3E00 + 0x40000000
+  EXPECT(after[19] == 0x40000000u);  // 1.5 > -2.0
+  EXPECT(after[20] == 0x40000000u);  // 0 * inf + 2 = 2 (legacy multiply)
+  EXPECT(after[21] == 0x40400000u);  // major axis -y: face 3
+}
+
+TEST(format_stores_pack_by_the_descriptor_format) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v0 = 1.0, v1 = 0.5, v2 = 0, v3 = 0.25;
+  // buffer_store_format_xyzw v[0:3], off, s[0:3] offset:64 (8_8_8_8_UNORM);
+  // s[4:7] = s[0:3] with format 13 (16_FLOAT);
+  // buffer_store_format_x v1, off, s[4:7] offset:68; s_endpgm.
+  const std::vector<uint32_t> program = {0x7E0002F2u, 0x7E0202F0u, 0x7E040280u, 0x7E0602FFu, 0x3E800000u,
+                                         0xE01C0040u, 0x80000000u, 0xBE840400u, 0xBE860302u, 0xBE8703FFu,
+                                         0x0000D000u, 0xE0100044u, 0x80010100u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 56u << 12}, true));  // title memory at 2^32
+  std::vector<uint32_t> contents(18, 0);
+  contents[17] = 0x11112222u;
+  const std::vector<uint32_t> after = gpu.dispatch(cs, contents);
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[16] == 0x400080FFu);  // {255, 128, 0, 64}
+  EXPECT(after[17] == 0x11113800u);  // a half 0.5 in the low half; the high half kept
+}
+
+TEST(lane_permutes_through_local_data_share_instructions) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v0 = lane; v4 = lane * 4; v2 = v4 + 4;
+  // ds_bpermute_b32 v1, v2, v0 (lane + 1); ds_swizzle_b32 v3, v0 offset:0x801b (quads reversed);
+  // buffer_store_dword v1, v4 offen; buffer_store_dword v3, v4 offen offset:128; s_endpgm.
+  const std::vector<uint32_t> program = {0x34080082u, 0x4A040884u, 0xDACC0000u, 0x01000002u, 0xD8D4801Bu,
+                                         0x03000000u, 0xE0701000u, 0x80000104u, 0xE0701080u, 0x80000304u,
+                                         0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 32;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  const std::vector<uint32_t> after = gpu.dispatch(cs, {0});
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  bool permuted = true, swizzled = true;
+  for (uint32_t i = 0; i < 32; ++i) {
+    permuted = permuted && after[i] == ((i + 1) & 31);
+    swizzled = swizzled && after[32 + i] == ((i & ~3u) | (3 - (i & 3)));
+  }
+  EXPECT(permuted);
+  EXPECT(swizzled);
+}
+
+void cube_sampling_check(bool gradients) {
+  Gpu gpu;
+  if (!gpu.open() || !gpu.make_cube()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // Face coordinates as open-source drivers form them from a direction:
+  // v4 = lane * 16; buffer_load_dwordx3 v[5:7], v4, s[0:3] offen (x, y, z);
+  // v_cubeid_f32 v10, v5, v6, v7; v_cubesc_f32 v11, ...; v_cubetc_f32 v12, ...;
+  // v_cubema_f32 v13, ...; v_rcp_f32 v13, |v13|; v20 = 1.5;
+  // v_fma_f32 v11, v11, v13, v20; v_fma_f32 v12, v12, v13, v20; v13 = v10;
+  // image_sample_lz v14, v[11:13], s[4:11], s[12:15] dmask:0x1 dim:CUBE;
+  // buffer_store_dword v14, v4, s[0:3] offen offset:128; s_endpgm.
+  // With `gradients`, image_sample_d instead, with zero face-coordinate
+  // gradients: v[15:17] = s, t, face; v[11:14] = 0;
+  // image_sample_d v18, v[11:17], s[4:11], s[12:15] dmask:0x1 dim:CUBE;
+  // buffer_store_dword v18, v4, s[0:3] offen offset:128.
+  std::vector<uint32_t> program = {
+      0x34080084u, 0xE03C1000u, 0x80000504u, 0xD544000Au, 0x041E0D05u, 0xD545000Bu, 0x041E0D05u, 0xD546000Cu,
+      0x041E0D05u, 0xD547000Du, 0x041E0D05u, 0xD5AA010Du, 0x0000010Du, 0x7E2802FFu, 0x3FC00000u, 0xD54B000Bu,
+      0x04521B0Bu, 0xD54B000Cu, 0x04521B0Cu, 0x7E1A030Au};
+  if (gradients) {
+    program.insert(program.end(), {0x7E1E030Bu, 0x7E20030Cu, 0x7E22030Du, 0x7E160280u, 0x7E180280u, 0x7E1A0280u,
+                                   0x7E1C0280u, 0xF0880118u, 0x0061120Bu, 0xE0701080u, 0x80001204u, 0xBF810000u});
+  } else {
+    program.insert(program.end(), {0xF09C0118u, 0x00610E0Bu, 0xE0701080u, 0x80000E04u, 0xBF810000u});
+  }
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 8;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  // Image and sampler descriptors (s[4:11], s[12:15]) select index 0.
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  // A direction on each face, off its centre, and two more.
+  const float directions[8][3] = {{1.0f, 0.5f, -0.5f},  {-1.0f, -0.5f, -0.5f}, {0.5f, 1.0f, -0.5f},
+                                  {-0.5f, -1.0f, 0.5f}, {0.5f, -0.5f, 1.0f},   {-0.5f, 0.5f, -1.0f},
+                                  {0.3f, -0.6f, 2.0f},  {-2.0f, 0.7f, 0.4f}};
+  std::vector<uint32_t> contents(32, 0);
+  for (uint32_t lane = 0; lane < 8; ++lane) std::memcpy(&contents[4 * lane], directions[lane], 12);
+  const std::vector<uint32_t> after = gpu.dispatch(cs, contents);
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  // The host's own face and texel for each direction.
+  for (uint32_t lane = 0; lane < 8; ++lane) {
+    const float x = directions[lane][0], y = directions[lane][1], z = directions[lane][2];
+    const float ax = std::fabs(x), ay = std::fabs(y), az = std::fabs(z);
+    uint32_t face;
+    float u, v;
+    if (ax >= ay && ax >= az) {
+      face = x > 0 ? 0 : 1;
+      u = (x > 0 ? -z : z) / ax;
+      v = -y / ax;
+    } else if (ay >= az) {
+      face = y > 0 ? 2 : 3;
+      u = x / ay;
+      v = (y > 0 ? z : -z) / ay;
+    } else {
+      face = z > 0 ? 4 : 5;
+      u = (z > 0 ? x : -x) / az;
+      v = -y / az;
+    }
+    const uint32_t tu = u > 0 ? 1 : 0, tv = v > 0 ? 1 : 0;
+    float sampled;
+    std::memcpy(&sampled, &after[32 + 4 * lane], 4);
+    EXPECT(sampled == static_cast<float>(4 * face + 2 * tv + tu));
+    if (sampled != static_cast<float>(4 * face + 2 * tv + tu)) {
+      std::printf("      lane %u: sampled %g, expected %u\n", lane, sampled, 4 * face + 2 * tv + tu);
+    }
+  }
+}
+
+TEST(cube_face_coordinates_sample_the_direction_they_came_from) { cube_sampling_check(false); }
+
+TEST(cube_face_coordinate_gradients_sample_the_same_texels) { cube_sampling_check(true); }
+
+TEST(pixel_wave_reductions_reduce_over_the_quad) {
+  Gpu gpu;
+  const std::vector<uint8_t> vs = covering_vertex_shader();
+  if (vs.empty() || !gpu.open()) {
+    std::printf("      (no Direct3D 12 device or shader compiler: not run)\n");
+    return;
+  }
+  // The console compiler's whole-wave reduction of v1 (op: v_min_u32 or
+  // v_add_nc_u32), as titles' pixel programs carry it:
+  // s_or_saveexec_b32 s66, -1; v_cndmask_b32 v126, identity, v1, s66;
+  // v_op_dpp v126, v126, v126 quad_perm:[1,0,3,2], then [2,3,0,1],
+  // row_half_mirror, row_mirror (fetch inactive); v_permlanex16_b32 v127, v126, 0, 0;
+  // v_op v126, v127, v126; s_mov_b32 exec_lo, s66; v_readlane_b32 s65, v126, 31;
+  // then v2 = s65 (min) or v2 = float(s65) (sum of whole numbers).
+  auto reduction = [](uint32_t op, uint32_t identity, std::initializer_list<uint32_t> before, uint32_t last) {
+    const uint32_t dpp = 0x00FCFCFAu | (op << 25), plain = 0x00FCFD7Fu | (op << 25);
+    std::vector<uint32_t> middle(before);
+    const std::vector<uint32_t> body = {0xBEC23DC1u, 0xD501007Eu, 0x010A0200u | identity,
+                                        dpp, 0xFF04B17Eu, dpp, 0xFF044E7Eu, dpp, 0xFF05417Eu, dpp, 0xFF05407Eu,
+                                        0xD778007Fu, 0x0201017Eu, plain, 0xBEFE0342u, 0xD7600041u, 0x00013F7Eu,
+                                        last};
+    middle.insert(middle.end(), body.begin(), body.end());
+    std::vector<uint32_t> code = {0xC8010000u, 0x100200FFu, 0x3F9E3779u};
+    code.insert(code.end(), middle.begin(), middle.end());
+    code.insert(code.end(), {0xF8000801u, 2u, 0xBF810000u});
+    std::vector<uint8_t> out;
+    for (uint32_t v : code) {
+      const auto* p = reinterpret_cast<const uint8_t*>(&v);
+      out.insert(out.end(), p, p + 4);
+    }
+    return out;
+  };
+  ShaderInterface link;
+  std::string error;
+  std::vector<uint8_t> own, minimum, own_whole, sum;
+  EXPECT(translate_graphics(pixel_program({}, 1).data(), pixel_program({}, 1).size(), GraphicsStage::Pixel, &own,
+                            &link, &error));
+  // Minimum of v1's bits (positive floats: their order).
+  const std::vector<uint8_t> min_code = reduction(0x13, 0xC1, {}, 0x7E040241u);
+  EXPECT(translate_graphics(min_code.data(), min_code.size(), GraphicsStage::Pixel, &minimum, &link, &error));
+  EXPECT(error.empty());
+  // Sum of v1 = u32(v0): v_cvt_u32_f32 v1, v0 first; v_cvt_f32_u32 v2, s65 last.
+  const std::vector<uint8_t> whole_code = pixel_program({0x7E020F00u, 0x7E040D01u}, 2);
+  EXPECT(translate_graphics(whole_code.data(), whole_code.size(), GraphicsStage::Pixel, &own_whole, &link, &error));
+  const std::vector<uint8_t> sum_code = reduction(0x25, 0x80, {0x7E020F00u}, 0x7E040C41u);
+  EXPECT(translate_graphics(sum_code.data(), sum_code.size(), GraphicsStage::Pixel, &sum, &link, &error));
+  EXPECT(error.empty());
+  const std::vector<uint32_t> a = gpu.draw(vs, own), b = gpu.draw(vs, minimum);
+  const std::vector<uint32_t> c = gpu.draw(vs, own_whole), d = gpu.draw(vs, sum);
+  EXPECT(a.size() == kSize * kSize && b.size() == a.size() && c.size() == a.size() && d.size() == a.size());
+  if (a.size() != kSize * kSize || b.size() != a.size() || c.size() != a.size() || d.size() != a.size()) return;
+  auto as_float = [](uint32_t bits) {
+    float value;
+    std::memcpy(&value, &bits, 4);
+    return value;
+  };
+  bool exact_min = true, exact_sum = true;
+  for (UINT y = 0; y < kSize; ++y) {
+    for (UINT x = 0; x < kSize; ++x) {
+      uint32_t low = 0xFFFFFFFFu;
+      float total = 0;
+      for (UINT j = 0; j < 4; ++j) {
+        const UINT at = ((y & ~1u) + (j >> 1)) * kSize + (x & ~1u) + (j & 1);
+        if (a[at] < low) low = a[at];
+        total += as_float(c[at]);
+      }
+      exact_min = exact_min && b[y * kSize + x] == low;
+      exact_sum = exact_sum && as_float(d[y * kSize + x]) == total;
+    }
+  }
+  EXPECT(exact_min);
+  EXPECT(exact_sum);
+}
+
+TEST(lane_mask_counts_follow_the_lane_mask_model) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v4 = lane * 4; v_mbcnt_lo_u32_b32 v1, exec_lo, 0 (a lane mask: no lane below);
+  // v_mbcnt_lo_u32_b32 v2, 56, 0 (a constant: by lane index);
+  // buffer_store_dword v1, v4 offen; buffer_store_dword v2, v4 offen offset:128; s_endpgm.
+  const std::vector<uint32_t> program = {0x34080082u, 0xD7650001u, 0x0001007Eu, 0xD7650002u, 0x000100B8u,
+                                         0xE0701000u, 0x80000104u, 0xE0701080u, 0x80000204u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 32;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  const std::vector<uint32_t> after = gpu.dispatch(cs, {0});
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  bool lane_masks = true, constants = true;
+  for (uint32_t i = 0; i < 32; ++i) {
+    lane_masks = lane_masks && after[i] == 0;
+    uint32_t below = 0;
+    for (uint32_t bit = 0; bit < i; ++bit) below += (56u >> bit) & 1;
+    constants = constants && after[32 + i] == below;
+  }
+  EXPECT(lane_masks);
+  EXPECT(constants);
+}
+
+TEST(subroutine_calls_return_and_data_after_the_end_is_not_code) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // 0x00 s_getpc_b64 s[4:5]; 0x04 s_add_u32 s4, s4, 0x18 (the subroutine at 0x1c);
+  // 0x0c s_swappc_b64 s[6:7], s[4:5]; 0x10 buffer_store_dword v1, off, s[0:3] offset:64;
+  // 0x18 s_endpgm; 0x1c v_mov_b32 v1, 0x1234; 0x24 s_setpc_b64 s[6:7] (return);
+  // 0x28 a data word (no instruction).
+  const std::vector<uint32_t> program = {0xBE841F00u, 0x8004FF04u, 0x00000018u, 0xBE862104u, 0xE0700040u,
+                                         0x80000100u, 0xBF810000u, 0x7E0202FFu, 0x00001234u, 0xBE802006u,
+                                         0x00000004u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  const std::vector<uint32_t> after = gpu.dispatch(cs, {0});
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[16] == 0x1234u);
+}
+
+TEST(pack_conversions_and_packed_half_fma_run_as_documented) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v0 = 0.5, v1 = -1.0, v5 = 0x12345, v6 = 7, v7 = {1.0, -1.0}, v8 = {1.5, 2.0}, v9 = {2.0, 0.5} (halves);
+  // v_cvt_pknorm_u16_f32 v2, v0, v1; v_cvt_pknorm_i16_f32 v3, v0, v1; v_cvt_pk_u16_u32 v4, v5, v6;
+  // v_pk_fmac_f16 v7, v8, v9; buffer_store_dwordx4 v[2:5] offset:64; buffer_store_dword v7 offset:80.
+  const std::vector<uint32_t> program = {
+      0x7E0002F0u, 0x7E0202F3u, 0x7E0A02FFu, 0x00012345u, 0x7E0C0287u, 0x7E0E02FFu, 0xBC003C00u, 0x7E1002FFu,
+      0x40003E00u, 0x7E1202FFu, 0x38004000u, 0xD7690002u, 0x00020300u, 0xD7680003u, 0x00020300u, 0xD76A0004u,
+      0x00020D05u, 0x780E1308u, 0xE0780040u, 0x80000200u, 0xE0700050u, 0x80000700u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));  // title memory at 2^32
+  const std::vector<uint32_t> after = gpu.dispatch(cs, {0});
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[16] == 0x00008000u);  // unorm16: 0.5 -> 32768 (to even), -1 -> 0
+  EXPECT(after[17] == 0x80014000u);  // snorm16: 0.5 -> 16384, -1 -> -32767
+  EXPECT(after[18] == 0x0007FFFFu);  // 0x12345 saturated, 7
+  EXPECT(after[20] == 0x00004400u);  // {1.5 * 2 + 1, 2 * 0.5 - 1} = {4.0, 0}
 }

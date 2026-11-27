@@ -168,6 +168,9 @@ bool decode(const uint8_t* code, size_t size, uint32_t pc, Instruction* out) {
     inst.src[2] = static_cast<uint16_t>(((w1 >> 16) & 0x1F) * 4);      // srsrc
     inst.src[3] = static_cast<uint16_t>(((w1 >> 21) & 0x1F) * 4);      // ssamp
     inst.ext = nsa ? w2 : 0;
+    for (uint32_t i = 0; i < 4 * nsa && i < 12; ++i) {
+      inst.nsa[i] = static_cast<uint8_t>(word(code, size, pc + 8 + 4 * (i / 4)) >> (8 * (i % 4)));
+    }
   } else if (top6 == 0x3E) {  // EXP
     inst.encoding = Encoding::EXP;
     inst.words = 2;
@@ -233,3 +236,7 @@ std::string mnemonic(const Instruction& inst) {
 }
 
 }  // namespace holy::d3d12::rdna
+
+namespace holy::d3d12 {
+const char* rdna_build() { return __DATE__ " " __TIME__; }
+}  // namespace holy::d3d12

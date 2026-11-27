@@ -82,4 +82,21 @@ HRESULT wait_frame_event(uint32_t type, uint32_t timeout_ms, uint64_t* token) {
   return S_OK;
 }
 
+void wait_frame_boundary() {
+  int64_t deadline;
+  {
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (!g_length) return;
+    const int64_t since = now() - g_origin;
+    deadline = g_origin + (since < 0 ? 0 : since / g_length + 1) * g_length;
+  }
+  for (;;) {
+    const int64_t left = deadline - now();
+    if (left <= 0) return;
+    const int64_t ms = left * 1000 / g_frequency.QuadPart;
+    if (ms > 1) Sleep(static_cast<DWORD>(ms - 1));
+    else YieldProcessor();
+  }
+}
+
 }  // namespace holy::d3d12

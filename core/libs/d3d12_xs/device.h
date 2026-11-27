@@ -5,6 +5,9 @@
 #include <windows.h>
 
 #include <atomic>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #include "core/libs/d3d12_xs/bindings.h"
 #include "core/libs/vtable.h"
@@ -33,6 +36,24 @@ struct CommandQueue {
   Device* device = nullptr;
   ID3D12CommandQueue* host = nullptr;
   int type = 0;
+  // Signalled after every submission, so host command lists know when the
+  // GPU is done with them.
+  ID3D12Fence* fence = nullptr;
+  uint64_t submitted = 0;
+  std::mutex lock;  // submission and its signal stay in order
+};
+
+// A host command list and its last submission (see HostListPool in
+// command_list.cpp).
+struct HostList {
+  ID3D12GraphicsCommandList* list = nullptr;
+  ID3D12GraphicsCommandList2* list2 = nullptr;
+  ID3D12GraphicsCommandList7* list7 = nullptr;
+  ID3D12Fence* fence = nullptr;  // of the queue it was last submitted to
+  uint64_t value = 0;            // the GPU is done with it once `fence` reaches this
+  bool recording = false;
+  bool executed = false;  // submitted since it was last reset
+  std::vector<void*> ngg_blocks;  // scratch memory of NGG draws (ngg.h)
 };
 
 struct DescriptorHeap;
@@ -51,7 +72,8 @@ struct CommandList {
   const lib::VtableInfo* info;
   std::atomic<long> refs{1};
   Device* device = nullptr;
-  ID3D12GraphicsCommandList* host = nullptr;
+  HostList* current = nullptr;  // the host list recording or last recorded for this list
+  ID3D12GraphicsCommandList* host = nullptr;    // current->list
   ID3D12GraphicsCommandList2* host2 = nullptr;  // WriteBufferImmediate
   ID3D12GraphicsCommandList7* host7 = nullptr;  // enhanced barriers (null if the host has none)
   D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -61,6 +83,10 @@ struct CommandList {
   bool translated = false;         // it runs translated native code
   uint32_t number = 0;             // in the host list's name ("title list N")
   D3D12_VERTEX_BUFFER_VIEW vertex_buffers[16] = {};  // title addresses
+  // Input assembly state as set on the host, restored after NGG draws.
+  D3D12_INDEX_BUFFER_VIEW index_buffer{};
+  bool index_buffer_set = false;
+  D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
 };
 
 struct Resource {
@@ -87,7 +113,9 @@ enum TranslatedRootParameter : uint32_t {
   kRootSystem = 1,    // root CBV: system constants (shader/translate.h)
   kRootImages = 2,    // descriptor table: the bound CBV/SRV/UAV heap from index 0
   kRootSamplers = 3,  // descriptor table: the bound sampler heap from index 0
-  kTranslatedRootParameters = 4,
+  kRootNggOutput = 4, // root UAV (u0, space kNggSpace): an NGG draw's records, written
+  kRootNggInput = 5,  // root SRV (t0, space kNggSpace): the same records, read
+  kTranslatedRootParameters = 6,
 };
 ID3D12RootSignature* translated_root_signature(Device* device);
 // A title resource description as the host takes it: flag bits the desktop
@@ -103,6 +131,9 @@ ID3D12RootSignature* translated_root_signature(Device* device);
 // replacement (host_view_format).
 D3D12_RESOURCE_DESC desktop_resource_desc(const D3D12_RESOURCE_DESC& desc);
 DXGI_FORMAT host_view_format(const void* resource, DXGI_FORMAT format);
+// The desktop format for a format the console adds to DXGI (the format
+// itself otherwise).
+DXGI_FORMAT desktop_format(DXGI_FORMAT format);
 // `state` is a legacy resource state, or with `layout` a barrier layout.
 HRESULT create_committed_resource(Device* device, const D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS flags,
                                   const D3D12_RESOURCE_DESC* desc, UINT state, bool layout,
@@ -120,6 +151,14 @@ HRESULT create_placed_resource_x(Device* device, uint64_t address, const D3D12_R
 // The console IDXGIDevice a title obtains from the device.
 void* dxgi_device();
 HRESULT create_command_list(Device* device, const uint32_t* desc, void* allocator, void* initial_state, void** out);
+// Submits title command lists to a queue (in order, then signals the queue's
+// fence and records the submission in each list's host list).
+void submit_command_lists(CommandQueue* queue, UINT count, void* const* lists);
+
+// Counts of recorded work since the previous call, as text for the log
+// (draws, NGG draws, dispatches, clears; work dropped for want of a host
+// pipeline).
+std::string recorded_work_summary();
 
 // `console_flags`: the descriptor's flags field has console meaning and is
 // not passed to the host.

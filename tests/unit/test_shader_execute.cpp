@@ -712,6 +712,80 @@ TEST(cached_pages_read_their_copy_until_written) {
   flags->Release();
 }
 
+// Relative moves (documented): v_movrels_b32 reads v[src + M0],
+// v_movreld_b32 writes v[dst + M0].
+TEST(relative_moves_index_registers_by_m0) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v1..v4 = 0x11, 0x22, 0x33, 0x44; s_mov_b32 m0, 2; v_movrels_b32 v5, v1
+  // (v3); s_mov_b32 m0, 1; v_movreld_b32 v1, 0x99 (v2); buffer_store_dword
+  // v5, v2, v3 at 0, 4, 8; s_endpgm.
+  const std::vector<uint32_t> program = {0x7E0202FFu, 0x11u, 0x7E0402FFu, 0x22u, 0x7E0602FFu, 0x33u, 0x7E0802FFu,
+                                         0x44u, 0xBEFC0382u, 0x7E0A8701u, 0xBEFC0381u, 0x7E0284FFu, 0x99u,
+                                         0xE0700000u, 0x80000500u, 0xE0700004u, 0x80000200u, 0xE0700008u,
+                                         0x80000300u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  info.user_sgprs = 4;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));
+  const std::vector<uint32_t> after = gpu.dispatch(cs, std::vector<uint32_t>(64));
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[0] == 0x33);  // v3, read through v1 + 2
+  EXPECT(after[1] == 0x99);  // v2, written through v1 + 1
+  EXPECT(after[2] == 0x33);  // v3 kept
+}
+
+// Doubles (documented: register pairs, low dword first; inline float
+// constants as doubles): add, multiply and conversions on the host's doubles.
+TEST(double_precision_adds_multiplies_and_converts) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v[1:2] = 1.5, v[3:4] = 2.25, v[12:13] = 1 + 2^-40; v_add_f64 v[5:6];
+  // v_mul_f64 v[7:8]; v_cvt_f32_f64 v9, v[5:6]; v_cvt_f64_f32 v[10:11], v9;
+  // v_add_f64 v[14:15], v[12:13], 1.0; stores of v[5:8], v[9:11], v[14:15].
+  const std::vector<uint32_t> program = {
+      0x7E020280u, 0x7E0402FFu, 0x3FF80000u, 0x7E060280u, 0x7E0802FFu, 0x40020000u, 0x7E1802FFu, 0x00001000u,
+      0x7E1A02FFu, 0x3FF00000u, 0xD5640005u, 0x00020701u, 0xD5650007u, 0x00020701u, 0x7E121F05u, 0x7E142109u,
+      0xD564000Eu, 0x0001E50Cu, 0xE0780000u, 0x80000500u, 0xE07C0010u, 0x80000900u, 0xE074001Cu, 0x80000E00u,
+      0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  info.user_sgprs = 4;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(error.empty());
+  EXPECT(gpu.set_constants({0, 1, 256, 0}, true));
+  const std::vector<uint32_t> after = gpu.dispatch(cs, std::vector<uint32_t>(64));
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[0] == 0 && after[1] == 0x400E0000u);  // 3.75
+  EXPECT(after[2] == 0 && after[3] == 0x400B0000u);  // 3.375
+  EXPECT(after[4] == 0x40700000u);                   // 3.75f
+  EXPECT(after[5] == 0 && after[6] == 0x400E0000u);  // 3.75 again
+  EXPECT(after[7] == 0x00000800u && after[8] == 0x40000000u);  // 2 + 2^-40
+}
+
 TEST(format_loads_take_format_and_selects_from_the_descriptor) {
   Gpu gpu;
   if (!gpu.open()) {

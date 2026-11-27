@@ -389,10 +389,14 @@ TEST(cube_multisampled_and_gradient_images_translate) {
   EXPECT(text.find("resinfo") != std::string::npos);  // unnormalised coordinates over the size
   EXPECT(text.find("div ") != std::string::npos);
   EXPECT(text.find("gather4") != std::string::npos);
-  // image_get_lod outside a pixel program is reported.
+  // image_get_lod outside a pixel program: level 0 (partial: the console
+  // derives it from quads of lanes), without the host's level instruction,
+  // which only pixel shaders have.
   const std::vector<uint8_t> lod = words({0xF1800F08u, 0x00820004u, 0xBF810000u});
-  EXPECT(!translate_compute(lod.data(), lod.size(), info, &bytecode, &error));
-  EXPECT(error.find("image_get_lod") != std::string::npos);
+  error.clear();
+  EXPECT(translate_compute(lod.data(), lod.size(), info, &bytecode, &error));
+  EXPECT(error.empty());
+  EXPECT(disassemble(bytecode).find("lod ") == std::string::npos);
 }
 
 TEST(image_atomics_use_integer_views) {

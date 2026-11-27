@@ -102,6 +102,9 @@ Operand srv_xyzw(uint32_t id, uint32_t index) {
 Operand temp_dst_mask(uint32_t index, uint32_t mask) {
   return {kFourComponents | kMaskMode | (mask << 4) | type_bits(kTemp) | dimension(1), index};
 }
+Operand temp_swizzle(uint32_t index, uint32_t swizzle) {
+  return {kFourComponents | kSwizzleMode | ((swizzle & 0xFF) << 4) | type_bits(kTemp) | dimension(1), index};
+}
 Operand temp_xyzw(uint32_t index) {
   return {kFourComponents | kSwizzleMode | (0xE4u << 4) | type_bits(kTemp) | dimension(1), index};
 }

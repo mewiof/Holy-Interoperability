@@ -684,6 +684,15 @@ Notes describe the platform, never a title.
 
 ## Graphics shaders
 
+- *measured* (offline, `holy_translate_corpus`, the reference title's 19,305 saved shaders): every program
+  translates except those with ray intersection instructions (128). Found and translated since: NGG vertex
+  programs taking their vertex group as `v_readfirstlane_b32 sN, v5` then `s_lshr_b32` (36); relative register
+  moves `v_movrels_b32`/`v_movreld_b32` (documented: M0 indexes VGPRs; host temps cannot be indexed, so a
+  selection on M0 over the program's VGPRs) (13); doubles (`v_add_f64`, `v_mul_f64`, the conversions to and
+  from f32; a double is a host register's x and y, low dword first, the opcodes measured from the desktop
+  compiler) (4); `image_get_lod` in compute programs (65; partial: level 0, the level implicit samples take
+  outside pixel shaders, where the console derives it from quads of lanes). Translation takes 93 ms a program on
+  average (the slowest 8.8 s) and writes about 1 MB of host bytecode for each.
 - *observed*: console shader containers have the desktop container layout, but their `DXIL` part holds a
   console block (`XDAT`) with a zlib-compressed `FSSM` payload: the console GPU's native machine code
   (RDNA-family instruction encodings: `s_waitcnt`, exports, `s_endpgm`, `s_code_end` padding) and metadata.

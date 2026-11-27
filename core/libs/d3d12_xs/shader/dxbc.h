@@ -34,6 +34,9 @@ enum Opcode : uint32_t {
   kImmAtomicIadd = 180, kImmAtomicAnd = 181, kImmAtomicOr = 182, kImmAtomicXor = 183, kImmAtomicExch = 184,
   kImmAtomicCmpExch = 185, kImmAtomicImax = 186, kImmAtomicImin = 187, kImmAtomicUmax = 188,
   kImmAtomicUmin = 189, kSync = 190, kDerivRtxFine = 123, kDerivRtyFine = 125,
+  // Doubles (measured from the desktop compiler's output): a double is a
+  // register's x and y (or z and w) components, low dword first.
+  kDadd = 191, kDmul = 194, kDtof = 201, kFtod = 202,
   // Geometry programs.
   kDclGsOutputTopology = 92, kDclGsInputPrimitive = 93, kDclMaxOutputVertexCount = 94, kDclInputSiv = 97,
   kEmitStream = 117, kCutStream = 118, kDclStream = 143,
@@ -107,6 +110,7 @@ enum class Access { Load, LoadVector, Store, Atomic };
 
 // Shader feature bits of the SFI0 part (the desktop runtime's documented
 // D3D_SHADER_REQUIRES_* values).
+inline constexpr uint64_t kRequiresDoubles = 0x1;
 inline constexpr uint64_t kRequiresTypedUavLoadAdditionalFormats = 0x800;
 inline constexpr uint64_t kRequiresRovs = 0x1000;
 // Un[0][temp.x] (non-uniform) and gN.
@@ -119,6 +123,9 @@ Operand srv_xyzw(uint32_t id, uint32_t index);
 // rN with a write mask, and rN.xyzw as a four-component source.
 Operand temp_dst_mask(uint32_t index, uint32_t mask);
 Operand temp_xyzw(uint32_t index);
+// rN with a swizzle (2 bits a component, x in bits 0-1): rN.xyxy (0x44) is a
+// double in x and y.
+Operand temp_swizzle(uint32_t index, uint32_t swizzle);
 // Tn[temp.x], Un[temp.x] (typed, .xyzw) and Sn[temp.x], all non-uniform.
 Operand texture_indexed(uint32_t id, uint32_t temp_index);
 Operand typed_uav_indexed(uint32_t id, uint32_t temp_index, bool store);

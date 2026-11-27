@@ -186,6 +186,26 @@ class Translator {
     use_vgpr(static_cast<uint16_t>(rdna::kVgpr0 + index));
     return kVgprBase + index;
   }
+  // One past the highest VGPR the program names (relative moves reach VGPRs
+  // through M0, within the ones a program uses).
+  uint32_t relative_vgpr_limit() {
+    if (!relative_limit_) {
+      uint32_t limit = 1;
+      for (const Instruction& inst : program_) {
+        for (uint16_t code : inst.src) {
+          if (code >= rdna::kVgpr0 && code < rdna::kVgpr0 + 256) limit = std::max<uint32_t>(limit, code - rdna::kVgpr0 + 4);
+        }
+        const bool vector_dst = inst.encoding == Encoding::VOP1 || inst.encoding == Encoding::VOP2 ||
+                                inst.encoding == Encoding::VOP3 || inst.encoding == Encoding::VOP3P ||
+                                inst.encoding == Encoding::VINTRP || inst.encoding == Encoding::MUBUF ||
+                                inst.encoding == Encoding::MTBUF || inst.encoding == Encoding::FLAT ||
+                                inst.encoding == Encoding::MIMG || inst.encoding == Encoding::DS;
+        if (vector_dst && inst.dst < 256) limit = std::max<uint32_t>(limit, inst.dst + 4u);
+      }
+      relative_limit_ = std::min<uint32_t>(limit, 256);
+    }
+    return relative_limit_;
+  }
 
   // 32-bit source.
   Operand src(const Instruction& inst, uint16_t code) {
@@ -762,6 +782,8 @@ class Translator {
   std::string error_;
   uint32_t scratch_ = 0;
   uint32_t vgprs_ = 3;
+  uint32_t relative_limit_ = 0;  // relative_vgpr_limit()
+  bool doubles_ = false;         // double-precision operations are used
   bool barrier_ = false;
   bool lds_ = false;
   // s_getpc_b64 present: program bytes [code_first_, + code_bytes_) are an
@@ -1990,6 +2012,49 @@ bool Translator::emit_vector(const Instruction& inst) {
     return true;
   };
   auto setf = [&](const Operand& value) { return set(fresult(work, value)); };
+  // Doubles (documented 64-bit float operands): VGPR or SGPR pairs low dword
+  // first, inline float constants as doubles, a literal as the high dword;
+  // VOP3 abs and neg act on bit 63. Packed into a temp's x and y.
+  auto d64 = [&](int i) -> uint32_t {
+    const uint16_t code = work.src[i];
+    Operand lo = I(0), hi = I(0);
+    if (code >= rdna::kVgpr0) {
+      lo = R(vreg(code - rdna::kVgpr0));
+      hi = R(vreg(code - rdna::kVgpr0 + 1u));
+    } else if (code <= 104) {
+      lo = R(code);
+      hi = R(code + 1u);
+    } else if (code >= 240 && code <= 248) {
+      static const uint32_t kHigh[] = {0x3FE00000u, 0xBFE00000u, 0x3FF00000u, 0xBFF00000u, 0x40000000u,
+                                       0xC0000000u, 0x40100000u, 0xC0100000u, 0x3FC45F30u};
+      hi = I(kHigh[code - 240]);
+      lo = I(code == 248 ? 0x6DC9C883u : 0u);  // 1/(2 pi)
+    } else if (code == rdna::kLiteral) {
+      hi = I(inst.literal);
+    } else if (code != 128) {
+      fail(format("a double operand of code %u", code));
+    }
+    if (e64 && ((inst.abs >> i) & 1)) hi = band(hi, I(0x7FFFFFFFu));
+    if (e64 && ((inst.neg >> i) & 1)) hi = bxor(hi, I(0x80000000u));
+    const uint32_t t = fresh();
+    emit(dx::kMov, {dxbc::temp_dst_mask(t, 0x1), lo});
+    emit(dx::kMov, {dxbc::temp_dst_mask(t, 0x2), hi});
+    doubles_ = true;
+    return t;
+  };
+  // A double result (a temp's x and y) into vdst and vdst + 1, active lanes.
+  auto set64 = [&](uint32_t t) {
+    if (inst.clamp || inst.omod) return fail("a double result with clamp or output modifier");
+    const uint32_t lo = vreg(inst.dst), hi = vreg(inst.dst + 1u);
+    put(lo, select(on, dxbc::temp(t, 0), R(lo)));
+    put(hi, select(on, dxbc::temp(t, 1), R(hi)));
+    return true;
+  };
+  auto dop = [&](uint32_t opcode, uint32_t a64, uint32_t b64) {
+    const uint32_t r = fresh();
+    emit(opcode, {dxbc::temp_dst_mask(r, 0x3), dxbc::temp_swizzle(a64, 0x44), dxbc::temp_swizzle(b64, 0x44)});
+    return r;
+  };
   const Operand literal = I(inst.literal);
   auto fadd = [&](const Operand& x, const Operand& y) { return op2(dx::kAdd, x, y); };
   auto fmul = [&](const Operand& x, const Operand& y) { return op2(dx::kMul, x, y); };
@@ -2260,6 +2325,17 @@ bool Translator::emit_vector(const Instruction& inst) {
         // loops and wave-coalesced atomics need).
         set_s(inst.dst, a);
         return true;
+      case 15: {  // v_cvt_f32_f64
+        const uint32_t r = fresh();
+        emit(dx::kDtof, {dxbc::temp_dst_mask(r, 0x1), dxbc::temp_swizzle(d64(0), 0x44)});
+        return setf(R(r));
+      }
+      case 16: {  // v_cvt_f64_f32
+        const uint32_t r = fresh();
+        emit(dx::kFtod, {dxbc::temp_dst_mask(r, 0x3), f(0)});
+        doubles_ = true;
+        return set64(r);
+      }
       case 5: return setf(op1(dx::kItof, a));
       case 6: return setf(op1(dx::kUtof, a));
       case 7: return set(op1(dx::kFtou, f(0)));
@@ -2300,6 +2376,33 @@ bool Translator::emit_vector(const Instruction& inst) {
         const Operand u = in_temp(f(0));
         const Operand m = bor(band(u, I(0x807FFFFFu)), I(0x3F000000u));
         return setf(select(op2(dx::kEq, u, dxbc::immf(0.0f)), dxbc::immf(0.0f), m));
+      }
+      case 66: case 67: {
+        // Documented relative moves: v_movreld_b32 (66) v[vdst + M0] = src0,
+        // v_movrels_b32 (67) vdst = v[src0 + M0]. Host temps cannot be
+        // indexed: a selection on M0 over the program's VGPRs (beyond them
+        // reads give zero and writes go nowhere).
+        const uint32_t limit = relative_vgpr_limit();
+        if (op == 67) {
+          if (work.src[0] < rdna::kVgpr0) return fail("v_movrels_b32 with a scalar operand");
+          const uint32_t base = work.src[0] - rdna::kVgpr0;
+          const uint32_t value = fresh();
+          put(value, I(0));
+          for (uint32_t k = 0; base + k < limit; ++k) {
+            const uint32_t mark = scratch_;
+            put(value, select(eq(R(kM0R), I(k)), R(vreg(base + k)), R(value)));
+            scratch_ = mark;
+          }
+          return set(R(value));
+        }
+        const Operand v = copy(s(0));
+        for (uint32_t k = 0; inst.dst + k < limit; ++k) {
+          const uint32_t mark = scratch_;
+          const uint32_t r = vreg(inst.dst + k);
+          put(r, select(band(on, eq(R(kM0R), I(k))), v, R(r)));
+          scratch_ = mark;
+        }
+        return true;
       }
       case 101: {
         // v_swap_b32: vdst and the VGPR src0 exchange values.
@@ -2444,6 +2547,8 @@ bool Translator::emit_vector(const Instruction& inst) {
     case 0x16d:                      // v_div_scale: no scaling needed without denormal ranges
       set_mask(inst.sdst, I(0));
       return setf(f(0));
+    case 0x164: return set64(dop(dx::kDadd, d64(0), d64(1)));  // v_add_f64
+    case 0x165: return set64(dop(dx::kDmul, d64(0), d64(1)));  // v_mul_f64
     case 0x169: return set(mul_lo(a, b));
     case 0x16a: return set(umul_hi(a, b));
     case 0x16c: return set(imul_hi(a, b));
@@ -2856,7 +2961,15 @@ bool Translator::emit_image(const Instruction& inst) {
     }
     case 96: {
       // image_get_lod: the level a sample would use (clamped, unclamped).
-      if (!pixel) return fail("image_get_lod outside a pixel shader");
+      // Outside pixel shaders the console derives it from quads of lanes;
+      // partial: level 0 here, the level the implicit samples above take
+      // there (observed: 65 compute programs of a title query it).
+      if (!pixel) {
+        const uint32_t result = fresh();
+        emit(dx::kMov, {dxbc::temp_dst_mask(result, 0xF), dxbc::immf(0.0f)});
+        results(result);
+        return true;
+      }
       const uint32_t coords = coordinates(0);
       const uint32_t result = fresh();
       emit(dx::kLod, {dxbc::temp_dst_mask(result, 0xF), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
@@ -3711,7 +3824,9 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
                         : stage_ == Stage::Vertex ? dxbc::ProgramType::Vertex
                                                   : dxbc::ProgramType::Pixel);
   std::vector<dxbc::SignatureElement> inputs, outputs;
-  program.dcl_global_flags(1);  // refactoring allowed
+  // Refactoring allowed; double-precision operations.
+  program.dcl_global_flags(doubles_ ? 1u | 2u : 1u);
+  if (doubles_) features_ |= dxbc::kRequiresDoubles;
   program.dcl_constant_buffer(0, kTranslatedSpace, kSystemVectors, true);
   program.dcl_uav_raw_range(0, 0, kMemoryViews - 1, kTranslatedSpace);
   if (page_table_used_) program.dcl_resource_raw_range(kPageTableId, 0, 0, kTranslatedSpace);

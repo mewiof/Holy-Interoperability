@@ -67,15 +67,19 @@ std::array<void*, kWrapperSlots> make_forwarding_vtable(int forwarded) {
   return table;
 }
 
-Wrapper* wrap(IUnknown* host, const lib::VtableInfo* info, void* const* vtable) {
+void init_wrapper(Wrapper* wrapper, IUnknown* host, const lib::VtableInfo* info, void* const* vtable) {
   {
     std::lock_guard<std::mutex> lock(g_lock);
     wrapper_vtables().insert(vtable);
   }
-  auto* wrapper = new Wrapper();
   wrapper->vtable = vtable;
   wrapper->info = info;
   wrapper->host = host;
+}
+
+Wrapper* wrap(IUnknown* host, const lib::VtableInfo* info, void* const* vtable) {
+  auto* wrapper = new Wrapper();
+  init_wrapper(wrapper, host, info, vtable);
   return wrapper;
 }
 

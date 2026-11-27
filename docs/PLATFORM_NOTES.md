@@ -324,8 +324,12 @@ Notes describe the platform, never a title.
   of those records. The title's index buffer and topology are restored afterwards. Partial: indexed draws with
   such pipelines are not drawn (logged).
 - *observed*: fence slot 12 (past the desktop `ID3D12Fence1`) returns the address of the fence's current value;
-  titles poll it, reading all ones as a removed device. Implementation: a cell per fence kept at the host value by
-  a thread that waits for each completion.
+  titles poll it, reading all ones as a removed device, and read what the GPU wrote once the value shows the work
+  done. Implementation: a cell owned by the fence (released with its last reference), kept at the host fence's
+  completed value by one thread for all cells, woken by any watched fence's next completion; each fence's event
+  is set again only when its value moved. *Measured* (sample title): the allocator often hands a new fence the
+  address of one just released; cells found by the fence's address (an earlier implementation) then gave the new
+  fence the old one's value, so work looked done at once and its results read as zero (about one read in 70).
 
 ### Frame tokens and presentation
 

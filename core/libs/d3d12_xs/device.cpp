@@ -19,6 +19,7 @@
 #include <intrin.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -133,49 +134,114 @@ HRESULT STDMETHODCALLTYPE get_device_of_child(Wrapper*, REFIID, void** device) {
 
 // Observed: fence slot 12 (past the desktop ID3D12Fence1 methods) returns a
 // pointer through which titles read the fence's current value directly,
-// treating all ones as a removed device. Host model: a cell per fence, kept
-// at the host fence's completed value by a thread that waits for each
-// further completion.
+// treating all ones as a removed device; titles read memory the GPU wrote once
+// the value shows the work done. Host model: a cell per fence, owned by the
+// fence and gone with its last reference (a fence made later at the same
+// address has a cell of its own), kept at the host fence's completed value by
+// one thread for all cells.
 struct FenceCell {
-  ID3D12Fence* fence;
-  volatile uint64_t value;
+  ID3D12Fence* fence = nullptr;  // the fence's host fence (the cell goes first)
+  volatile uint64_t value = 0;
+  uint64_t armed = 0;  // the value the watcher's event is set to come at (0: none)
 };
 
-DWORD WINAPI watch_fence(void* context) {
-  auto* cell = static_cast<FenceCell*>(context);
-  const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-  for (;;) {
-    const uint64_t seen = cell->fence->GetCompletedValue();
-    cell->value = seen;
-    if (seen == UINT64_MAX) {  // device removed
-      static std::atomic<bool> reported{false};
-      if (g_device && !reported.exchange(true)) report_device_removal(g_device);
-      break;
-    }
-    if (FAILED(cell->fence->SetEventOnCompletion(seen + 1, event))) break;
-    WaitForSingleObject(event, INFINITE);
+struct Fence : Wrapper {
+  std::atomic<FenceCell*> cell{nullptr};
+};
+
+// The thread keeping cells current: woken by the next completion of any
+// watched fence (one event, set by each fence at its next value), it reads
+// every cell's fence and sets each event again where the value moved.
+class FenceWatcher {
+ public:
+  static FenceWatcher& get() {
+    static auto* watcher = new FenceWatcher();
+    return *watcher;
   }
-  CloseHandle(event);
-  return 0;
+
+  void add(FenceCell* cell) {
+    std::lock_guard<std::mutex> guard(lock_);
+    if (!wake_) {
+      wake_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      const HANDLE thread = wake_ ? CreateThread(nullptr, 64 * 1024, &run, this, 0, nullptr) : nullptr;
+      if (!thread) {
+        LIB_LOG(lib::kError, "d3d12", "no thread keeps fence values current: values read through fences stay as made");
+        return;
+      }
+      CloseHandle(thread);
+    }
+    cells_.push_back(cell);
+    SetEvent(wake_);
+  }
+
+  // Once it returns, the watcher no longer reads the cell or its fence.
+  void remove(FenceCell* cell) {
+    std::lock_guard<std::mutex> guard(lock_);
+    cells_.erase(std::remove(cells_.begin(), cells_.end(), cell), cells_.end());
+  }
+
+ private:
+  static DWORD WINAPI run(void* self) { static_cast<FenceWatcher*>(self)->loop(); }
+
+  [[noreturn]] void loop() {
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> guard(lock_);
+        for (FenceCell* cell : cells_) {
+          const uint64_t seen = cell->fence->GetCompletedValue();
+          cell->value = seen;
+          if (seen == UINT64_MAX) {  // device removed
+            static std::atomic<bool> reported{false};
+            if (g_device && !reported.exchange(true)) report_device_removal(g_device);
+            continue;
+          }
+          // Set once per value: a fence whose value stays put keeps one
+          // pending event, however often others wake the thread.
+          if (cell->armed != seen + 1 && SUCCEEDED(cell->fence->SetEventOnCompletion(seen + 1, wake_))) {
+            cell->armed = seen + 1;
+          }
+        }
+      }
+      WaitForSingleObject(wake_, INFINITE);
+    }
+  }
+
+  std::mutex lock_;
+  std::vector<FenceCell*> cells_;
+  HANDLE wake_ = nullptr;  // auto-reset
+};
+
+const volatile uint64_t* STDMETHODCALLTYPE fence_value_address(Fence* self) {
+  if (FenceCell* cell = self->cell.load(std::memory_order_acquire)) return &cell->value;
+  static std::mutex lock;
+  std::lock_guard<std::mutex> guard(lock);
+  FenceCell* cell = self->cell.load(std::memory_order_acquire);
+  if (!cell) {
+    cell = new FenceCell();
+    cell->fence = static_cast<ID3D12Fence*>(self->host);
+    cell->value = cell->fence->GetCompletedValue();
+    FenceWatcher::get().add(cell);
+    self->cell.store(cell, std::memory_order_release);
+  }
+  return &cell->value;
 }
 
-const volatile uint64_t* STDMETHODCALLTYPE fence_value_address(Wrapper* self) {
-  static std::mutex lock;
-  static auto* cells = new std::map<Wrapper*, FenceCell*>();
-  std::lock_guard<std::mutex> guard(lock);
-  auto found = cells->find(self);
-  if (found != cells->end()) return &found->second->value;
-  auto* cell = new FenceCell{static_cast<ID3D12Fence*>(self->host), 0};
-  cell->fence->AddRef();
-  cell->value = cell->fence->GetCompletedValue();
-  const HANDLE thread = CreateThread(nullptr, 64 * 1024, &watch_fence, cell, 0, nullptr);
-  if (thread) CloseHandle(thread);
-  cells->emplace(self, cell);
-  return &cell->value;
+ULONG STDMETHODCALLTYPE fence_release(Fence* self) {
+  const long left = self->refs.fetch_sub(1) - 1;
+  if (left == 0) {
+    if (FenceCell* cell = self->cell.load(std::memory_order_acquire)) {
+      FenceWatcher::get().remove(cell);
+      delete cell;
+    }
+    if (self->host) self->host->Release();
+    delete self;
+  }
+  return static_cast<ULONG>(left);
 }
 
 const auto kFenceVtable = [] {
   auto table = make_forwarding_vtable(12);
+  table[2] = reinterpret_cast<void*>(&fence_release);
   table[7] = reinterpret_cast<void*>(&get_device_of_child);
   table[12] = reinterpret_cast<void*>(&fence_value_address);
   return table;
@@ -188,7 +254,9 @@ HRESULT STDMETHODCALLTYPE create_fence(Device* self, UINT64 initial, D3D12_FENCE
   const HRESULT hr = self->host->CreateFence(initial, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&host));
   (void)flags;
   if (FAILED(hr)) return hr;
-  *fence = wrap(host, &kFenceInfo, kFenceVtable.data());
+  auto* made = new Fence();
+  init_wrapper(made, host, &kFenceInfo, kFenceVtable.data());
+  *fence = made;
   return S_OK;
 }
 

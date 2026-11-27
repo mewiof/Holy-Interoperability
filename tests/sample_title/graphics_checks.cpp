@@ -4,6 +4,8 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <vector>
 
 #include "tests/sample_title/checks.h"
 
@@ -98,6 +100,35 @@ void test_graphics() {
     check(call<HRESULT>(queue, 16, fence, UINT64{12}) == S_OK, "a queue signals a fence");
     for (int i = 0; value && *value != 12 && i < 2000; ++i) Sleep(1);
     check(value && *value == 12, "a fence's value address follows the GPU's signals");
+  }
+  {
+    // A fence released and another made at the same address (the allocator
+    // reuses the memory, though not every time): the new fence's value is
+    // its own, not the released one's.
+    void* first = nullptr;
+    call<HRESULT>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), &first);
+    const auto* first_value = first ? call<const volatile uint64_t*>(first, 12) : nullptr;
+    if (first) call<HRESULT>(first, 10, UINT64{7});  // Signal from the CPU
+    for (int i = 0; first_value && *first_value != 7 && i < 2000; ++i) Sleep(1);
+    check(first_value && *first_value == 7, "a fence's value address follows signals from the CPU");
+    const void* released = first;
+    if (first) call<ULONG>(first, 2);
+    std::vector<void*> made;
+    bool reused = false, own_values = true;
+    for (int attempt = 0; attempt < 2048 && !reused; ++attempt) {
+      void* next = nullptr;
+      call<HRESULT>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), &next);
+      if (!next) break;
+      made.push_back(next);
+      reused = next == released;
+      const auto* next_value = call<const volatile uint64_t*>(next, 12);
+      Sleep(reused ? 20 : 0);
+      own_values = own_values && next_value && *next_value == 0;
+    }
+    std::printf("    (%zu fences made, %s)\n", made.size(),
+                reused ? "the last at the released fence's address" : "none at the released fence's address");
+    check(released && own_values, "a fence made where a released one was reads its own value");
+    for (void* fence_made : made) call<ULONG>(fence_made, 2);
   }
   if (queue && list && allocator && fence) {
     // Titles reset a list and submit it again while its previous submission may

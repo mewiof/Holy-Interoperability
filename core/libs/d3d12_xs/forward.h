@@ -53,4 +53,8 @@ T* host_of(const void* object) {
 // Creates a wrapper around `host` (taking over the reference).
 Wrapper* wrap(IUnknown* host, const lib::VtableInfo* info, void* const* vtable);
 
+// Fills in a wrapper of a kind with state of its own (a type deriving from
+// Wrapper, made and released by its own code), as wrap does.
+void init_wrapper(Wrapper* wrapper, IUnknown* host, const lib::VtableInfo* info, void* const* vtable);
+
 }  // namespace holy::d3d12

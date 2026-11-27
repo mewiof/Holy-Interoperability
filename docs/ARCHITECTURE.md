@@ -136,6 +136,29 @@ runs in the launcher, outside the title process, so it cannot deadlock with what
 ([core/loader/profiler.h](../core/loader/profiler.h)); it reports where threads run, where they wait and their
 processor time.
 
+## When GPU programs are translated and compiled
+
+Titles hand native GPU programs to pipeline creation, by the tens of thousands while loading, and draw with a
+small part of them. Two costs follow, and they differ by two orders of magnitude (measured on the development
+host, over the reference title's 19,305 saved programs):
+
+- **Translation** to host bytecode (shader model 5.1): about 5 ms a program on one processor, a minute and a
+  half of processor time for all of them. It happens at pipeline creation, and the result is kept on disk under
+  a key of the native code, the translation's parameters and the translator's build
+  (`<data>/translated/<build>`); later runs read it back.
+- **The host driver's compile** of that bytecode: from tens of milliseconds to seconds a program, growing faster
+  than the program's size (about 0.9 s a compute program on average): hours of processor time for all of them.
+  So a host pipeline is compiled only when a pipeline is first used, except pipelines that an earlier run used
+  (`<data>/pipelines-used.bin`), which compile on worker threads as soon as the title creates them; the
+  driver's own cache keeps compiled code across runs.
+
+Prebaking everything on the first run is therefore not done: translating everything is affordable but happens
+anyway as pipelines are created, and compiling everything would take hours. What makes the first run smooth is
+the size and shape of what the driver compiles. The translator's output is measured for that
+(`holy_translate_corpus --compile`, which keeps the driver's cache out of the measurement): blocks laid out in
+program order with loops only where the code loops, page lookups without branches and moves folded into the
+computations cut the compile time of a sample of 60 programs from 166 s to 56 s.
+
 ## Console libraries
 
 Each library under `core/libs` is a normal DLL exporting the console API's names. Implementations state their

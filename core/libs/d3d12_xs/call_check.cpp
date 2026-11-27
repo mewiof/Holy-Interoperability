@@ -34,6 +34,14 @@ uint64_t traced_present() {
 
 std::atomic<bool> g_frame_traced{false};
 
+namespace {
+// The first frame has no present before it: its trace starts with the process.
+const bool g_trace_first_frame = [] {
+  if (traced_present() == 1) g_frame_traced.store(true);
+  return true;
+}();
+}  // namespace
+
 bool call_check_enabled() {
   static const bool enabled = removal_check_enabled() || traced_present() > 0;
   return enabled;

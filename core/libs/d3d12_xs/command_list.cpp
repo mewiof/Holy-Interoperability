@@ -765,6 +765,33 @@ void mark_work(CommandList* self) {
   LIB_LOG(lib::kDebug, "d3d12", "work on title list %u: %ls", self->number, label.c_str());
 }
 
+// For traces: what a draw reads, as far as the CPU can see it now: each bound
+// vertex buffer with its first vertex (as floats), and the packed root
+// arguments (the title may still write the memory before the work runs).
+void trace_draw_inputs(const CommandList* self) {
+  for (int i = 0; i < 16; ++i) {
+    const D3D12_VERTEX_BUFFER_VIEW& v = self->vertex_buffers[i];
+    if (!v.BufferLocation) continue;
+    float first[8] = {};
+    const uint32_t bytes = std::min<uint32_t>(v.SizeInBytes, sizeof(first));
+    MEMORY_BASIC_INFORMATION info{};
+    const bool readable = VirtualQuery(reinterpret_cast<const void*>(v.BufferLocation), &info, sizeof(info)) &&
+                          info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+    if (readable) std::memcpy(first, reinterpret_cast<const void*>(v.BufferLocation), bytes);
+    HOLY_TRACE("list %u   vertex buffer %d: %llx, %u bytes, stride %u; first vertex %g %g %g %g | %g %g %g %g%s",
+               self->number, i, static_cast<unsigned long long>(v.BufferLocation), v.SizeInBytes, v.StrideInBytes,
+               first[0], first[1], first[2], first[3], first[4], first[5], first[6], first[7],
+               readable ? "" : " (not readable)");
+  }
+  std::string root;
+  for (int i = 0; i < 16; ++i) {
+    char word[12];
+    std::snprintf(word, sizeof(word), " %08x", self->graphics.packed[i]);
+    root += word;
+  }
+  HOLY_TRACE("list %u   graphics root arguments:%s", self->number, root.c_str());
+}
+
 // The host pipeline a draw needs: the title pipeline's, or its rectangle
 // list variant while the topology is a rectangle list.
 void bind_draw_pipeline(CommandList* self) {
@@ -792,6 +819,7 @@ void STDMETHODCALLTYPE list_draw_instanced(CommandList* self, UINT vertices, UIN
   g_work.draws.fetch_add(1, std::memory_order_relaxed);
   HOLY_TRACE("list %u draws %u vertices x %u from %u / %u", self->number, vertices, instances, first_vertex,
              first_instance);
+  if (frame_traced()) trace_draw_inputs(self);
   mark_work(self);
   NggPipeline ngg;
   if (self->translated && ngg_pipeline(self->pipeline, &ngg)) {
@@ -819,6 +847,7 @@ void STDMETHODCALLTYPE list_draw_indexed_instanced(CommandList* self, UINT indic
   g_work.indexed.fetch_add(1, std::memory_order_relaxed);
   HOLY_TRACE("list %u draws %u indices x %u from %u, base %d / %u", self->number, indices, instances, first_index,
              base_vertex, first_instance);
+  if (frame_traced()) trace_draw_inputs(self);
   mark_work(self);
   NggPipeline ngg;
   if (self->translated && ngg_pipeline(self->pipeline, &ngg)) {

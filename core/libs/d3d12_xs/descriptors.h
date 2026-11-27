@@ -36,6 +36,13 @@ struct DescriptorHeap {
   uint64_t host_cpu = 0;
   uint64_t host_gpu = 0;
   uint64_t title_gpu = 0;  // GPU start as the title sees it (shader-visible heaps)
+  // Shader-visible heaps: a CPU-readable copy. The host's shader-visible heaps
+  // may only be written by the CPU (copying descriptors out of them is
+  // invalid, measured with the host's debug layer), while titles copy
+  // descriptors out of theirs. Descriptors are written into the shadow and
+  // published to the visible heap (publish_descriptors); copies read shadows.
+  ID3D12DescriptorHeap* shadow = nullptr;
+  uint64_t shadow_cpu = 0;
 };
 
 HRESULT create_descriptor_heap(Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, void** out);
@@ -50,7 +57,12 @@ bool find_descriptor(uint64_t title_handle, DescriptorLocation* out);
 bool find_gpu_descriptor(uint64_t title_gpu, DescriptorLocation* out);
 
 // The host CPU handle for a title CPU handle; zero if it is in no heap.
+// The host CPU handle descriptors are written through and copied from: the
+// shadow's for shader-visible heaps (publish them afterwards).
 D3D12_CPU_DESCRIPTOR_HANDLE host_cpu_handle(uint64_t title_handle);
+// Copies `count` descriptors from `title_handle` on from the shadow into the
+// shader-visible heap (nothing for heaps without a shadow).
+void publish_descriptors(uint64_t title_handle, uint32_t count = 1);
 // The host GPU handle for a title GPU handle (in a shader-visible heap's GPU
 // range); zero if it is in none.
 D3D12_GPU_DESCRIPTOR_HANDLE host_gpu_handle(uint64_t title_handle);

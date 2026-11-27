@@ -95,7 +95,7 @@ Notes describe the platform, never a title.
   is a multiple of 16 (as the desktop's user physical page frame numbers count 4 KiB frames). Numbers that are
   not are refused. Handing out consecutive numbers made such titles map 16 different pages as one.
 - Implementation: a page gets its storage when first mapped: a 64 KiB slice of a
-  committed pagefile-backed section laid out like the region it is mapped into (one section per chunk of up to
+  reserved pagefile-backed section laid out like the region it is mapped into (one section per chunk of up to
   1 GiB), at the offset of the granule. Pages a title maps side by side are therefore contiguous in one section,
   which lets the graphics library open one GPU heap over them. Mapping replaces 64 KiB placeholders with views
   of the slices, so a page mapped at two addresses is the same memory; private reservations titles carved out of
@@ -110,7 +110,10 @@ Notes describe the platform, never a title.
   gets its slice, and the granule its view, on first CPU access (a vectored exception handler in the memory
   library), when a buffer in it is handed to the kernel (the runtime's commit-before-I/O path calls the memory
   library first), or when the graphics library asks for the memory behind an address. Fresh storage reads as
-  zero. Commit charge is taken per section (up to 1 GiB) when its first page is used, not at mapping time.
+  zero. Commit charge is taken per page when it gets storage, and per 64 MiB block of a section when the GPU
+  first needs memory in it (the graphics library opens heaps over committed blocks of a view of the section:
+  *measured* host behaviour, a heap over a committed stretch of a view of a reserved section works and the GPU
+  and CPU see each other's writes), not at mapping time and not per section.
   Storage a freed page leaves behind is cleared before another page takes it, so freshly allocated pages read
   as zero (*assumed*, as the system's own pages do). A freed page that is still mapped somewhere keeps its
   storage until its last mapping goes, so a new page never shows through an old mapping.
@@ -246,7 +249,11 @@ Notes describe the platform, never a title.
     such allocations get a heap per committed stretch.
   - Descriptor heaps take their CPU memory from `XMemAlloc` as above; title CPU handles translate to host heaps
     by offset. Shader-visible heaps above the host's limit of 1,000,000 descriptors are created at the limit
-    (partial: descriptors past it are refused).
+    (partial: descriptors past it are refused). *measured* (the host's debug layer): the host's shader-visible
+    heaps may only be written by the CPU, and titles copy descriptors out of theirs; each such heap therefore
+    has a CPU-readable shadow: descriptors are written into the shadow and copied to the visible heap, and
+    copies read shadows. Heaps over committed title memory end where the page protection changes (the host
+    refuses mixed protection; titles hand thread stacks, with their guard pages, to the GPU too).
   - Committed resources are host committed resources; the matching `XMemAlloc` is made so titles' accounting
     holds.
   - Root signature flag bits above the desktop's are dropped. Compute pipelines whose shaders keep their DXIL

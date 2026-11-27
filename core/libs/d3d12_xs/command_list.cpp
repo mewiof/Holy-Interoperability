@@ -279,7 +279,7 @@ void STDMETHODCALLTYPE list_write_timestamp_x(CommandList* self, uint64_t addres
   }
   TimestampHeap* heap = timestamps(self->device);
   Backing backing;
-  if (!heap->heap || self->type == D3D12_COMMAND_LIST_TYPE_COPY || !locate(self->device, address, &backing) ||
+  if (!heap->heap || self->type == D3D12_COMMAND_LIST_TYPE_COPY || !locate(self->device, address, &backing, 8) ||
       !backing.whole || (backing.heap_offset & 7)) {
     LIB_LOG(lib::kError, "d3d12", "timestamp write to %p: not possible there", reinterpret_cast<void*>(address));
     return;

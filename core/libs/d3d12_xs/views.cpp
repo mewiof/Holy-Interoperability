@@ -112,6 +112,7 @@ void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_
     // the view becomes a null view of the requested kind.
     if (view->srv.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
       self->host->CreateShaderResourceView(nullptr, &view->srv, host_cpu_handle(dest));
+      publish_descriptors(dest);
     }
     write_indexed_descriptor(dest, kKindShaderResource);
     return;
@@ -120,6 +121,7 @@ void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_
     // A texture in title memory: viewed through a host copy (texture_upload.h).
     ID3D12Resource* texture = texture_at(self, *resource, view->address);
     if (texture) self->host->CreateShaderResourceView(texture, &view->srv, host_cpu_handle(dest));
+    if (texture) publish_descriptors(dest);
     write_indexed_descriptor(dest, kKindShaderResource);
     return;
   }
@@ -128,7 +130,7 @@ void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_
     return;
   }
   Backing backing;
-  if (!locate(self, view->address, &backing) || !backing.whole) {
+  if (!locate(self, view->address, &backing, 64ull << 20) || !backing.whole) {
     LIB_LOG(lib::kError, "d3d12", "buffer view at %p lies in no GPU memory", reinterpret_cast<void*>(view->address));
     return;
   }
@@ -138,6 +140,7 @@ void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_
                                                                          : format_bytes(host.Format);
   host.Buffer.FirstElement += slack_elements(backing.heap_offset, stride);
   self->host->CreateShaderResourceView(backing.whole, &host, host_cpu_handle(dest));
+  publish_descriptors(dest);
   const bool raw = (view->srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0;
   const uint32_t element = view->srv.Buffer.StructureByteStride;
   write_buffer_descriptor(dest, view->address + view->srv.Buffer.FirstElement * stride, raw ? 0 : element,
@@ -174,6 +177,7 @@ void STDMETHODCALLTYPE create_constant_buffer_view(Device* self, const D3D12_CON
     }
   }
   self->host->CreateConstantBufferView(host_viewable && desc ? &host : nullptr, host_cpu_handle(dest));
+  publish_descriptors(dest);
   if (desc) write_buffer_descriptor(dest, desc->BufferLocation, 0, desc->SizeInBytes);
 }
 
@@ -192,6 +196,7 @@ void STDMETHODCALLTYPE create_shader_resource_view(Device* self, void* resource,
     }
   }
   self->host->CreateShaderResourceView(host_resource(resource), desc ? &host : nullptr, host_cpu_handle(dest));
+  publish_descriptors(dest);
   if (object && desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
     const UINT stride = desc->Buffer.StructureByteStride ? desc->Buffer.StructureByteStride
                         : (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 4
@@ -226,6 +231,7 @@ void STDMETHODCALLTYPE create_unordered_access_view(Device* self, void* resource
       }
     }
     self->host->CreateUnorderedAccessView(object->twin, nullptr, desc ? &host : nullptr, host_cpu_handle(dest));
+    publish_descriptors(dest);
     write_indexed_descriptor(dest, kKindUnorderedAccess);
     return;
   }
@@ -242,6 +248,7 @@ void STDMETHODCALLTYPE create_unordered_access_view(Device* self, void* resource
   }
   self->host->CreateUnorderedAccessView(host_resource(resource), host_resource(counter), desc ? &host : nullptr,
                                         host_cpu_handle(dest));
+  publish_descriptors(dest);
   if (object && desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
     const UINT stride = desc->Buffer.StructureByteStride ? desc->Buffer.StructureByteStride
                         : (desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) ? 4
@@ -263,6 +270,7 @@ void STDMETHODCALLTYPE create_render_target_view(Device* self, void* resource,
     host.Format = host_view_format(resource, desc->Format);
   }
   self->host->CreateRenderTargetView(host_resource(resource), desc ? &host : nullptr, host_cpu_handle(dest));
+  publish_descriptors(dest);
 }
 
 void STDMETHODCALLTYPE create_depth_stencil_view(Device* self, void* resource,
@@ -273,10 +281,12 @@ void STDMETHODCALLTYPE create_depth_stencil_view(Device* self, void* resource,
     host.Format = desktop_format(desc->Format);
   }
   self->host->CreateDepthStencilView(host_resource(resource), desc ? &host : nullptr, host_cpu_handle(dest));
+  publish_descriptors(dest);
 }
 
 void STDMETHODCALLTYPE create_sampler(Device* self, const D3D12_SAMPLER_DESC* desc, SIZE_T dest) {
   self->host->CreateSampler(desc, host_cpu_handle(dest));
+  publish_descriptors(dest);
   write_indexed_descriptor(dest, kKindSampler);
 }
 
@@ -322,6 +332,7 @@ void STDMETHODCALLTYPE create_sampler_x(Device* self, const uint32_t* desc, SIZE
   host.MaxAnisotropy = anisotropy;
   for (int i = 0; i < 4; ++i) host.BorderColor[i] = as_float(17 + i);
   self->host->CreateSampler(&host, host_cpu_handle(dest));
+  publish_descriptors(dest);
   write_indexed_descriptor(dest, kKindSampler);
 }
 
@@ -333,6 +344,7 @@ void STDMETHODCALLTYPE copy_descriptors(Device* self, UINT dest_ranges, const SI
   for (UINT i = 0; i < source_ranges; ++i) sources[i] = host_cpu_handle(source_starts[i]);
   self->host->CopyDescriptors(dest_ranges, dests.data(), dest_sizes, source_ranges, sources.data(), source_sizes,
                               type);
+  for (UINT i = 0; i < dest_ranges; ++i) publish_descriptors(dest_starts[i], dest_sizes ? dest_sizes[i] : 1);
   // Descriptor memory, one descriptor at a time across both range lists
   // (a null size array means ranges of one).
   UINT d = 0, s = 0, d_at = 0, s_at = 0;
@@ -358,6 +370,7 @@ void STDMETHODCALLTYPE copy_descriptors(Device* self, UINT dest_ranges, const SI
 void STDMETHODCALLTYPE copy_descriptors_simple(Device* self, UINT count, SIZE_T dest, SIZE_T source,
                                                D3D12_DESCRIPTOR_HEAP_TYPE type) {
   self->host->CopyDescriptorsSimple(count, host_cpu_handle(dest), host_cpu_handle(source), type);
+  publish_descriptors(dest, count);
   copy_descriptor_memory(dest, source, count);
 }
 

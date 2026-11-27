@@ -197,7 +197,7 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   ID3D12Resource* staging = nullptr;
   uint64_t source_offset = 0;
   ID3D12Resource* source_buffer = nullptr;
-  if (size && locate(device, address, &backing) && backing.whole && backing.contiguous >= size) {
+  if (size && locate(device, address, &backing, size) && backing.whole && backing.contiguous >= size) {
     source_buffer = backing.whole;
     source_offset = backing.heap_offset;
   } else if (size && readable(address, size) && (staging = staged_copy(device, address, size)) != nullptr) {

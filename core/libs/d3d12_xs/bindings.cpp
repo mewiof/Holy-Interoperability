@@ -53,6 +53,9 @@ std::map<const void*, RootLayout>& layouts() {
 // --- upload ring ---------------------------------------------------------------------
 
 constexpr size_t kRingBytes = 64ull << 20;
+// How much of the memory around an address a region opens for the GPU (physical
+// pages: the heaps over their storage cover what is asked for).
+constexpr uint64_t kRegionHint = 64ull << 20;
 
 struct Ring {
   uint8_t* base = nullptr;
@@ -118,7 +121,7 @@ struct Regions {
   void add_address(Device* device, uint64_t address) {
     if (!address || covers(address)) return;
     Backing backing;
-    if (!locate(device, address, &backing) || !backing.whole) return;
+    if (!locate(device, address, &backing, kRegionHint) || !backing.whole) return;
     Region region;
     region.resource = backing.whole;
     if (backing.title_base) {
@@ -138,7 +141,7 @@ struct Regions {
 void add_heap(Device* device, const DescriptorHeap* heap, Regions* regions) {
   if (!heap || !heap->title_gpu) return;
   Backing backing;
-  if (!locate(device, heap->title_cpu, &backing) || !backing.whole) return;
+  if (!locate(device, heap->title_cpu, &backing, heap->title_bytes) || !backing.whole) return;
   regions->add({heap->title_gpu, heap->title_bytes, backing.whole, backing.heap_offset});
 }
 
@@ -237,7 +240,7 @@ void add_ring(Device* device, Regions* regions) {
   Ring* r = ring();
   if (!r->base) return;
   Backing backing;
-  if (!locate(device, reinterpret_cast<uint64_t>(r->base), &backing) || !backing.whole) return;
+  if (!locate(device, reinterpret_cast<uint64_t>(r->base), &backing, kRingBytes) || !backing.whole) return;
   regions->add({reinterpret_cast<uint64_t>(r->base), kRingBytes, backing.whole, backing.heap_offset});
 }
 

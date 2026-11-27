@@ -27,9 +27,8 @@
 // open one GPU heap over them (HolyXMemQueryPhysical). Mapping replaces a
 // 64 KiB placeholder with a view of the page's slice, so a page mapped at
 // several addresses is the same memory, as titles' CPU and GPU views expect.
-// Sections are committed (the host opens GPU heaps only over committed
-// sections); when the host is short of commit charge they are reserved and
-// pages are committed when mapped or first touched.
+// Sections are reserved; pages are committed when they get storage, and the
+// graphics library commits the blocks it opens GPU heaps over.
 //
 // Storage is created lazily: mapping a page that has none yet only records
 // the mapping. The page gets its storage, and the granule its view, on first
@@ -63,6 +62,10 @@ const holy::lib::Counter& c_section_committed() {
 }
 const holy::lib::Counter& c_section_reserved() {
   static const holy::lib::Counter c("xmem.physical_reserved_bytes");
+  return c;
+}
+const holy::lib::Counter& c_page_commit() {
+  static const holy::lib::Counter c("xmem.physical_page_commit_bytes");
   return c;
 }
 const holy::lib::Counter& c_pages_live() {
@@ -172,30 +175,15 @@ void add_region(uintptr_t begin, uintptr_t end) {
   regions().push_back(std::move(region));
 }
 
+// Sections are reserved: each page takes commit charge when it gets storage
+// (back_granule), and the graphics library commits the blocks it opens GPU
+// heaps over (gpu_memory.cpp). Commit charge follows use instead of whole
+// sections.
 int32_t create_section(uint64_t bytes) {
   Section section;
-  section.committed = true;
-  section.handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
+  section.committed = false;
+  section.handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                       static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
-  if (!section.handle && commit_exhausted(GetLastError())) {
-    section.committed = false;
-    section.handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
-                                        static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
-    // The host opens GPU heaps only over committed sections: GPU work on
-    // pages stored here will fail. Said once, plainly, since what fails later
-    // (placed buffers, the title's own checks) does not point here.
-    static std::atomic<bool> warned{false};
-    if (section.handle && !warned.exchange(true)) {
-      PERFORMANCE_INFORMATION system{};
-      system.cb = sizeof(system);
-      GetPerformanceInfo(&system, sizeof(system));
-      LIB_LOG(holy::lib::kError, "xmem",
-              "the host's commit is exhausted (%.1f of %.1f GiB): physical storage is only reserved, and the GPU "
-              "cannot use the pages stored in it; close programs or restart the host",
-              static_cast<double>(system.CommitTotal) * system.PageSize / (1ull << 30),
-              static_cast<double>(system.CommitLimit) * system.PageSize / (1ull << 30));
-    }
-  }
   if (!section.handle) {
     LIB_LOG(holy::lib::kError, "xmem", "cannot create 0x%llx bytes of physical storage (error %lu)",
             static_cast<unsigned long long>(bytes), GetLastError());
@@ -410,7 +398,21 @@ bool back_granule(uintptr_t granule, ULONG_PTR id) {
     // every other view of it then shares.
     if (VirtualAlloc(view, kPage, MEM_COMMIT, PAGE_READWRITE)) {
       page.committed = true;
+      c_page_commit().add(static_cast<int64_t>(kPage));
     } else if (commit_exhausted(GetLastError())) {
+      // Said once, plainly: what fails later (the GPU's heaps over this
+      // storage, titles' own checks) does not point here.
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true)) {
+        PERFORMANCE_INFORMATION system{};
+        system.cb = sizeof(system);
+        GetPerformanceInfo(&system, sizeof(system));
+        LIB_LOG(holy::lib::kError, "xmem",
+                "the host's commit is exhausted (%.1f of %.1f GiB): physical pages are committed on first touch, "
+                "and the GPU cannot use them; close programs or restart the host",
+                static_cast<double>(system.CommitTotal) * system.PageSize / (1ull << 30),
+                static_cast<double>(system.CommitLimit) * system.PageSize / (1ull << 30));
+      }
       HolyCommitOnDemand(view, kPage, PAGE_READWRITE);
     } else {
       return false;
@@ -567,7 +569,7 @@ HOLY_EXPORT BOOL HolyXMemQueryPhysical(const void* address, HANDLE* section, uin
       run += kPage;
     }
     *contiguous = run;
-    found = storage.committed ? TRUE : FALSE;
+    found = TRUE;
   }
   unlock();
   return found;

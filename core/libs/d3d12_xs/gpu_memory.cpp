@@ -2,8 +2,10 @@
 
 #include <d3d12.h>
 
+#include <algorithm>
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/support.h"
@@ -19,8 +21,25 @@ struct HeapRecord {
 };
 
 std::mutex g_lock;
-std::map<HANDLE, HeapRecord>& section_heaps() {
-  static auto* storage = new std::map<HANDLE, HeapRecord>();
+
+// Physical page storage: sections whose pages take commit as they are used
+// (xmem). The GPU reaches a section through heaps opened over committed spans
+// of a view of it kept here: spans of whole kBlock blocks covering what was
+// asked for, committed when first asked for. Measured host behaviour
+// (development host): a heap opened over a committed stretch of a view of a
+// reserved section works, and the GPU and the CPU see each other's writes; a
+// heap opened from the section handle itself (OpenExistingHeapFromFileMapping)
+// leaves the whole section's commit charged to the system after the process
+// ends, and the host opens it only over fully committed sections.
+constexpr uint64_t kBlock = 64ull << 20;
+
+struct SectionRecord {
+  uint8_t* view = nullptr;  // the whole section
+  uint64_t size = 0;
+  std::vector<std::pair<uint64_t, HeapRecord>> spans;  // (section offset, heap), a heap per span
+};
+std::map<HANDLE, SectionRecord>& sections() {
+  static auto* storage = new std::map<HANDLE, SectionRecord>();
   return *storage;
 }
 // Keyed by the end address of the allocation, for upper_bound lookups.
@@ -39,7 +58,13 @@ QueryPhysicalFn query_physical() {
 
 bool finish_record(Device* device, ID3D12Heap* heap, HeapRecord* record) {
   record->heap = heap;
-  record->size = heap->GetDesc().SizeInBytes;
+  // Buffers take whole 64 KiB units of a heap (measured, the host's debug
+  // layer: heaps over committed stretches can end inside one).
+  record->size = heap->GetDesc().SizeInBytes & ~0xFFFFull;
+  if (!record->size) {
+    heap->Release();
+    return false;
+  }
   D3D12_RESOURCE_DESC desc{};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
   desc.Width = record->size;
@@ -54,6 +79,8 @@ bool finish_record(Device* device, ID3D12Heap* heap, HeapRecord* record) {
   if (FAILED(hr)) {
     LIB_LOG(lib::kError, "d3d12", "cannot span a heap of 0x%llx bytes with a buffer (0x%08lX)",
             static_cast<unsigned long long>(record->size), static_cast<unsigned long>(hr));
+    heap->Release();
+    record->heap = nullptr;
     return false;
   }
   record->host_gpu_va = record->whole->GetGPUVirtualAddress();
@@ -80,41 +107,87 @@ ID3D12Device3* device3(Device* device) {
 
 }  // namespace
 
-bool locate(Device* device, uint64_t title_va, Backing* out) {
+namespace {
+
+const lib::Counter& c_block_commit() {
+  static const lib::Counter c("d3d12.gpu_block_commit_bytes");
+  return c;
+}
+
+// The heap over the blocks of `section` covering [begin, end), opened (and
+// the blocks committed) if no span covers them yet.
+const std::pair<uint64_t, HeapRecord>* section_span(Device* device, HANDLE section, uint64_t begin, uint64_t end) {
+  SectionRecord& record = sections()[section];
+  if (!record.view) {
+    MEMORY_BASIC_INFORMATION info{};
+    record.view = static_cast<uint8_t*>(MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0));
+    if (!record.view || !VirtualQuery(record.view, &info, sizeof(info))) {
+      LIB_LOG(lib::kError, "d3d12", "cannot map physical storage for the GPU (error %lu)", GetLastError());
+      if (record.view) UnmapViewOfFile(record.view);
+      record.view = nullptr;
+      return nullptr;
+    }
+    // The view's extent: the reservation of the whole section.
+    uint64_t size = 0;
+    for (uint8_t* at = record.view;;) {
+      MEMORY_BASIC_INFORMATION part{};
+      if (!VirtualQuery(at, &part, sizeof(part)) || part.AllocationBase != record.view) break;
+      size += part.RegionSize;
+      at += part.RegionSize;
+    }
+    record.size = size;
+  }
+  for (const auto& span : record.spans) {
+    if (begin >= span.first && end <= span.first + span.second.size) return &span;
+  }
+  const uint64_t first = begin & ~(kBlock - 1);
+  const uint64_t last = std::min((end + kBlock - 1) & ~(kBlock - 1), record.size);
+  if (last <= first) return nullptr;
+  if (!VirtualAlloc(record.view + first, last - first, MEM_COMMIT, PAGE_READWRITE)) {
+    LIB_LOG(lib::kError, "d3d12", "cannot commit 0x%llx bytes of physical storage for the GPU (error %lu)",
+            static_cast<unsigned long long>(last - first), GetLastError());
+    return nullptr;
+  }
+  c_block_commit().add(static_cast<int64_t>(last - first));
+  ID3D12Device13* d13 = device13(device);
+  ID3D12Heap* heap = nullptr;
+  const HRESULT hr = d13 ? d13->OpenExistingHeapFromAddress1(record.view + first, last - first, IID_PPV_ARGS(&heap))
+                         : E_NOINTERFACE;
+  if (FAILED(hr)) {
+    LIB_LOG(lib::kError, "d3d12", "cannot open a GPU heap over physical pages (0x%08lX)", static_cast<unsigned long>(hr));
+    return nullptr;
+  }
+  HeapRecord heap_record;
+  if (!finish_record(device, heap, &heap_record)) return nullptr;
+  LIB_LOG(lib::kDebug, "d3d12", "GPU heap over physical pages: section %p + 0x%llx, 0x%llx bytes, host %p", section,
+          static_cast<unsigned long long>(first), static_cast<unsigned long long>(heap_record.size),
+          reinterpret_cast<void*>(heap_record.host_gpu_va));
+  record.spans.emplace_back(first, heap_record);
+  return &record.spans.back();
+}
+
+}  // namespace
+
+bool locate(Device* device, uint64_t title_va, Backing* out, uint64_t size) {
+  return locate_range(device, title_va, size, out);
+}
+
+bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out) {
   std::lock_guard<std::mutex> lock(g_lock);
   ID3D12Device3* d3 = device3(device);
   if (!d3) return false;
 
-  // Physical pages the title mapped.
+  // Physical pages the title mapped: `run` bytes from the address are pages
+  // laid out in order in one section.
   HANDLE section = nullptr;
   uint64_t offset = 0, run = 0;
   if (query_physical() && query_physical()(reinterpret_cast<const void*>(title_va), &section, &offset, &run)) {
-    auto found = section_heaps().find(section);
-    if (found == section_heaps().end()) {
-      // Measured host behaviour (development host): a heap opened from the
-      // section itself (OpenExistingHeapFromFileMapping) keeps the section's
-      // commit charged to the system after the process ends, the whole
-      // section each time, released heap or not; a heap opened over a mapped
-      // view of it (OpenExistingHeapFromAddress) does not. So the heap is
-      // opened over a view of the whole section kept for it (address space
-      // only; the storage is the section's).
-      void* view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0);
-      ID3D12Heap* heap = nullptr;
-      const HRESULT hr = view ? d3->OpenExistingHeapFromAddress(view, IID_PPV_ARGS(&heap)) : E_OUTOFMEMORY;
-      if (FAILED(hr)) {
-        LIB_LOG(lib::kError, "d3d12", "cannot open a GPU heap over physical pages (0x%08lX, error %lu)",
-                static_cast<unsigned long>(hr), view ? 0ul : GetLastError());
-        if (view) UnmapViewOfFile(view);
-        return false;
-      }
-      HeapRecord record;
-      if (!finish_record(device, heap, &record)) return false;
-      LIB_LOG(lib::kDebug, "d3d12", "GPU heap over physical pages: section %p, 0x%llx bytes, host %p", section,
-              static_cast<unsigned long long>(record.size), reinterpret_cast<void*>(record.host_gpu_va));
-      found = section_heaps().emplace(section, record).first;
-    }
-    *out = Backing{found->second.heap, offset, run, found->second.host_gpu_va + offset, found->second.whole, 0,
-                   found->second.size};
+    const uint64_t wanted = std::max<uint64_t>(std::min(size ? size : 1, run), 1);
+    const auto* span = section_span(device, section, offset, offset + wanted);
+    if (!span) return false;
+    const uint64_t at = offset - span->first;
+    *out = Backing{span->second.heap, at, std::min(run, span->second.size - at), span->second.host_gpu_va + at,
+                   span->second.whole, 0, span->second.size};
     return true;
   }
 
@@ -141,12 +214,17 @@ bool locate(Device* device, uint64_t title_va, Backing* out) {
   // gaps between them. The host opens heaps from an address only over a
   // wholly committed allocation, or (ID3D12Device13) over a committed stretch
   // given with its size: such allocations get a heap per stretch.
+  // Measured (the host's debug layer): heaps are opened only over pages of one
+  // protection (titles hand thread stacks, whose guard pages differ, to the
+  // GPU too), so stretches also end where the protection changes.
   uintptr_t base = allocation, end = allocation_end;
   bool whole = true;
+  DWORD protection = 0;
   for (uintptr_t at = allocation; at < allocation_end;) {
     MEMORY_BASIC_INFORMATION part;
     if (!VirtualQuery(reinterpret_cast<void*>(at), &part, sizeof(part))) break;
-    if (part.State != MEM_COMMIT) whole = false;
+    if (part.State != MEM_COMMIT || (protection && part.Protect != protection)) whole = false;
+    if (!protection) protection = part.Protect;
     at = reinterpret_cast<uintptr_t>(part.BaseAddress) + part.RegionSize;
   }
   ID3D12Heap* heap = nullptr;
@@ -160,7 +238,7 @@ bool locate(Device* device, uint64_t title_va, Backing* out) {
     for (;;) {  // committed regions before and after (protection changes split regions)
       MEMORY_BASIC_INFORMATION part;
       if (base <= allocation || !VirtualQuery(reinterpret_cast<void*>(base - 1), &part, sizeof(part)) ||
-          part.State != MEM_COMMIT) {
+          part.State != MEM_COMMIT || part.Protect != info.Protect) {
         break;
       }
       base = reinterpret_cast<uintptr_t>(part.BaseAddress);
@@ -168,7 +246,7 @@ bool locate(Device* device, uint64_t title_va, Backing* out) {
     for (;;) {
       MEMORY_BASIC_INFORMATION part;
       if (end >= allocation_end || !VirtualQuery(reinterpret_cast<void*>(end), &part, sizeof(part)) ||
-          part.State != MEM_COMMIT) {
+          part.State != MEM_COMMIT || part.Protect != info.Protect) {
         break;
       }
       end = reinterpret_cast<uintptr_t>(part.BaseAddress) + part.RegionSize;
@@ -198,7 +276,7 @@ bool locate(Device* device, uint64_t title_va, Backing* out) {
 uint64_t translate_gpu_va(Device* device, uint64_t title_va) {
   if (!title_va) return 0;
   Backing backing;
-  return locate(device, title_va, &backing) ? backing.host_gpu_va : 0;
+  return locate(device, title_va, &backing, 1) ? backing.host_gpu_va : 0;
 }
 
 }  // namespace holy::d3d12

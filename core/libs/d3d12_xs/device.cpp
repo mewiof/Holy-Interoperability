@@ -1211,9 +1211,11 @@ Device* create_device(const void* parameters) {
           words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], words[8], words[9],
           words[10], words[11], words[12], words[13], words[14], words[15]);
 
-  // With debug logging, device removal records what the GPU was doing
-  // (the documented device-removed extended data).
-  if (HolyLogEnabled(lib::kDebug)) {
+  // With debug logging (or HOLY_D3D_DEBUG=1 alone), the host's debug layer
+  // checks every call and device removal records what the GPU was doing (the
+  // documented device-removed extended data).
+  const bool host_debug = HolyLogEnabled(lib::kDebug) || GetEnvironmentVariableW(L"HOLY_D3D_DEBUG", nullptr, 0) > 0;
+  if (host_debug) {
     ID3D12Debug* layer = nullptr;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&layer)))) {
       layer->EnableDebugLayer();
@@ -1244,7 +1246,7 @@ Device* create_device(const void* parameters) {
   g_device = device;
   LIB_LOG(lib::kInfo, "d3d12", "host Direct3D 12 device created");
   log_object_vtables();
-  if (HolyLogEnabled(lib::kDebug)) {
+  if (host_debug) {
     // The debug layer's warnings and errors go to the log as they happen.
     ID3D12InfoQueue1* queue = nullptr;
     if (SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&queue)))) {

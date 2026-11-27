@@ -32,8 +32,11 @@ struct Backing {
   uint64_t heap_size = 0;
 };
 
-// Finds (creating heaps on first use) what backs `title_va`.
-bool locate(Device* device, uint64_t title_va, Backing* out);
+// Finds (creating heaps on first use) what backs `title_va`, for `size` bytes
+// from it at least where the memory allows (physical pages: the GPU's heaps
+// over their storage are opened, and committed, over what is asked for).
+bool locate(Device* device, uint64_t title_va, Backing* out, uint64_t size);
+bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out);
 
 // Host GPU address for a title GPU address, or 0 if the address lies in no
 // memory the title owns.

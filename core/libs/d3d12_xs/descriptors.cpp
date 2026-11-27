@@ -73,6 +73,7 @@ ULONG STDMETHODCALLTYPE heap_release(DescriptorHeap* self) {
       if (self->title_gpu) heaps_by_gpu_end().erase(self->title_gpu + self->title_bytes);
     }
     self->host->Release();
+    if (self->shadow) self->shadow->Release();
     XMemFree(reinterpret_cast<void*>(self->title_cpu), kDescriptorHeapAttributes);
     delete self;
   }
@@ -147,6 +148,14 @@ HRESULT create_descriptor_heap(Device* device, const D3D12_DESCRIPTOR_HEAP_DESC*
   heap->host_cpu = host->GetCPUDescriptorHandleForHeapStart().ptr;
   if (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
     heap->host_gpu = host->GetGPUDescriptorHandleForHeapStart().ptr;
+    D3D12_DESCRIPTOR_HEAP_DESC shadow_desc = host_desc;
+    shadow_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    if (SUCCEEDED(device->host->CreateDescriptorHeap(&shadow_desc, IID_PPV_ARGS(&heap->shadow)))) {
+      heap->shadow_cpu = heap->shadow->GetCPUDescriptorHandleForHeapStart().ptr;
+    } else {
+      LIB_LOG(lib::kError, "d3d12", "no CPU-readable copy of a shader-visible heap of %u descriptors",
+              host_desc.NumDescriptors);
+    }
   }
   {
     std::lock_guard<std::mutex> lock(g_lock);
@@ -212,7 +221,20 @@ UINT title_descriptor_bytes(D3D12_DESCRIPTOR_HEAP_TYPE type) {
 D3D12_CPU_DESCRIPTOR_HANDLE host_cpu_handle(uint64_t title_handle) {
   DescriptorLocation where;
   if (!find_descriptor(title_handle, &where)) return {0};
-  return {static_cast<SIZE_T>(where.heap->host_cpu + static_cast<uint64_t>(where.index) * where.heap->increment)};
+  const uint64_t base = where.heap->shadow ? where.heap->shadow_cpu : where.heap->host_cpu;
+  return {static_cast<SIZE_T>(base + static_cast<uint64_t>(where.index) * where.heap->increment)};
+}
+
+void publish_descriptors(uint64_t title_handle, uint32_t count) {
+  DescriptorLocation where;
+  if (!count || !find_descriptor(title_handle, &where) || !where.heap->shadow) return;
+  ID3D12Device* device = host_device();
+  if (!device) return;
+  const uint32_t available = where.heap->host_count - where.index;
+  const uint64_t offset = static_cast<uint64_t>(where.index) * where.heap->increment;
+  device->CopyDescriptorsSimple(count < available ? count : available,
+                                {static_cast<SIZE_T>(where.heap->host_cpu + offset)},
+                                {static_cast<SIZE_T>(where.heap->shadow_cpu + offset)}, where.heap->desc.Type);
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE host_gpu_handle(uint64_t title_handle) {

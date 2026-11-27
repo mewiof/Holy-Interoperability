@@ -483,7 +483,7 @@ HRESULT create_placed_resource_x(Device* device, uint64_t address, const D3D12_R
     return S_OK;
   }
   Backing backing;
-  if (!locate(device, address, &backing) || backing.contiguous < desc->Width) {
+  if (!locate(device, address, &backing, desc->Width) || backing.contiguous < desc->Width) {
     LIB_LOG(lib::kError, "d3d12", "no GPU heap backs a buffer of 0x%llx bytes at %p (heap %p, 0x%llx contiguous)",
             static_cast<unsigned long long>(desc->Width), reinterpret_cast<void*>(address),
             static_cast<void*>(backing.heap), static_cast<unsigned long long>(backing.contiguous));

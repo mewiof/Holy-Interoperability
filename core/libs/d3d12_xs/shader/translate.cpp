@@ -869,8 +869,16 @@ bool Translator::emit_sopk(const Instruction& inst) {
   const uint16_t d = inst.dst;
   const Operand simm = I(static_cast<uint32_t>(inst.imm));
   const Operand uimm = I(static_cast<uint32_t>(inst.imm) & 0xFFFF);
+  // Without a destination: s_version (1), s_setreg (19: the register is its
+  // source; 21: a literal), the waits (23-26; documented: a null register
+  // waits for the immediate count alone). Not modelled: rounding and denormal
+  // modes, and waits (the host orders memory accesses itself).
+  switch (inst.op) {
+    case 1: case 19: case 21: case 23: case 24: case 25: case 26: return true;
+    default: break;
+  }
   const uint32_t reg_index = sreg(d);
-  if (reg_index == kNoRegister && inst.op != 18) return fail("SOPK without a register");
+  if (reg_index == kNoRegister && inst.op != 18) return fail(format("SOPK op %u without a register", inst.op));
   const Operand reg = R(reg_index == kNoRegister ? 0 : reg_index);
   switch (inst.op) {
     case 0: put(reg_index, simm); return true;
@@ -895,8 +903,6 @@ bool Translator::emit_sopk(const Instruction& inst) {
     }
     case 16: put(reg_index, mul_lo(reg, simm)); return true;
     case 18: set_s(d, I(0)); return true;              // s_getreg_b32: hardware state reads as zero
-    case 19: case 21: return true;                     // s_setreg: rounding/denormal modes, not modelled
-    case 23: case 24: case 25: case 26: return true;   // waits
     default: return fail(format("SOPK op %u", inst.op));
   }
 }

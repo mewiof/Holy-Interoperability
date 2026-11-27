@@ -613,11 +613,14 @@ TEST(scalar_bit_counts_and_searches_run_as_documented) {
   // s8 = s_flbit_i32_b64 s[4:5]; s9 = s_bcnt0_i32_b64 s[4:5];
   // s10 = s_flbit_i32_i64 s[12:13]; s[14:15] = s_brev_b64 s[4:5];
   // s_bitset1_b64 s[16:17], 40; v0-v7 = s6-s10, s14, s15, s17;
+  // s_waitcnt_vscnt null, 0; s_setreg_imm32_b32 hwreg(1, 4, 4), 3 (neither
+  // has a destination register);
   // buffer_store_dwordx4 v[0:3] offset:64; v[4:7] offset:80; s_endpgm.
   const std::vector<uint32_t> program = {
       0xBE8403FFu, 0x00000100u, 0xBE850380u, 0xBE8C03FFu, 0xFFFF0000u, 0xBE8D03C1u, 0xBE900380u, 0xBE910380u,
       0xBE861404u, 0xBE8717FFu, 0x40000000u, 0xBE881604u, 0xBE890E04u, 0xBE8A180Cu, 0xBE8E0C04u, 0xBE901EA8u,
       0x7E000206u, 0x7E020207u, 0x7E040208u, 0x7E060209u, 0x7E08020Au, 0x7E0A020Eu, 0x7E0C020Fu, 0x7E0E0211u,
+      0xBBFD0000u, 0xBA801901u, 0x00000003u,
       0xE0780040u, 0x80000000u, 0xE0780050u, 0x80000400u, 0xBF810000u};
   std::vector<uint8_t> code;
   for (uint32_t v : program) {

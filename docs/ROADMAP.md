@@ -116,7 +116,13 @@ The largest piece.
 - done: native pipelines with a program that neither exports nor interpolates (depth-only passes) and with an
   unusual target field; placeholder pipelines in the reference title's first minute went from 426 to 66.
 - done: unordered-access views of depth textures, through a twin texture kept in step at barriers.
-- next: ray intersection image instructions in compute programs.
+- next: ray intersection image instructions in compute programs. Each instruction tests one node of a bounding
+  volume hierarchy in the layout the console's driver builds (box nodes with four children, triangle nodes; the
+  title's own code walks the tree and reads instance nodes), so emulating the instruction also means building
+  acceleration structures in that same layout when the title asks for them; host acceleration structures are
+  opaque and cannot serve.
+- done: scalar waits and mode writes without a register (`s_waitcnt_vscnt null`, `s_setreg_imm32_b32`)
+  translate; programs using them were refused.
 - next: textures streamed into scattered pool pages are copied through the CPU.
 - open: textures the GPU writes in title memory as seen by the CPU.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed

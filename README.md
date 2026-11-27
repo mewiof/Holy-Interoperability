@@ -37,9 +37,9 @@ flowchart LR
 | Graphics device, title memory as GPU memory, pipelines from native GPU code | ✅ done; translated rendering not yet checked against known results |
 | Start-up in seconds, memory within the host's means | ✅ first frame after 3 s; about 5 GiB of commit at the first frames (was 17 GiB) |
 | Frames presented at the title's pace | ✅ 30 a second, measured |
-| Runs for minutes without crashing | 🟡 five stops in the title's first seconds fixed; it now loads for about 90 s on the development host, until the host's commit runs out (pinned by a host graphics driver leak that older builds triggered; a host restart frees it) |
+| Runs for minutes without crashing | 🟡 five stops in the title's first seconds fixed; runs on the development host now end within 2-30 s because its system commit is exhausted (about 60 GiB still pinned by a host graphics driver leak that older builds triggered; current builds measurably do not leak, and a host restart frees it). The "invalid call" device removals in those runs follow the exhausted commit (`HOLY_D3D_CHECK` finds no call that causes them) |
 | No memory leaks (RAM, VRAM, system commit) | 🟡 live-object counters in every run; host heaps no longer leak system commit after exit, released textures free their host copies |
-| A correct picture | ⬜ frames are black |
+| A correct picture | ⬜ frames are black: the loading screen's three draws a frame reach no render target (every texture reads zero); a per-frame call trace (`HOLY_D3D_TRACE`) is ready to find out why |
 | Menus and input | 🟡 a gamepad from the host controller or keyboard; menus not reached yet |
 | Sound | ⬜ silent audio device |
 | In game at a stable 30 FPS, no leaks | ⬜ |
@@ -51,13 +51,13 @@ flowchart LR
 | Fast storage | `███████░░░` 70% |
 | Game runtime services | `██████░░░░` 60% |
 | Graphics: device, resources, command recording | `█████░░░░░` 50% |
-| Graphics: shader translation | `█████░░░░░` 45% |
+| Graphics: shader translation | `█████░░░░░` 45% (ray-intersection instructions open) |
 | Graphics: pipelines and caches | `███████░░░` 70% |
 | Graphics: correct output | `█░░░░░░░░░` 8% |
 | Graphics: performance | `█░░░░░░░░░` 10% |
 | Input | `████░░░░░░` 40% |
 | Audio | `█░░░░░░░░░` 10% |
-| Measurement: statistics, profiler, leak checks | `███████░░░` 70% |
+| Measurement: statistics, profiler, leak checks, call check, frame trace | `████████░░` 75% |
 
 ## How it works
 

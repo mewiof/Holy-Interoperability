@@ -908,7 +908,9 @@ Notes describe the platform, never a title.
   of other translator builds are deleted in the background when a run first uses the cache (they are never hit
   again). Translations of more than 256 KiB are compiled one at a time (*observed* host behaviour: the driver
   refuses some such programs with `E_OUTOFMEMORY` when several compile at once, and accepts them alone), with
-  one retry. The private host cache is discarded only after such a refusal.
+  one retry. Caveat: this was observed while the development host's system commit was nearly exhausted (the
+  driver's compiler also ran out of memory compiling four large programs at once there); 41% of translations
+  are over 256 KiB, so the rule is to be measured again on a healthy host. The private host cache is discarded only after such a refusal.
 - *observed*: titles create pipelines by the tens of thousands while loading (over 80,000 in the first minutes,
   about 63,000 of them distinct once translated), and draw with a small part of them; creation is cheap on the
   console. *measured* on the development host: a compiled translated pipeline holds about 45 KB of driver

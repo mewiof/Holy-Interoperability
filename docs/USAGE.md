@@ -53,7 +53,9 @@ use, and at creation for pipelines used in an earlier run; `eager` all at creati
 Every ten seconds, and when the title ends or crashes, the runtime log gets a statistics report: the process's
 commit and working set, the system's commit, and named counters with their change since the previous report
 (`d3d12.presents` is the frame count, `d3d12.frame_gap_max_ms` the longest frame of the last ten seconds,
-`d3d12.vram_local_mb` the host GPU memory in use, `xmem.*` and `memory.*` title memory). A counter of live objects
+`d3d12.vram_local_mb` the host GPU memory in use, `d3d12.host_textures_from_memory` and
+`d3d12.host_texture_bytes_from_memory` the host copies of textures the title views in its memory, `xmem.*` and
+`memory.*` title memory). A counter of live objects
 that only grows while the title does the same thing over and over is a leak. `--profile` adds where the
 title's threads spend their time.
 

@@ -59,6 +59,10 @@ void unregister_texture(const D3D12_RESOURCE_DESC& desc, uint64_t address, ID3D1
 // remapped, memory released, a library's or the kernel's write announced).
 // Safe to call under other libraries' locks.
 void texture_memory_changed(uint64_t address, uint64_t size);
+// The title released [address, address + size): the textures filled from it
+// are gone (a texture viewed there later is a new one). Safe under other
+// libraries' locks.
+void texture_memory_released(uint64_t address, uint64_t size);
 
 // Copies again the host textures whose title memory was written since they
 // were filled, and makes `queue` wait for the copies before its next work.

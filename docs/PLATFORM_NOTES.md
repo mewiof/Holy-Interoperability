@@ -449,7 +449,12 @@ Notes describe the platform, never a title.
   the title releases it, for as long as the heap lives (16 rounds of 64 MiB placed, released and freed left
   1,026 MiB charged). The runtime therefore lets go of heaps over title memory before the title's `VirtualFree`
   and `XMemFree` release it (`HolySetReleaseHook`); measured: no growth over the same rounds. Titles release memory
-  once the GPU is done with it, as on the console.
+  once the GPU is done with it, as on the console. Host copies of textures filled from released memory leave the
+  registry with it (a texture viewed there later is a new one, filled then); their host textures are let go of
+  two seconds later (*assumed*: no work submitted before still reads them by then). A heap still recorded over
+  memory whose allocation is gone or changed (released where the runtime does not hear of it) is let go of and
+  opened again when an address in it is next located. Partial: memory released that way and allocated again at
+  the same base is not told apart.
 - *measured* host behaviour (development host): memory a heap was opened over (`OpenExistingHeapFromAddress`)
   refuses protection changes (`VirtualProtect` fails with error 87), and a heap cannot be opened over read-only
   memory (`E_INVALIDARG`): write tracking of title memory by page protection does not work where the GPU reaches it.

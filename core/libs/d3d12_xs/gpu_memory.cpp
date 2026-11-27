@@ -25,6 +25,9 @@ struct HeapRecord {
   uint64_t host_gpu_va = 0;
   uint64_t size = 0;
   uint32_t slot = 0;  // first memory slot
+  // Committed memory: the base of the allocation the heap was opened over,
+  // telling memory released and allocated again at the same address apart.
+  uint64_t allocation = 0;
 };
 
 std::mutex g_lock;
@@ -90,6 +93,8 @@ uint32_t add_slots(Device* device, const HeapRecord& record) {
     g_map.slots[slot] = Slot{record.whole, 0, record.size};
     for (const DescriptorHeap* heap : g_map.heaps) write_slot_view(device, heap, slot);
     c_slots().add(1);
+    LIB_LOG(lib::kDebug, "d3d12", "memory slot %u (reused) for a heap of 0x%llx bytes", slot,
+            static_cast<unsigned long long>(record.size));
     return slot;
   }
   const uint32_t first = static_cast<uint32_t>(g_map.slots.size());
@@ -109,6 +114,8 @@ uint32_t add_slots(Device* device, const HeapRecord& record) {
     for (const DescriptorHeap* heap : g_map.heaps) write_slot_view(device, heap, static_cast<uint32_t>(first + i));
   }
   c_slots().add(static_cast<int64_t>(count));
+  LIB_LOG(lib::kDebug, "d3d12", "memory slots %u-%llu for a heap of 0x%llx bytes", first,
+          static_cast<unsigned long long>(first + count - 1), static_cast<unsigned long long>(record.size));
   return first;
 }
 
@@ -143,6 +150,8 @@ volatile uint32_t* page_entry(uint64_t title_va, bool make) {
 // `begin` on in the heap whose first slot is `first_slot` (g_lock held).
 void map_pages(uint64_t begin, uint64_t end, uint32_t first_slot, uint64_t heap_offset) {
   if (!first_slot) return;
+  LIB_LOG(lib::kTrace, "d3d12", "pages %p-%p: slot %u from heap offset 0x%llx", reinterpret_cast<void*>(begin),
+          reinterpret_cast<void*>(end), first_slot, static_cast<unsigned long long>(heap_offset));
   for (uint64_t page = begin & ~0xFFFFull; page < end; page += 0x10000) {
     // The heap offset of the page's start: before the heap for a first page
     // that starts before it (those addresses then fall outside the view).
@@ -302,39 +311,51 @@ const lib::Counter& c_heaps_released() {
 // first, as the host requires, their pages leaving the page table and their
 // slots becoming null views for reuse. Titles release memory once the GPU is
 // done with it, as on the console.
-void release_title_memory(const void* address, size_t size) {
-  const auto begin = reinterpret_cast<uintptr_t>(address);
-  const uintptr_t end = begin + size;
-  texture_memory_changed(begin, size);
-  std::vector<HeapRecord> retired;
-  {
-    std::lock_guard<std::mutex> lock(g_lock);
-    auto it = region_heaps().upper_bound(begin);
-    while (it != region_heaps().end() && it->second.first < end) {
-      const uintptr_t base = it->second.first;
-      const HeapRecord record = it->second.second;
-      const uint64_t slots = record.slot ? slot_count(record.size) : 0;
-      for (uint64_t page = base & ~0xFFFFull; page < base + record.size; page += 0x10000) {
-        volatile uint32_t* entry = page_entry(page, false);
-        if (entry && entry[0] >= record.slot && entry[0] < record.slot + slots) entry[0] = 0;
-      }
-      for (uint64_t i = 0; i < slots; ++i) {
-        const auto slot = static_cast<uint32_t>(record.slot + i);
-        g_map.slots[slot] = Slot{};
-        for (const DescriptorHeap* heap : g_map.heaps) write_slot_view(g_map.device, heap, slot);
-        g_map.free_slots.push_back(slot);
-      }
-      c_slots().add(-static_cast<int64_t>(slots));
-      retired.push_back(record);
-      it = region_heaps().erase(it);
-      g_generation.fetch_add(1, std::memory_order_acq_rel);
-    }
+// Takes a heap over committed memory out of the memory map (g_lock held):
+// its pages leave the page table, its slots become null views for reuse. The
+// record goes to `retired` (its heap and buffer released by the caller).
+std::map<uintptr_t, std::pair<uintptr_t, HeapRecord>>::iterator retire_locked(
+    std::map<uintptr_t, std::pair<uintptr_t, HeapRecord>>::iterator it, std::vector<HeapRecord>* retired) {
+  const uintptr_t base = it->second.first;
+  const HeapRecord record = it->second.second;
+  const uint64_t slots = record.slot ? slot_count(record.size) : 0;
+  for (uint64_t page = base & ~0xFFFFull; page < base + record.size; page += 0x10000) {
+    volatile uint32_t* entry = page_entry(page, false);
+    if (entry && entry[0] >= record.slot && entry[0] < record.slot + slots) entry[0] = 0;
   }
+  for (uint64_t i = 0; i < slots; ++i) {
+    const auto slot = static_cast<uint32_t>(record.slot + i);
+    g_map.slots[slot] = Slot{};
+    for (const DescriptorHeap* heap : g_map.heaps) write_slot_view(g_map.device, heap, slot);
+    g_map.free_slots.push_back(slot);
+  }
+  c_slots().add(-static_cast<int64_t>(slots));
+  LIB_LOG(lib::kDebug, "d3d12", "heap over %p (0x%llx bytes, slot %u) released with the memory",
+          reinterpret_cast<void*>(base), static_cast<unsigned long long>(record.size), record.slot);
+  retired->push_back(record);
+  g_generation.fetch_add(1, std::memory_order_acq_rel);
+  return region_heaps().erase(it);
+}
+
+void release_retired(const std::vector<HeapRecord>& retired) {
   for (const HeapRecord& record : retired) {
     record.whole->Release();
     record.heap->Release();
   }
   if (!retired.empty()) c_heaps_released().add(static_cast<int64_t>(retired.size()));
+}
+
+void release_title_memory(const void* address, size_t size) {
+  const auto begin = reinterpret_cast<uintptr_t>(address);
+  const uintptr_t end = begin + size;
+  texture_memory_released(begin, size);
+  std::vector<HeapRecord> retired;
+  {
+    std::lock_guard<std::mutex> lock(g_lock);
+    auto it = region_heaps().upper_bound(begin);
+    while (it != region_heaps().end() && it->second.first < end) it = retire_locked(it, &retired);
+  }
+  release_retired(retired);
 }
 
 // The page table (g_lock held), made on first use: process memory the GPU
@@ -498,11 +519,30 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
   // Committed memory the title allocated.
   auto region = region_heaps().upper_bound(title_va);
   if (region != region_heaps().end() && title_va >= region->second.first) {
-    const uint64_t at = title_va - region->second.first;
-    *out = Backing{region->second.second.heap, at, region->first - title_va, region->second.second.host_gpu_va + at,
-                   region->second.second.whole, region->second.first, region->second.second.size,
-                   region->second.second.slot};
-    return true;
+    // Still the allocation the heap was opened over? Memory released without
+    // the runtime hearing of it and allocated again at the same address would
+    // otherwise reach the old heap's pages (the GPU then reads and writes
+    // memory the title no longer has).
+    MEMORY_BASIC_INFORMATION now{};
+    if (VirtualQuery(reinterpret_cast<void*>(title_va), &now, sizeof(now)) && now.State == MEM_COMMIT &&
+        reinterpret_cast<uint64_t>(now.AllocationBase) == region->second.second.allocation) {
+      const uint64_t at = title_va - region->second.first;
+      *out = Backing{region->second.second.heap, at, region->first - title_va, region->second.second.host_gpu_va + at,
+                     region->second.second.whole, region->second.first, region->second.second.size,
+                     region->second.second.slot};
+      return true;
+    }
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) {
+      LIB_LOG(lib::kError, "d3d12",
+              "the GPU heap over %p was still recorded after its memory was released (allocation %p, now %p, "
+              "state 0x%lx): opened again",
+              reinterpret_cast<void*>(region->second.first),
+              reinterpret_cast<void*>(region->second.second.allocation), now.AllocationBase, now.State);
+    }
+    std::vector<HeapRecord> retired;
+    retire_locked(region, &retired);
+    release_retired(retired);
   }
   MEMORY_BASIC_INFORMATION info;
   if (!VirtualQuery(reinterpret_cast<void*>(title_va), &info, sizeof(info)) || info.State == MEM_FREE) return false;
@@ -572,6 +612,7 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
           reinterpret_cast<void*>(base), static_cast<unsigned long long>(record.size),
           reinterpret_cast<void*>(allocation), static_cast<unsigned long long>(allocation_end - allocation),
           reinterpret_cast<void*>(record.host_gpu_va));
+  record.allocation = allocation;
   region_heaps()[base + record.size] = std::make_pair(base, record);
   map_pages(base, base + record.size, record.slot, 0);
   const uint64_t at = title_va - base;

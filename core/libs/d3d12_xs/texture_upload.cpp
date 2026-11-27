@@ -55,7 +55,6 @@ struct Tracked {
 
 // The registry, its tracking and the uploader.
 std::mutex g_lock;
-std::atomic<uint64_t> g_texture_bytes{0};
 std::map<Key, Record*>& textures() {
   static auto* map = new std::map<Key, Record*>();
   return *map;
@@ -72,7 +71,22 @@ ULONGLONG g_last_scan = 0;
 // released, writes into untracked memory announced), queued under a leaf lock
 // (they are reported under other libraries' locks) and applied under g_lock.
 std::mutex g_changes_lock;
-std::vector<std::pair<uint64_t, uint64_t>> g_changes;
+struct Change {
+  uint64_t begin;
+  uint64_t size;
+  bool released;  // the title released the memory (else it changed)
+  ULONGLONG when;  // GetTickCount64 when it was reported
+};
+std::vector<Change> g_changes;
+// Host textures of records dropped because their memory was released, let go
+// of a while later (GPU work submitted before may still read them).
+struct Retired {
+  ULONGLONG since;
+  ID3D12Resource* texture;
+  uint64_t bytes;  // in title memory (the live count's share)
+};
+std::vector<Retired> g_retired;  // under g_lock
+constexpr ULONGLONG kRetireMs = 2000;
 std::atomic<bool> g_any_change{false};
 
 const lib::Counter& c_refreshes() {
@@ -82,6 +96,23 @@ const lib::Counter& c_refreshes() {
 const lib::Counter& c_untracked() {
   static const lib::Counter c("d3d12.textures_untracked");
   return c;
+}
+// Host textures filled from title memory the runtime holds, and their bytes
+// in title memory (live: they fall as the textures are let go of).
+const lib::Counter& c_live_textures() {
+  static const lib::Counter c("d3d12.host_textures_from_memory");
+  return c;
+}
+const lib::Counter& c_live_texture_bytes() {
+  static const lib::Counter c("d3d12.host_texture_bytes_from_memory");
+  return c;
+}
+
+// Lets go of a host texture filled from title memory (g_lock held).
+void release_filled(ID3D12Resource* texture, uint64_t bytes) {
+  texture->Release();
+  c_live_textures().add(-1);
+  c_live_texture_bytes().add(-static_cast<int64_t>(bytes));
 }
 
 // HOLY_TEXTURE_TRACKING=0 turns tracking off (textures are copied once).
@@ -167,23 +198,59 @@ void scan_range(Tracked& allocation, uint64_t begin, uint64_t end) {
   }
 }
 
+void drop(Record* record, ULONGLONG released = 0);
+
+// Drops the records filled from memory over [begin, end) (g_lock held): the
+// title released the memory at `released` (GetTickCount64), so the textures
+// there are gone; a texture viewed there later is a new one, filled from the
+// memory then.
+void drop_range(uint64_t begin, uint64_t end, ULONGLONG released) {
+  auto it = textures().lower_bound(Key{begin > g_largest ? begin - g_largest : 0, 0, 0, 0, 0, 0, 0});
+  while (it != textures().end() && std::get<0>(it->first) < end) {
+    Record* record = it->second;
+    if (record->from_memory && record->address + record->size > begin) {
+      drop(record, released);
+      it = textures().erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+// Lets go of the retired host textures old enough to be done with (g_lock held).
+void release_retired(ULONGLONG now) {
+  while (!g_retired.empty() && now - g_retired.front().since > kRetireMs) {
+    release_filled(g_retired.front().texture, g_retired.front().bytes);
+    g_retired.erase(g_retired.begin());
+  }
+}
+
+// Applies the queued changes (g_lock held).
+void apply_changes() {
+  if (!g_any_change.load(std::memory_order_acquire)) return;
+  std::vector<Change> changes;
+  {
+    std::lock_guard<std::mutex> guard(g_changes_lock);
+    changes.swap(g_changes);
+    g_any_change.store(false, std::memory_order_relaxed);
+  }
+  for (const Change& change : changes) {
+    if (change.released) {
+      drop_range(change.begin, change.begin + change.size, change.when);
+    } else {
+      mark_range(change.begin, change.begin + change.size);
+    }
+    forget_memory(change.begin, change.size);  // the pages lose their watches (refreshed records watch again)
+  }
+}
+
 // Applies queued changes and, at most every 16 ms (about once a frame), asks
 // the host which tracked pages were written: one query per tracked
 // allocation, over the span its textures cover (g_lock held).
 void scan() {
-  if (g_any_change.load(std::memory_order_acquire)) {
-    std::vector<std::pair<uint64_t, uint64_t>> changes;
-    {
-      std::lock_guard<std::mutex> guard(g_changes_lock);
-      changes.swap(g_changes);
-      g_any_change.store(false, std::memory_order_relaxed);
-    }
-    for (const auto& [begin, size] : changes) {
-      mark_range(begin, begin + size);
-      forget_memory(begin, size);  // remapped or released pages lose their watches (refreshed records watch again)
-    }
-  }
+  apply_changes();
   const ULONGLONG now = GetTickCount64();
+  release_retired(now);
   if (now - g_last_scan < 16) return;
   g_last_scan = now;
   for (auto& [base, allocation] : tracked()) {
@@ -218,15 +285,25 @@ void track(Record* record) {
   }
 }
 
-// The registry lets go of a record (g_lock held).
-void drop(Record* record) {
+// The registry lets go of a record (g_lock held). `released`: when the title
+// released its memory (GetTickCount64); its host texture then goes kRetireMs
+// after that. 0: at once.
+void drop(Record* record, ULONGLONG released) {
   if (record->protected_watch) unwatch(reinterpret_cast<WatchToken>(record));
   g_dirty.erase(std::remove(g_dirty.begin(), g_dirty.end(), record), g_dirty.end());
   for (auto& [base, allocation] : tracked()) {
     auto& list = allocation.records;
     list.erase(std::remove(list.begin(), list.end(), record), list.end());
   }
-  if (record->texture) record->texture->Release();
+  if (record->texture && record->from_memory) {
+    if (released) {
+      g_retired.push_back({released, record->texture, record->size});
+    } else {
+      release_filled(record->texture, record->size);
+    }
+  } else if (record->texture) {
+    record->texture->Release();
+  }
   delete record;
 }
 
@@ -354,20 +431,29 @@ bool record_fill(Device* device, Uploader* up, const Record& record, ID3D12Resou
   // Observed: titles stream textures into pages of a pool mapped one by one
   // into an address range (queue slot 31), so no host heap backs such a
   // texture as a whole; the CPU reads it through the title's addresses.
-  if (locate(device, record.address, &backing, record.size) && backing.whole && backing.contiguous >= record.size) {
+  const bool located = locate(device, record.address, &backing, record.size);
+  bool is_readable = false;
+  if (located && backing.whole && backing.contiguous >= record.size) {
     source_buffer = backing.whole;
     source_offset = backing.heap_offset;
-  } else if (readable(record.address, record.size)) {
+  } else if ((is_readable = readable(record.address, record.size))) {
     source_buffer = staged_copy(device, record.address, record.size);
     if (source_buffer) up->staging.push_back(source_buffer);
   }
   if (!source_buffer) {
     if (first) {
+      MEMORY_BASIC_INFORMATION info{};
+      VirtualQuery(reinterpret_cast<const void*>(record.address), &info, sizeof(info));
       LIB_LOG(lib::kError, "d3d12",
-              "texture dim %u %llux%ux%u, %u mips, format %u at %p (0x%llx bytes) lies in no readable memory",
+              "texture dim %u %llux%ux%u, %u mips, format %u at %p (0x%llx bytes): no copy (%s; memory state 0x%lx, "
+              "protection 0x%lx, type 0x%lx, allocation %p)",
               shape.dimension, static_cast<unsigned long long>(shape.width), shape.height, shape.depth_or_array,
               shape.mips, shape.format, reinterpret_cast<void*>(record.address),
-              static_cast<unsigned long long>(record.size));
+              static_cast<unsigned long long>(record.size),
+              is_readable ? "no upload buffer"
+              : located   ? "no GPU heap covers it whole, and it cannot be read"
+                          : "it lies in no readable memory",
+              info.State, info.Protect, info.Type, info.AllocationBase);
     }
     return false;
   }
@@ -469,6 +555,10 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   const Key key = key_of(address, shape);
 
   std::lock_guard<std::mutex> guard(g_lock);
+  // Released memory's textures go first: a texture viewed in memory the title
+  // released and reused is a new one.
+  apply_changes();
+  release_retired(GetTickCount64());
   auto found = textures().find(key);
   if (found != textures().end()) return found->second->texture;
 
@@ -534,14 +624,22 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
           reinterpret_cast<void*>(address));
   textures().emplace(key, record);
   g_largest = std::max(g_largest, size);
-  g_texture_bytes.fetch_add(size, std::memory_order_relaxed);
+  c_live_textures().add(1);
+  c_live_texture_bytes().add(static_cast<int64_t>(size));
   return texture;
+}
+
+void texture_memory_released(uint64_t address, uint64_t size) {
+  if (!size) return;
+  std::lock_guard<std::mutex> guard(g_changes_lock);
+  g_changes.push_back({address, size, true, GetTickCount64()});
+  g_any_change.store(true, std::memory_order_release);
 }
 
 void texture_memory_changed(uint64_t address, uint64_t size) {
   if (!size) return;
   std::lock_guard<std::mutex> guard(g_changes_lock);
-  g_changes.emplace_back(address, size);
+  g_changes.push_back({address, size, false, GetTickCount64()});
   g_any_change.store(true, std::memory_order_release);
 }
 
@@ -575,8 +673,8 @@ void refresh_textures(Device* device, ID3D12CommandQueue* queue) {
 
 void host_texture_totals(uint64_t* count, uint64_t* bytes) {
   std::lock_guard<std::mutex> guard(g_lock);
-  *count = textures().size();
-  *bytes = g_texture_bytes.load(std::memory_order_relaxed);
+  *count = static_cast<uint64_t>(c_live_textures().value());
+  *bytes = static_cast<uint64_t>(c_live_texture_bytes().value());
 }
 
 }  // namespace holy::d3d12

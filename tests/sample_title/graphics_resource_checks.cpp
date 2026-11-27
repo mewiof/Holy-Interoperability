@@ -626,6 +626,60 @@ void test_released_memory(void* device) {
         "committed title memory the GPU used goes back to the host when released");
 }
 
+// Textures viewed in title memory the title then releases: the runtime's host
+// copies of them go (a while later, when the GPU is done with them), read from
+// the runtime's live count of host textures filled from title memory.
+void test_released_texture_memory(void* device) {
+  using CounterFn = volatile int64_t* (*)(const char*);
+  const HMODULE runtime = GetModuleHandleW(L"holyrt.dll");
+  const auto counter = runtime ? reinterpret_cast<CounterFn>(GetProcAddress(runtime, "HolyCounter")) : nullptr;
+  volatile int64_t* live = counter ? counter("d3d12.host_textures_from_memory") : nullptr;
+  void* heap = nullptr;
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  call<HRESULT>(device, 14, &heap_desc, __uuidof(ID3D12DescriptorHeap), &heap);
+  if (!live || !heap) {
+    check(false, "the objects for viewing textures in released memory exist");
+    return;
+  }
+  D3D12_RESOURCE_DESC texture{};
+  texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  texture.Width = 64;
+  texture.Height = 64;
+  texture.DepthOrArraySize = 1;
+  texture.MipLevels = 1;
+  texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture.SampleDesc.Count = 1;
+  struct {
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+    uint64_t address;
+  } view{};
+  view.srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  view.srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  view.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  view.srv.Texture2D.MipLevels = 1;
+  const uint64_t descriptor = call<uint64_t>(heap, 9);
+  auto view_and_release = [&] {
+    void* memory = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!memory) return;
+    view.address = reinterpret_cast<uint64_t>(memory);
+    call<void>(device, 70, &texture, &view, descriptor);
+    VirtualFree(memory, 0, MEM_RELEASE);
+  };
+  const int64_t before = *live;
+  constexpr int kRounds = 8;
+  for (int i = 0; i < kRounds; ++i) view_and_release();
+  const int64_t held = *live - before;
+  // The released textures' host copies go once old enough: the next view
+  // lets go of them.
+  Sleep(2100);
+  view_and_release();
+  const int64_t after = *live - before;
+  std::printf("    (host textures from title memory: %+lld after %d views of released memory, %+lld later)\n",
+              static_cast<long long>(held), kRounds, static_cast<long long>(after));
+  check(held == kRounds && after <= 1, "host copies of textures in memory the title released are let go of");
+  call<ULONG>(heap, 2);
+}
+
 // The host's commit left, in GiB: printed with GPU results, since with it used
 // up the host refuses pipelines and memory and such checks read zeros.
 double host_commit_left() {
@@ -686,11 +740,14 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   // s_load_dwordx8 s[12:19], s[8:9]: the texture's descriptor;
   // v0 = v1 = 0; image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D;
   // s[20:23] = a buffer at s[5:6] of 64 bytes;
-  // buffer_store_dwordx4 v[2:5], off, s[20:23], 0; s_endpgm.
+  // buffer_store_dwordx4 v[2:5], off, s[20:23], 0; v6 = 0x12345678;
+  // buffer_store_dword v6, off, s[20:23], 0 offset:16 (a marker: the program
+  // ran, whatever the texel); s_endpgm.
   const std::vector<uint8_t> container = native_only_container(
       {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE880304u, 0xBE890380u, 0xF40C0304u, 0xFA000000u, 0xBF8CC07Fu,
        0x7E000280u, 0x7E020280u, 0xF0001F08u, 0x00030200u, 0xBF8C3F70u, 0xBE940305u, 0xBE950306u, 0xB0160040u,
-       0xBE970380u, 0xE0780000u, 0x80050200u, 0xBF810000u});
+       0xBE970380u, 0xE0780000u, 0x80050200u, 0x7E0C02FFu, 0x12345678u, 0xE0700010u, 0x80050600u,
+       0xBF810000u});
   D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
   pso.CS = {container.data(), container.size()};
   call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
@@ -791,8 +848,11 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   K32GetPerformanceInfo(&host, sizeof(host));
   const double commit_left =
       static_cast<double>(host.CommitLimit - host.CommitTotal) * static_cast<double>(host.PageSize) / (1ull << 30);
-  std::printf("    (texel read on the GPU: %.3f %.3f %.3f %.3f; host commit left %.1f GiB)\n", texel[0], texel[1],
-              texel[2], texel[3], commit_left);
+  uint32_t marker = 0;
+  std::memcpy(&marker, const_cast<const float*>(output + 4), 4);
+  std::printf("    (texel read on the GPU: %.3f %.3f %.3f %.3f; marker %08x; fence %llu; host commit left %.1f GiB)\n",
+              texel[0], texel[1], texel[2], texel[3], marker, static_cast<unsigned long long>(value ? *value : 0),
+              commit_left);
   check(recorded && value && *value == 1 && close_to(texel[0], texel_bytes[0] / 255.0f) &&
             close_to(texel[1], texel_bytes[1] / 255.0f) && close_to(texel[2], texel_bytes[2] / 255.0f) &&
             close_to(texel[3], texel_bytes[3] / 255.0f),
@@ -1013,8 +1073,8 @@ void test_native_draw(void* device, void* queue) {
   for (int i = 0; value && *value < 1 && i < 5000; ++i) Sleep(1);
   auto close_to = [](float a, float b) { return a > b - 0.01f && a < b + 0.01f; };
   const float pixel[4] = {output[0], output[1], output[2], output[3]};
-  std::printf("    (pixel the draw left: %.3f %.3f %.3f %.3f; host commit left %.1f GiB)\n", pixel[0], pixel[1],
-              pixel[2], pixel[3], host_commit_left());
+  std::printf("    (pixel the draw left: %.3f %.3f %.3f %.3f; fence %llu; host commit left %.1f GiB)\n", pixel[0],
+              pixel[1], pixel[2], pixel[3], static_cast<unsigned long long>(value ? *value : 0), host_commit_left());
   check(recorded && value && *value == 1 && close_to(pixel[0], 0.25f) && close_to(pixel[1], 0.5f) &&
             close_to(pixel[2], 0.75f) && close_to(pixel[3], 1.0f),
         "a draw from vertex 3 with native programs fetching vertices through the vertex buffer table colours its "
@@ -1242,8 +1302,8 @@ void test_native_depth(void* device, void* queue, bool stencil) {
   const auto* value = call<const volatile uint64_t*>(fence, 12);
   for (int i = 0; value && *value < 1 && i < 5000; ++i) Sleep(1);
   const float pixel[4] = {output[0], output[1], output[2], output[3]};
-  std::printf("    (pixel after the two draws: %.3f %.3f %.3f %.3f; host commit left %.1f GiB)\n", pixel[0], pixel[1],
-              pixel[2], pixel[3], host_commit_left());
+  std::printf("    (pixel after the two draws: %.3f %.3f %.3f %.3f; fence %llu; host commit left %.1f GiB)\n", pixel[0],
+              pixel[1], pixel[2], pixel[3], static_cast<unsigned long long>(value ? *value : 0), host_commit_left());
   const bool first_kept = stencil ? pixel[0] > 0.99f && pixel[1] < 0.01f : pixel[0] < 0.01f && pixel[1] > 0.99f;
   check(recorded && value && *value == 1 && first_kept && pixel[2] < 0.01f,
         stencil ? "a native pipeline's stencil state keeps a second draw out where the first replaced the value"
@@ -1271,6 +1331,7 @@ void test_graphics_resources(void* device, void* queue) {
   if (queue) test_native_depth(device, queue, true);
   test_page_mapping_update(device);
   test_released_memory(device);
+  test_released_texture_memory(device);
   if (queue) {
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Plain);
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Reserved);

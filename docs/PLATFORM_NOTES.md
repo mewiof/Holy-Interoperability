@@ -693,6 +693,22 @@ Notes describe the platform, never a title.
   compiler) (4); `image_get_lod` in compute programs (65; partial: level 0, the level implicit samples take
   outside pixel shaders, where the console derives it from quads of lanes). Translation takes 93 ms a program on
   average (the slowest 8.8 s) and writes about 1 MB of host bytecode for each.
+- *measured* (`holy_translate_corpus --compile`, 60 compute programs of the reference title, development host):
+  the host's shader compiler takes 2.4-2.7 s per MiB of host bytecode for programs under 64 KiB and 6.2-6.9 s per
+  MiB from 256 KiB up, so the size of what the translator writes is first-run time (hundreds of milliseconds to
+  seconds a pipeline) and the time grows faster than the size. Over a 500-program sample the translations were
+  73 times the native code's size (median 359 KB, the largest 8.9 MB from 79 KB). Cut since, each measured on
+  the same sample (489 MiB of host bytecode before, 286 MiB after; translation 188 to 320 programs a second on
+  one thread; host compile time of the 60 programs 166 s to 136 s): scalar loads read whole dwords (below); a
+  lane's result goes into its register in one conditional move; EXEC holds only the lane's bit (the lane model),
+  so it is the lane's condition as it is; reads and writes need no test of the view (view 0, the null view,
+  reads zero and drops writes); the page lookup has no branches (a table of zeros, "table 0", for windows
+  without a table and addresses from 2^47), and tests for cached pages only when the page cache runs; buffer
+  formats come from a table in the immediate constant buffer instead of a 128-case switch at every typed access;
+  the container checksum is computed with the MD5 rounds written out.
+- *documented* (RDNA 2): the two low bits of each part of a scalar memory address (base, offset, instruction
+  offset) are ignored, so `s_load_*` and `s_buffer_load_*` read whole, aligned dwords. Translated as such: one
+  load, no alignment test (a unit test reads at unaligned parts).
 - *observed*: console shader containers have the desktop container layout, but their `DXIL` part holds a
   console block (`XDAT`) with a zlib-compressed `FSSM` payload: the console GPU's native machine code
   (RDNA-family instruction encodings: `s_waitcnt`, exports, `s_endpgm`, `s_code_end` padding) and metadata.

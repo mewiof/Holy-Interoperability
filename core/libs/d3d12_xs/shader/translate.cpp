@@ -53,7 +53,11 @@ constexpr uint32_t kNoView = 0xFFFFFFFFu;
 // 48 bits a buffer descriptor holds), read through kCodeView.
 constexpr uint32_t kCodeAddressHi = 0xFFF0u;
 constexpr uint32_t kCodeView = 0xFFFFFFFEu;
-constexpr uint32_t kCodeDataLimit = 65536;  // an immediate constant buffer's 4096 vectors
+// The immediate constant buffer (4096 vectors): the buffer format table
+// (format_info), then program data (code_dword).
+constexpr uint32_t kFormatTableVectors = 64;  // two words a format, 128 formats
+constexpr uint32_t kInvalidFormat = 7;       // the numeric type of formats the table lacks
+constexpr uint32_t kCodeDataLimit = 65536 - kFormatTableVectors * 16;
 
 Operand R(uint32_t r) { return dxbc::temp(r); }
 Operand I(uint32_t v) { return dxbc::imm(v); }
@@ -121,7 +125,17 @@ class Translator {
     emit(opcode, {D(r), a, b, c, d});
     return R(r);
   }
-  void put(uint32_t reg, const Operand& v) { emit(dx::kMov, {D(reg), v}); }
+  // EXEC is kept as this lane's bit alone (the lane model: a lane mask holds
+  // the lane's bit at bit 0), so it serves as the lane's condition as it is.
+  void put(uint32_t reg, const Operand& v) {
+    if (reg == kExecLoR) return emit(dx::kAnd, {D(reg), v, I(1)});
+    emit(dx::kMov, {D(reg), v});
+  }
+  // put(reg, select(mask, a, b)) as one instruction (its sources are read
+  // before the register is written).
+  void put_select(uint32_t reg, const Operand& mask, const Operand& a, const Operand& b) {
+    emit(dx::kMovc, {D(reg), mask, a, b});
+  }
   Operand in_temp(const Operand& v) { return is_temp(v) ? v : op1(dx::kMov, v); }
   Operand copy(const Operand& v) { return op1(dx::kMov, v); }
   // Integer helpers. Masks (comparison results) are 0 or ~0.
@@ -321,7 +335,7 @@ class Translator {
     set_s64(code, bit, I(0));
   }
   Operand mask_bit(const Instruction& inst, uint16_t code) { return bit01(src(inst, code)); }
-  Operand active() { return bit01(R(kExecLoR)); }
+  Operand active() { return R(kExecLoR); }
   // Stages that run as host compute programs (thread groups, group shared
   // memory, exchanges between lanes).
   bool computeish() const { return stage_ == Stage::Compute || stage_ == Stage::Ngg; }
@@ -359,25 +373,26 @@ class Translator {
   // (translate.h): view 0, the null view, when no page is mapped there.
   // `write`: for a store or an atomic (cached pages: the page itself, and its
   // flag set), else for a read (cached pages: the copy unless flagged).
+  // Without branches: windows with no table (table 0) and addresses from
+  // 2^47 read the zero table (translate.h), whose entries are slot 0. Every
+  // memory access has one, and the host compiler's time grows faster than
+  // the size of what it compiles (measured).
   std::pair<uint32_t, uint32_t> find(const Operand& lo, const Operand& hi, bool write = false) {
     const uint32_t view = fresh(), offset = fresh();
     const uint32_t mark = scratch_;  // what find uses besides its results goes when it returns
     const Operand alo = in_temp(lo), ahi = in_temp(hi);
-    put(view, I(0));
-    put(offset, I(0));
     page_table_used_ = true;
-    if_nz(ult(ahi, I(0x8000)));
+    const Operand window = shl(bor(shl(ahi, I(2)), shr(alo, I(30))), I(2));
     const uint32_t table = fresh();
-    emit(dx::kLdRaw, {D(table), shl(bor(shl(ahi, I(2)), shr(alo, I(30))), I(2)), dxbc::srv_xyzw(kPageTableId, 0)});
-    if_nz(R(table));
+    emit(dx::kLdRaw, {D(table), select(ult(ahi, I(0x8000)), window, I(kPageTableZeroTable)),
+                      dxbc::srv_xyzw(kPageTableId, 0)});
     const uint32_t entry = fresh();
-    const Operand at = add(add(I(kPageTableLevel2Base - kPageTableTableBytes), shl(R(table), I(17))),
-                           shl(ubfe(I(14), I(16), alo), I(3)));
+    const Operand at = add(add(I(kPageTableZeroTable), shl(R(table), I(17))), shl(ubfe(I(14), I(16), alo), I(3)));
     emit(dx::kLdRaw, {dxbc::temp_dst_mask(entry, 0x3), at, dxbc::srv_xyzw(kPageTableId, 0)});
     put(view, R(entry));
-    put(offset, dxbc::temp(entry, 1));
-    if_nz(band(R(view), I(kCachedPageBit)));
-    {
+    if (translator_options().page_cache_reads) {
+      put(offset, dxbc::temp(entry, 1));
+      if_nz(band(R(view), I(kCachedPageBit)));
       const uint32_t line = fresh(), line_at = fresh(), flags = fresh();
       put(line_at, shl(band(R(view), I(~kCachedPageBit)), I(2)));  // the flag's byte offset
       put(flags, I(kFlagsView));
@@ -390,14 +405,14 @@ class Translator {
       } else {
         const uint32_t flag = fresh();
         emit(dx::kLdRaw, {D(flag), R(line_at), dxbc::uav_indexed(0, flags, dxbc::Access::Load)});
-        put(view, select(R(flag), dxbc::temp(line, 2), dxbc::temp(line, 0)));
-        put(offset, select(R(flag), dxbc::temp(line, 3), dxbc::temp(line, 1)));
+        put_select(view, R(flag), dxbc::temp(line, 2), dxbc::temp(line, 0));
+        put_select(offset, R(flag), dxbc::temp(line, 3), dxbc::temp(line, 1));
       }
+      end_if();
+      put(offset, add(R(offset), band(alo, I(0xFFFF))));
+    } else {
+      put(offset, add(dxbc::temp(entry, 1), band(alo, I(0xFFFF))));
     }
-    end_if();
-    put(offset, add(R(offset), band(alo, I(0xFFFF))));
-    end_if();
-    end_if();
     if (code_data_) {
       const Operand in_code = band(eq(ahi, I(kCodeAddressHi)), ult(alo, I(static_cast<uint32_t>(size_))));
       if_nz(band(in_code, eq(R(view), I(0))));
@@ -408,15 +423,28 @@ class Translator {
     scratch_ = mark;
     return {view, offset};
   }
+  // A buffer format's component widths (a byte each, x first) and numeric
+  // type (kInvalidFormat for formats the table lacks) from the format table
+  // at the start of the immediate constant buffer (format_table): a lookup
+  // where a switch over 128 formats made every typed access hundreds of
+  // instructions long. `fmt` holds the format (below 128).
+  void format_info(uint32_t fmt, uint32_t widths, uint32_t numeric) {
+    format_table_ = true;
+    const uint32_t vec = fresh();
+    put(vec, shr(R(fmt), I(1)));
+    const Operand odd = in_temp(band(R(fmt), I(1)));
+    put_select(widths, odd, dxbc::icb_indexed(vec, 2), dxbc::icb_indexed(vec, 0));
+    put_select(numeric, odd, dxbc::icb_indexed(vec, 3), dxbc::icb_indexed(vec, 1));
+  }
   // The program dword at a byte offset (4-aligned), 0 outside the data the
-  // immediate constant buffer holds.
+  // immediate constant buffer holds (after the format table).
   Operand code_dword(const Operand& byte_offset) {
     const uint32_t result = fresh();
     put(result, I(0));
     const Operand rel = sub(byte_offset, I(code_first_));
     if_nz(band(uge(byte_offset, I(code_first_)), ult(rel, I(code_bytes_))));
     const uint32_t vec = fresh();
-    put(vec, shr(rel, I(4)));
+    put(vec, add(shr(rel, I(4)), I(kFormatTableVectors)));
     const Operand comp = ubfe(I(2), I(2), rel);
     Operand value = dxbc::icb_indexed(vec, 3);
     for (int c = 2; c >= 0; --c) value = select(eq(comp, I(static_cast<uint32_t>(c))), dxbc::icb_indexed(vec, c), value);
@@ -424,11 +452,13 @@ class Translator {
     end_if();
     return R(result);
   }
-  // Reads the dword at view/offset (any alignment); 0 when unresolved.
+  // Reads the dword at view/offset (any alignment); 0 when unresolved (view 0,
+  // the null view, reads zero; only programs reading their own code have
+  // views that are not memory views).
   Operand read(uint32_t view, const Operand& offset) {
     const uint32_t value = fresh();
-    put(value, I(0));
     if (code_data_) {
+      put(value, I(0));
       if_nz(eq(R(view), I(kCodeView)));
       const Operand o = in_temp(offset);
       const Operand aligned = band(o, I(~3u));
@@ -441,8 +471,8 @@ class Translator {
       end_if();
       put(value, R(w));
       end_if();
+      if_nz(ult(R(view), I(kMemoryViews)));
     }
-    if_nz(ult(R(view), I(kMemoryViews)));
     const Operand o = in_temp(offset);
     const Operand aligned = band(o, I(~3u));
     const Operand shift = shl(band(o, I(3)), I(3));
@@ -455,6 +485,7 @@ class Translator {
     emit(dx::kIshl, {D(w2), R(w2), sub(I(32), shift)});
     emit(dx::kOr, {D(w), R(w), R(w2)});
     end_if();
+    if (!code_data_) return R(w);
     put(value, R(w));
     end_if();
     return R(value);
@@ -468,26 +499,34 @@ class Translator {
   // Reads `count` consecutive dwords (1-4) from byte `byte_offset` past `at`
   // into registers `dest(i)`: one guard, and one load when the address is a
   // multiple of 4 (else dword by dword, any alignment); 0 when unresolved.
-  // Programs reading their own code as data read dword by dword.
+  // `aligned`: the address is known to be a multiple of 4 (one load, no
+  // alignment test). Programs reading their own code as data read dword by
+  // dword.
   template <typename Dest>
-  void read_dwords(Dest dest, int count, uint32_t view, uint32_t at, uint32_t byte_offset) {
-    if (code_data_ || count == 1) {
+  void read_dwords(Dest dest, int count, uint32_t view, uint32_t at, uint32_t byte_offset, bool aligned = false) {
+    if (code_data_ || (count == 1 && !aligned)) {
       for (int i = 0; i < count; ++i) read_to(dest(i), view, at, byte_offset + 4u * static_cast<uint32_t>(i));
       return;
     }
     const uint32_t mark = scratch_;
     const uint32_t o = fresh();
     put(o, byte_offset == 0 ? R(at) : add(R(at), I(byte_offset)));
-    for (int i = 0; i < count; ++i) put(dest(i), I(0));
-    if_nz(ult(R(view), I(kMemoryViews)));
+    if (aligned) {
+      const uint32_t v = fresh();
+      const dxbc::Access access = count == 1 ? dxbc::Access::Load : dxbc::Access::LoadVector;
+      emit(dx::kLdRaw, {dxbc::temp_dst_mask(v, (1u << count) - 1), R(o), dxbc::uav_indexed(0, view, access)});
+      for (int i = 0; i < count; ++i) put(dest(i), dxbc::temp(v, static_cast<uint32_t>(i)));
+      scratch_ = mark;
+      return;
+    }
     if_nz(band(R(o), I(3)));
     for (int i = 0; i < count; ++i) {
       const uint32_t inner = scratch_;
-      const Operand aligned = band(add(R(o), I(4u * static_cast<uint32_t>(i))), I(~3u));
+      const Operand word_at = band(add(R(o), I(4u * static_cast<uint32_t>(i))), I(~3u));
       const Operand shift = shl(band(R(o), I(3)), I(3));
       const uint32_t w = fresh(), w2 = fresh();
-      emit(dx::kLdRaw, {D(w), aligned, dxbc::uav_indexed(0, view, dxbc::Access::Load)});
-      emit(dx::kLdRaw, {D(w2), add(aligned, I(4)), dxbc::uav_indexed(0, view, dxbc::Access::Load)});
+      emit(dx::kLdRaw, {D(w), word_at, dxbc::uav_indexed(0, view, dxbc::Access::Load)});
+      emit(dx::kLdRaw, {D(w2), add(word_at, I(4)), dxbc::uav_indexed(0, view, dxbc::Access::Load)});
       put(dest(i), bor(shr(R(w), shift), shl(R(w2), sub(I(32), shift))));
       scratch_ = inner;
     }
@@ -497,17 +536,24 @@ class Translator {
          {dxbc::temp_dst_mask(v, (1u << count) - 1), R(o), dxbc::uav_indexed(0, view, dxbc::Access::LoadVector)});
     for (int i = 0; i < count; ++i) put(dest(i), dxbc::temp(v, static_cast<uint32_t>(i)));
     end_if();
-    end_if();
     scratch_ = mark;
   }
+  // Writes go to memory views only (view 0 drops them); a guard where a view
+  // can be the program's code.
+  void if_memory_view(uint32_t view) {
+    if (code_data_) if_nz(ult(R(view), I(kMemoryViews)));
+  }
+  void end_memory_view() {
+    if (code_data_) end_if();
+  }
   void write(uint32_t view, const Operand& offset, const Operand& value) {
-    if_nz(ult(R(view), I(kMemoryViews)));
+    if_memory_view(view);
     emit(dx::kStoreRaw, {dxbc::uav_indexed(0, view, dxbc::Access::Store), band(offset, I(~3u)), value});
-    end_if();
+    end_memory_view();
   }
   // Byte or halfword store inside the containing dword.
   void write_part(uint32_t view, const Operand& offset, const Operand& value, uint32_t bytes) {
-    if_nz(ult(R(view), I(kMemoryViews)));
+    if_memory_view(view);
     const Operand aligned = band(offset, I(~3u));
     const Operand shift = shl(band(offset, I(3)), I(3));
     const Operand mask = shl(I(bytes == 1 ? 0xFFu : 0xFFFFu), shift);
@@ -515,14 +561,14 @@ class Translator {
     emit(dx::kImmAtomicAnd, {D(ignored), dxbc::uav_indexed(0, view, dxbc::Access::Atomic), aligned, bnot(mask)});
     emit(dx::kImmAtomicOr,
          {D(ignored), dxbc::uav_indexed(0, view, dxbc::Access::Atomic), aligned, band(shl(value, shift), mask)});
-    end_if();
+    end_memory_view();
   }
   // Atomic kinds: 0 swap, 1 cmpswap, 2 add, 3 sub, 4 smin, 5 umin, 6 smax,
   // 7 umax, 8 and, 9 or, 10 xor. Returns the previous value.
   Operand atomic(int kind, uint32_t view, const Operand& offset, const Operand& value, const Operand& compare) {
     const uint32_t old = fresh();
-    put(old, I(0));
-    if_nz(ult(R(view), I(kMemoryViews)));
+    if (code_data_) put(old, I(0));
+    if_memory_view(view);
     const Operand uav = dxbc::uav_indexed(0, view, dxbc::Access::Atomic);
     const Operand address = band(offset, I(~3u));
     static const uint32_t kOps[] = {dx::kImmAtomicExch, dx::kImmAtomicCmpExch, dx::kImmAtomicIadd,
@@ -536,7 +582,7 @@ class Translator {
     } else {
       emit(kOps[kind], {D(old), uav, address, value});
     }
-    end_if();
+    end_memory_view();
     return R(old);
   }
 
@@ -793,6 +839,7 @@ class Translator {
   // immediate constant buffer.
   bool code_data_ = false;
   uint32_t code_first_ = 0, code_bytes_ = 0;
+  bool format_table_ = false;  // format_info is used
   std::set<uint32_t> indirect_targets_;  // addresses s_setpc_b64 / s_swappc_b64 reach
   const ShaderInterface* consumer_ = nullptr;  // vertex programs: the pixel program's interface
   uint32_t scan_params_ = 0;  // pixel: attributes read whole (VINTRP), from the scan
@@ -969,7 +1016,7 @@ bool Translator::emit_sopk(const Instruction& inst) {
   const Operand reg = R(reg_index == kNoRegister ? 0 : reg_index);
   switch (inst.op) {
     case 0: put(reg_index, simm); return true;
-    case 2: put(reg_index, select(R(kSccR), simm, reg)); return true;
+    case 2: put_select(reg_index, R(kSccR), simm, reg); return true;
     case 3: set_scc(eq(reg, simm)); return true;
     case 4: set_scc(ne(reg, simm)); return true;
     case 5: set_scc(ilt(simm, reg)); return true;
@@ -1048,7 +1095,7 @@ bool Translator::emit_sop1(const Instruction& inst) {
     }
     case 5: {
       const uint32_t r = sreg(d);
-      if (r != kNoRegister) put(r, select(R(kSccR), a, R(r)));
+      if (r != kNoRegister) put_select(r, R(kSccR), a, R(r));
       return true;
     }
     case 6: {
@@ -1288,16 +1335,19 @@ bool Translator::emit_sopc(const Instruction& inst) {
 bool Translator::emit_smem(const Instruction& inst) {
   static const int kCounts[] = {1, 2, 4, 8, 16};
   const uint16_t base = inst.src[0];
-  // Offset: immediate plus an SGPR unless the field names null.
-  Operand offset = I(static_cast<uint32_t>(inst.imm));
-  if (inst.src[1] != rdna::kNull) offset = add(offset, src(inst, inst.src[1]));
+  // Offset: immediate plus an SGPR unless the field names null. Documented:
+  // the two low bits of each part of a scalar memory address (base, offset,
+  // instruction offset) are ignored, so scalar loads read whole, aligned
+  // dwords.
+  Operand offset = I(static_cast<uint32_t>(inst.imm) & ~3u);
+  if (inst.src[1] != rdna::kNull) offset = add(offset, band(src(inst, inst.src[1]), I(~3u)));
   if (inst.op <= 4) {
     const int count = kCounts[inst.op];
-    auto [lo, hi] = add64(R(base), band(R(base + 1u), I(0xFFFF)), offset, true);
+    auto [lo, hi] = add64(band(R(base), I(~3u)), band(R(base + 1u), I(0xFFFF)), offset, true);
     auto [view, at] = find(lo, hi);
     for (int i = 0; i < count; i += 4) {
       read_dwords([&](int k) { return inst.dst + static_cast<uint32_t>(i + k); }, std::min(4, count - i), view, at,
-                  4u * static_cast<uint32_t>(i));
+                  4u * static_cast<uint32_t>(i), true);
     }
     return true;
   }
@@ -1305,17 +1355,17 @@ bool Translator::emit_smem(const Instruction& inst) {
     // s_buffer_load: buffer descriptor in s[base..base+3] (address, stride, records).
     const int count = kCounts[inst.op - 8];
     const Operand o = copy(offset);
-    auto [lo, hi] = add64(R(base), band(R(base + 1u), I(0xFFFF)), o, false);
+    auto [lo, hi] = add64(band(R(base), I(~3u)), band(R(base + 1u), I(0xFFFF)), o, false);
     const Operand records = copy(R(base + 2u));
     auto [view, at] = find(lo, hi);
     for (int i = 0; i < count; i += 4) {
       read_dwords([&](int k) { return inst.dst + static_cast<uint32_t>(i + k); }, std::min(4, count - i), view, at,
-                  4u * static_cast<uint32_t>(i));
+                  4u * static_cast<uint32_t>(i), true);
     }
     for (int i = 0; i < count; ++i) {
       const uint32_t dest = inst.dst + static_cast<uint32_t>(i);
       const uint32_t mark = scratch_;
-      put(dest, select(op2(dx::kUge, records, add(o, I(4u * i + 4u))), R(dest), I(0)));
+      put_select(dest, op2(dx::kUge, records, add(o, I(4u * i + 4u))), R(dest), I(0));
       scratch_ = mark;
     }
     return true;
@@ -1444,32 +1494,18 @@ bool Translator::typed_load(uint32_t fmt, uint32_t components, uint32_t view, ui
 // word 3 holds the destination selects (bits 0-11, three bits a component:
 // 0 zero, 1 one, 4-7 the loaded x-w) and the format (bits 12-18), as in the
 // public RDNA 2 buffer descriptor layout. The format is known only when the
-// program runs: a switch over the format table picks the component widths
+// program runs: the format table (format_info) gives the component widths
 // and numeric type, then one decoder handles every format (a decoder per
 // format made programs too large for the host's shader compiler). Format 0
 // (invalid) and formats the table lacks read as zero.
 void Translator::format_load(uint32_t descriptor, uint32_t components, uint32_t view, uint32_t at, uint32_t data) {
-  constexpr uint32_t kInvalid = 7;
+  constexpr uint32_t kInvalid = kInvalidFormat;
   uint32_t loaded[4], words[4];
   for (uint32_t c = 0; c < 4; ++c) loaded[c] = fresh();
   for (uint32_t c = 0; c < 4; ++c) words[c] = fresh();
   const uint32_t fmt = fresh(), widths = fresh(), numeric = fresh(), offset = fresh(), one = fresh();
   put(fmt, ubfe(I(7), I(12), R(descriptor)));
-  put(widths, I(0));
-  put(numeric, I(kInvalid));
-  emit(dx::kSwitch, {R(fmt)});
-  for (uint32_t f = 1; f < 128; ++f) {
-    BufferFormat layout;
-    Numeric type;
-    if (!buffer_format(f, &layout, &type)) continue;
-    emit(dx::kCase, {I(f)});
-    put(widths, I(layout.bits[0] | (layout.bits[1] << 8) | (layout.bits[2] << 16) | (layout.bits[3] << 24)));
-    put(numeric, I(static_cast<uint32_t>(type)));
-    emit(dx::kBreak, {});
-  }
-  emit(dx::kDefault, {});
-  emit(dx::kBreak, {});
-  emit(dx::kEndswitch, {});
+  format_info(fmt, widths, numeric);
   for (uint32_t w = 0; w < 4; ++w) {
     const uint32_t mark = scratch_;
     put(words[w], read(view, add(R(at), I(4 * w))));
@@ -1479,7 +1515,7 @@ void Translator::format_load(uint32_t descriptor, uint32_t components, uint32_t 
     const uint32_t mark = scratch_;
     const Operand integer = bor(eq(R(numeric), I(static_cast<uint32_t>(Numeric::Uint))),
                                 eq(R(numeric), I(static_cast<uint32_t>(Numeric::Sint))));
-    put(one, select(eq(R(numeric), I(kInvalid)), I(0), select(integer, I(1), dxbc::immf(1.0f))));
+    put_select(one, eq(R(numeric), I(kInvalid)), I(0), select(integer, I(1), dxbc::immf(1.0f)));
     scratch_ = mark;
   }
   put(offset, I(0));
@@ -1535,26 +1571,12 @@ void Translator::format_load(uint32_t descriptor, uint32_t components, uint32_t 
 // Format 0 and formats outside the table store nothing.
 void Translator::format_store(const Operand& format, uint32_t components, uint32_t view, uint32_t at,
                               uint32_t data) {
-  constexpr uint32_t kInvalid = 7;
+  constexpr uint32_t kInvalid = kInvalidFormat;
   uint32_t words[4];
   for (uint32_t w = 0; w < 4; ++w) words[w] = fresh();
   const uint32_t fmt = fresh(), widths = fresh(), numeric = fresh(), offset = fresh();
-  put(fmt, format);
-  put(widths, I(0));
-  put(numeric, I(kInvalid));
-  emit(dx::kSwitch, {R(fmt)});
-  for (uint32_t f = 1; f < 128; ++f) {
-    BufferFormat layout;
-    Numeric type;
-    if (!buffer_format(f, &layout, &type)) continue;
-    emit(dx::kCase, {I(f)});
-    put(widths, I(layout.bits[0] | (layout.bits[1] << 8) | (layout.bits[2] << 16) | (layout.bits[3] << 24)));
-    put(numeric, I(static_cast<uint32_t>(type)));
-    emit(dx::kBreak, {});
-  }
-  emit(dx::kDefault, {});
-  emit(dx::kBreak, {});
-  emit(dx::kEndswitch, {});
+  put(fmt, band(format, I(127)));
+  format_info(fmt, widths, numeric);
   for (uint32_t w = 0; w < 4; ++w) put(words[w], I(0));
   put(offset, I(0));
   for (uint32_t c = 0; c < 4; ++c) {
@@ -1688,7 +1710,7 @@ bool Translator::emit_mubuf(const Instruction& inst) {
   const auto location = find(lo, hi, writes);
   const uint32_t at = location.second;
   const uint32_t view = fresh();
-  put(view, select(inside, R(location.first), I(kNoView)));
+  put_select(view, inside, R(location.first), I(kNoView));
   auto load = [&](int count) {
     read_dwords([&](int k) { return vreg(data + static_cast<uint32_t>(k)); }, count, view, at, 0);
   };
@@ -2011,7 +2033,7 @@ bool Translator::emit_vector(const Instruction& inst) {
   // Results are written only by active lanes.
   auto set = [&](const Operand& value) {
     const Operand placed = place(value);
-    put(dreg, select(on, placed[0] & 0x80000000u ? copy(placed) : placed, dval));
+    put_select(dreg, on, placed[0] & 0x80000000u ? copy(placed) : placed, dval);
     return true;
   };
   auto setf = [&](const Operand& value) { return set(fresult(work, value)); };
@@ -2049,8 +2071,8 @@ bool Translator::emit_vector(const Instruction& inst) {
   auto set64 = [&](uint32_t t) {
     if (inst.clamp || inst.omod) return fail("a double result with clamp or output modifier");
     const uint32_t lo = vreg(inst.dst), hi = vreg(inst.dst + 1u);
-    put(lo, select(on, dxbc::temp(t, 0), R(lo)));
-    put(hi, select(on, dxbc::temp(t, 1), R(hi)));
+    put_select(lo, on, dxbc::temp(t, 0), R(lo));
+    put_select(hi, on, dxbc::temp(t, 1), R(hi));
     return true;
   };
   auto dop = [&](uint32_t opcode, uint32_t a64, uint32_t b64) {
@@ -2393,7 +2415,7 @@ bool Translator::emit_vector(const Instruction& inst) {
           put(value, I(0));
           for (uint32_t k = 0; base + k < limit; ++k) {
             const uint32_t mark = scratch_;
-            put(value, select(eq(R(kM0R), I(k)), R(vreg(base + k)), R(value)));
+            put_select(value, eq(R(kM0R), I(k)), R(vreg(base + k)), R(value));
             scratch_ = mark;
           }
           return set(R(value));
@@ -2402,7 +2424,7 @@ bool Translator::emit_vector(const Instruction& inst) {
         for (uint32_t k = 0; inst.dst + k < limit; ++k) {
           const uint32_t mark = scratch_;
           const uint32_t r = vreg(inst.dst + k);
-          put(r, select(band(on, eq(R(kM0R), I(k))), v, R(r)));
+          put_select(r, band(on, eq(R(kM0R), I(k))), v, R(r));
           scratch_ = mark;
         }
         return true;
@@ -2412,7 +2434,7 @@ bool Translator::emit_vector(const Instruction& inst) {
         if (work.src[0] < rdna::kVgpr0) return fail("v_swap_b32 with a scalar operand");
         const uint32_t other = vreg(work.src[0]);
         const Operand old = copy(dval);
-        put(other, select(on, old, R(other)));
+        put_select(other, on, old, R(other));
         return set(a);
       }
       case 80: return setf16(op1(dx::kUtof, h16(0)));
@@ -2563,7 +2585,7 @@ bool Translator::emit_vector(const Instruction& inst) {
       auto [r0, carry] = addc(R(lo), clo);
       const Operand r1 = add(add(R(hi), chi), carry);
       const uint32_t d1 = vreg(inst.dst + 1u);
-      put(d1, select(on, r1, R(d1)));
+      put_select(d1, on, r1, R(d1));
       set(r0);
       set_mask(inst.sdst, I(0));
       return true;
@@ -2575,7 +2597,7 @@ bool Translator::emit_vector(const Instruction& inst) {
       auto [r0, r1] = shift64(op == 0x2ff ? 0 : op == 0x300 ? 1 : 2, lo, hi, a);
       const uint32_t d1 = vreg(inst.dst + 1u);
       const Operand keep0 = copy(r0);
-      put(d1, select(on, r1, R(d1)));
+      put_select(d1, on, r1, R(d1));
       return set(keep0);
     }
     case 0x30f: case 0x310: case 0x319: {
@@ -2629,7 +2651,7 @@ bool Translator::emit_vector(const Instruction& inst) {
     case 0x361: {
       // v_writelane_b32: the lane named by src1 gets src0, whatever EXEC says.
       const Operand lane = band(b, I(info_.wave_size - 1));
-      put(dreg, select(eq(R(kLaneR), lane), a, dval));
+      put_select(dreg, eq(R(kLaneR), lane), a, dval);
       return true;
     }
     case 0x365: case 0x366: {
@@ -2756,13 +2778,13 @@ bool Translator::emit_image(const Instruction& inst) {
       if (!(mask & (1u << c))) continue;
       if (!d16) {
         const uint32_t d = vreg(data + k++);
-        put(d, select(active(), dxbc::temp(result, c), R(d)));
+        put_select(d, active(), dxbc::temp(result, c), R(d));
         continue;
       }
       const uint32_t d = vreg(data + k / 2);
       const Operand half = op1(dx::kF32tof16, dxbc::temp(result, c));
       const Operand merged = op4(dx::kBfi, I(16), I(k % 2 ? 16 : 0), half, R(d));
-      put(d, select(active(), merged, R(d)));
+      put_select(d, active(), merged, R(d));
       ++k;
     }
   };
@@ -2855,7 +2877,7 @@ bool Translator::emit_image(const Instruction& inst) {
       for (uint32_t c = 0; c < 4; ++c) {
         if (!(inst.dmask & (1u << c))) continue;
         const uint32_t d = vreg(data + k++);
-        put(d, select(active(), dxbc::temp(result, c), R(d)));
+        put_select(d, active(), dxbc::temp(result, c), R(d));
       }
       return true;
     }
@@ -3104,13 +3126,13 @@ bool Translator::emit_vop3p(const Instruction& inst) {
       Operand r = op3(dx::kMad, s[0], s[1], s[2]);
       if (inst.clamp) r = op1(dx::kMov, r, dxbc::kSaturate);
       if (inst.op == 32) {
-        put(d, select(active(), r, R(d)));
+        put_select(d, active(), r, R(d));
         return true;
       }
       const Operand half = op1(dx::kF32tof16, r);
       const Operand merged = inst.op == 33 ? op4(dx::kBfi, I(16), I(0), half, R(d))
                                            : op4(dx::kBfi, I(16), I(16), half, R(d));
-      put(d, select(active(), merged, R(d)));
+      put_select(d, active(), merged, R(d));
       return true;
     }
     default: break;
@@ -3161,7 +3183,7 @@ bool Translator::emit_vop3p(const Instruction& inst) {
     if (inst.clamp && op <= 13) return fail(format("VOP3P op %u with clamp", op));
     const Operand lo = band(lane(false), I(0xFFFF));
     const Operand hi = shl(lane(true), I(16));
-    put(d, select(active(), bor(lo, hi), R(d)));
+    put_select(d, active(), bor(lo, hi), R(d));
     return true;
   }
   // Dot products into 32 bits: halves (bytes, nibbles) in order, plus src2.
@@ -3169,7 +3191,7 @@ bool Translator::emit_vop3p(const Instruction& inst) {
     Operand sum = op3(dx::kMad, fhalf(0, false), fhalf(1, false), src(inst, inst.src[2]));
     sum = op3(dx::kMad, fhalf(0, true), fhalf(1, true), sum);
     if (inst.clamp) sum = op1(dx::kMov, sum, dxbc::kSaturate);
-    put(d, select(active(), sum, R(d)));
+    put_select(d, active(), sum, R(d));
     return true;
   }
   if (op >= 20 && op <= 25) {
@@ -3183,7 +3205,7 @@ bool Translator::emit_vop3p(const Instruction& inst) {
       const Operand y = is_signed ? ibfe(I(bits), I(at), b) : ubfe(I(bits), I(at), b);
       sum = add(mul_lo(x, y), sum);
     }
-    put(d, select(active(), sum, R(d)));
+    put_select(d, active(), sum, R(d));
     return true;
   }
   return fail(format("VOP3P op %u", op));
@@ -3311,7 +3333,7 @@ bool Translator::finish_exchange(const Instruction& inst, uint32_t value, Operan
                                  bool fetch_inactive, bool bound_zero, const Operand& source_active) {
   if (!fetch_inactive) valid = band(valid, nonzero(source_active));
   if (bound_zero) {
-    put(value, select(valid, R(value), I(0)));
+    put_select(value, valid, R(value), I(0));
   } else {
     write = band(write, valid);
   }
@@ -3321,7 +3343,7 @@ bool Translator::finish_exchange(const Instruction& inst, uint32_t value, Operan
   }
   if (inst.encoding == Encoding::DS) {
     const uint32_t d = vreg(inst.dst);
-    put(d, select(active(), R(value), R(d)));
+    put_select(d, active(), R(value), R(d));
     return true;
   }
   Instruction work = inst;
@@ -3346,7 +3368,7 @@ bool Translator::finish_exchange(const Instruction& inst, uint32_t value, Operan
   if (inst.encoding == Encoding::VOP3) {
     // v_permlane: vdst = the exchanged value.
     const uint32_t d = vreg(inst.dst);
-    put(d, select(active(), R(value), R(d)));
+    put_select(d, active(), R(value), R(d));
     ok = true;
   } else {
     work.src[0] = kExchangeOperand;
@@ -3486,15 +3508,15 @@ bool Translator::quad_read(const Instruction& inst) {
   // Lanes outside the quad.
   switch (outside) {
     case Outside::Identity:
-      put(value, select(inside, R(value), I(identity)));
-      put(source_active, select(inside, R(source_active), I(1)));
+      put_select(value, inside, R(value), I(identity));
+      put_select(source_active, inside, R(source_active), I(1));
       break;
     case Outside::Own:
-      put(value, select(inside, R(value), own));
-      put(source_active, select(inside, R(source_active), I(1)));
+      put_select(value, inside, R(value), own);
+      put_select(source_active, inside, R(source_active), I(1));
       break;
     case Outside::Invalid:
-      put(source_active, select(inside, R(source_active), I(0)));
+      put_select(source_active, inside, R(source_active), I(0));
       valid = band(valid, inside);
       break;
   }
@@ -3573,7 +3595,7 @@ bool Translator::emit_interp(const Instruction& inst) {
     return fail(format("VINTRP op %u", inst.op));
   }
   const uint32_t d = vreg(inst.dst);
-  put(d, select(active(), dxbc::input_register(attribute + 1, channel), R(d)));
+  put_select(d, active(), dxbc::input_register(attribute + 1, channel), R(d));
   return true;
 }
 
@@ -3733,7 +3755,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
     if (inst.encoding == Encoding::SOPP) {
       const uint32_t target = static_cast<uint32_t>(inst.pc + 4 + 4 * inst.imm);
       const uint32_t next = i + 1 < program_.size() ? program_[i + 1].pc : 0xFFFFFFFFu;
-      auto branch = [&](const Operand& taken) { put(kNextR, select(taken, I(target), I(next))); };
+      auto branch = [&](const Operand& taken) { put_select(kNextR, taken, I(target), I(next)); };
       switch (inst.op) {
         case 1: end_program(); continue;
         case 2: put(kNextR, I(target)); continue;
@@ -3833,9 +3855,22 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   program.dcl_constant_buffer(0, kTranslatedSpace, kSystemVectors, true);
   program.dcl_uav_raw_range(0, 0, kMemoryViews - 1, kTranslatedSpace);
   if (page_table_used_) program.dcl_resource_raw_range(kPageTableId, 0, 0, kTranslatedSpace);
-  if (code_data_) {
-    std::vector<uint32_t> words((code_bytes_ + 3) / 4, 0);
-    std::memcpy(words.data(), code_ + code_first_, code_bytes_);
+  if (code_data_ || format_table_) {
+    // The format table: format f's widths and numeric type in words 2f and
+    // 2f + 1. Then program data.
+    std::vector<uint32_t> words(kFormatTableVectors * 4, 0);
+    for (uint32_t f = 0; f < 128; ++f) {
+      BufferFormat layout;
+      Numeric type;
+      words[2 * f + 1] = kInvalidFormat;
+      if (f == 0 || !buffer_format(f, &layout, &type)) continue;
+      words[2 * f] = layout.bits[0] | (layout.bits[1] << 8) | (layout.bits[2] << 16) | (layout.bits[3] << 24);
+      words[2 * f + 1] = static_cast<uint32_t>(type);
+    }
+    if (code_data_) {
+      words.resize(words.size() + (code_bytes_ + 3) / 4, 0);
+      std::memcpy(words.data() + kFormatTableVectors * 4, code_ + code_first_, code_bytes_);
+    }
     program.dcl_immediate_constant_buffer(words);
   }
   static const dxbc::ResourceDimension kSlotDimension[kImageSlots] = {
@@ -4130,7 +4165,20 @@ namespace holy::d3d12 {
 const char* dxbc_build();
 const char* rdna_build();
 
+namespace {
+TranslatorOptions g_options;
+}  // namespace
+
+void set_translator_options(const TranslatorOptions& options) {
+  g_options = options;
+}
+
+const TranslatorOptions& translator_options() {
+  return g_options;
+}
+
 std::string translator_build() {
-  return std::string(__DATE__ " " __TIME__) + "/" + dxbc_build() + "/" + rdna_build();
+  return std::string(__DATE__ " " __TIME__) + "/" + dxbc_build() + "/" + rdna_build() +
+         (g_options.page_cache_reads ? "/page cache reads" : "");
 }
 }  // namespace holy::d3d12

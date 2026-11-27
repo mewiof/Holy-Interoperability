@@ -16,3 +16,4 @@ add_executable(holy_translate_corpus
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader/translate.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/inflate.cpp)
 holy_target_defaults(holy_translate_corpus)
+target_link_libraries(holy_translate_corpus PRIVATE d3d12)

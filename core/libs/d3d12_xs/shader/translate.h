@@ -52,6 +52,9 @@ inline constexpr uint32_t kTranslatedSpace = 8;
 //   addresses (address bits 30-46), each the number of its level 2 table
 //   counting from 1, or 0 when no page in the window is mapped;
 // - the cache table after it (below);
+// - a table of zeros (kPageTableZeroTable, "table 0": translated programs
+//   look pages up without branches, so windows with no table and addresses
+//   from 2^47 up read their entries there: slot 0);
 // - level 2 tables from kPageTableLevel2Base, kPageTableTableBytes each: one
 //   entry per 64 KiB page of the window (address bits 16-29), two 32-bit
 //   words: the slot (0: not mapped) and the view offset of the page's start
@@ -66,15 +69,17 @@ inline constexpr uint32_t kTranslatedSpace = 8;
 // flag (a 32-bit word per line in view kFlagsView) is set; writes and atomics
 // take the page itself and set the flag, so the reads that follow them see
 // them. Flags stay set: the runtime keeps copies current with the CPU's
-// writes only.
+// writes only. Programs test for cached pages only when translated with
+// TranslatorOptions::page_cache_reads.
 inline constexpr uint32_t kMemoryViews = 65536;
 inline constexpr uint32_t kFlagsView = kMemoryViews - 1;  // memory slots stop below it
 inline constexpr uint32_t kPageTableWindows = 1u << 17;
 inline constexpr uint32_t kPageTableLevel1Bytes = kPageTableWindows * 4;
 inline constexpr uint32_t kCachedPageBit = 0x80000000u;
 inline constexpr uint32_t kPageCacheLines = 65536;
-inline constexpr uint32_t kPageTableLevel2Base = kPageTableLevel1Bytes + kPageCacheLines * 16;
 inline constexpr uint32_t kPageTableTableBytes = 16384 * 8;
+inline constexpr uint32_t kPageTableZeroTable = kPageTableLevel1Bytes + kPageCacheLines * 16;
+inline constexpr uint32_t kPageTableLevel2Base = kPageTableZeroTable + kPageTableTableBytes;
 inline constexpr uint32_t kPageTableId = 1;  // T1 in the translation's declarations
 
 // HolySystem layout in 16-byte vectors.
@@ -99,8 +104,16 @@ inline constexpr uint32_t kIntegerImageSpace = 21;
 bool translate_compute(const uint8_t* code, size_t size, const ComputeShaderInfo& info, std::vector<uint8_t>* dxbc,
                        std::string* error);
 
-// When the translator was built (its source files' compile times): stored
-// translations are keyed by it, so a changed translator misses them.
+// Options the runtime sets once, before translating anything.
+struct TranslatorOptions {
+  bool page_cache_reads = false;  // memory accesses test for cached pages (above)
+};
+void set_translator_options(const TranslatorOptions& options);
+const TranslatorOptions& translator_options();
+
+// When the translator was built (its source files' compile times) and the
+// options it translates with: stored translations are keyed by it, so a
+// changed translator misses them.
 std::string translator_build();
 
 // Graphics stages. Vertex shaders get the vertex id in v0 and the instance id

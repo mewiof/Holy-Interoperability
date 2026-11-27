@@ -6,15 +6,22 @@
 // translated as a compute program of 64 threads (pipelines from native code
 // give the size apart; it is not saved), so blocks that are not code show as
 // failures of raw compute programs. It reads the directory only; with
-// --report it writes one line per file to the given path. --extract writes
+// --report it writes one line per file to the given path (name, kind, result,
+// milliseconds, bytes in, bytes out, host compile milliseconds or -1, error). --extract writes
 // one shader's native code (for a disassembler) to the given path; --decode
 // lists its instructions as the translator decodes them (operand codes as in
-// shader/rdna.h).
+// shader/rdna.h); --translate writes one shader's host container. --compile
+// also compiles each compute translation into a host pipeline and reports the
+// host compiler's time by translation size (the host's shader caches are
+// switched off when it allows that, developer mode; else repeated runs
+// measure cache hits, and the report says so).
 //
-//   holy_translate_corpus <directory> [--threads N] [--report <file>]
+//   holy_translate_corpus <directory> [--threads N] [--report <file>] [--compile]
 //   holy_translate_corpus --extract <shader file> <code file>
 //   holy_translate_corpus --decode <shader file>
+//   holy_translate_corpus --translate <shader file> <container file>
 #include <windows.h>
+#include <d3d12.h>
 
 #include <algorithm>
 #include <atomic>
@@ -60,7 +67,76 @@ struct Result {
   std::string error;
   double ms = 0;
   size_t bytes_in = 0, bytes_out = 0;
+  double compile_ms = -1;  // --compile: the host compiler's time (-1: not compiled)
+  HRESULT compile_result = S_OK;
 };
+
+// --compile: a host device and the root signature translated programs bind
+// through (the runtime's translated_root_signature, same ranges).
+struct Host {
+  ID3D12Device* device = nullptr;
+  ID3D12RootSignature* root = nullptr;
+  bool caches_off = false;
+};
+
+bool open_host(Host* host) {
+  if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device),
+                               reinterpret_cast<void**>(&host->device)))) {
+    return false;
+  }
+  ID3D12Device9* device9 = nullptr;
+  if (SUCCEEDED(host->device->QueryInterface(__uuidof(ID3D12Device9), reinterpret_cast<void**>(&device9)))) {
+    host->caches_off = SUCCEEDED(device9->ShaderCacheControl(
+        D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER,
+        D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE));
+    device9->Release();
+  }
+  constexpr uint32_t kSlots = kImageSlots;
+  D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, kMemoryViews, 0, kTranslatedSpace, 0};
+  D3D12_DESCRIPTOR_RANGE images[3 * kSlots]{};
+  for (uint32_t slot = 0; slot < kSlots; ++slot) {
+    images[slot] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, kTextureSpace + slot, 0};
+    images[kSlots + slot] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UINT_MAX, 0, kTextureSpace + slot, 0};
+    images[2 * kSlots + slot] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UINT_MAX, 0, kIntegerImageSpace + slot, 0};
+  }
+  D3D12_DESCRIPTOR_RANGE samplers{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, kTextureSpace, 0};
+  D3D12_ROOT_PARAMETER parameters[7]{};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable = {1, &range};
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+  parameters[1].Descriptor = {0, kTranslatedSpace};
+  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  parameters[2].Descriptor = {0, kTranslatedSpace};
+  parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[3].DescriptorTable = {3 * kSlots, images};
+  parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[4].DescriptorTable = {1, &samplers};
+  parameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameters[5].Descriptor = {0, kNggSpace};
+  parameters[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+  parameters[6].Descriptor = {0, kNggSpace};
+  const D3D12_ROOT_SIGNATURE_DESC desc{7, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  ID3DBlob* blob = nullptr;
+  HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr);
+  if (SUCCEEDED(hr)) {
+    hr = host->device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                           __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&host->root));
+    blob->Release();
+  }
+  return SUCCEEDED(hr);
+}
+
+void compile_one(const Host& host, const std::vector<uint8_t>& bytecode, Result* r) {
+  D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+  desc.pRootSignature = host.root;
+  desc.CS = {bytecode.data(), bytecode.size()};
+  ID3D12PipelineState* pipeline = nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
+  r->compile_result = host.device->CreateComputePipelineState(&desc, __uuidof(ID3D12PipelineState),
+                                                             reinterpret_cast<void**>(&pipeline));
+  r->compile_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (pipeline) pipeline->Release();
+}
 
 bool read_file(const std::wstring& path, std::vector<uint8_t>* out) {
   const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -75,7 +151,7 @@ bool read_file(const std::wstring& path, std::vector<uint8_t>* out) {
 }
 
 // What the runtime does with a shader passed to pipeline creation.
-void translate_one(const std::vector<uint8_t>& blob, Result* r) {
+void translate_one(const std::vector<uint8_t>& blob, Result* r, std::vector<uint8_t>* kept = nullptr) {
   r->bytes_in = blob.size();
   std::vector<uint8_t> rebuilt;
   const ShaderFormat format = rebuild_desktop_container(blob.data(), blob.size(), rebuilt);
@@ -125,6 +201,7 @@ void translate_one(const std::vector<uint8_t>& blob, Result* r) {
     r->ok = translate_compute(code, size, info, &out, &r->error);
   }
   r->bytes_out = out.size();
+  if (kept) *kept = std::move(out);
 }
 
 // Errors grouped: the part after "at 0x...: " (the instruction's offset).
@@ -179,8 +256,27 @@ int extract(const std::wstring& in, const std::wstring& out) {
   return 0;
 }
 
+// Translates one shader file and writes the host container to `out`.
+int translate_file(const std::wstring& in, const std::wstring& out) {
+  std::vector<uint8_t> blob, bytecode;
+  if (!read_file(in, &blob)) return 1;
+  Result r;
+  translate_one(blob, &r, &bytecode);
+  if (!r.ok) {
+    std::fprintf(stderr, "%s: %s\n", kind_name(r.kind), r.error.c_str());
+    return 1;
+  }
+  FILE* file = _wfopen(out.c_str(), L"wb");
+  if (!file) return 1;
+  std::fwrite(bytecode.data(), 1, bytecode.size(), file);
+  std::fclose(file);
+  std::printf("%s: %zu bytes in, %zu bytes out\n", kind_name(r.kind), r.bytes_in, r.bytes_out);
+  return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
   if (argc == 4 && !std::wcscmp(argv[1], L"--extract")) return extract(argv[2], argv[3]);
+  if (argc == 4 && !std::wcscmp(argv[1], L"--translate")) return translate_file(argv[2], argv[3]);
   if (argc == 3 && !std::wcscmp(argv[1], L"--decode")) return decode_listing(argv[2]);
   if (argc < 2) {
     std::fprintf(stderr, "usage: holy_translate_corpus <directory> [--threads N] [--report <file>]\n");
@@ -189,9 +285,19 @@ int wmain(int argc, wchar_t** argv) {
   const std::wstring dir = argv[1];
   unsigned threads = std::max(1u, std::thread::hardware_concurrency());
   std::wstring report;
-  for (int i = 2; i + 1 < argc; ++i) {
-    if (!std::wcscmp(argv[i], L"--threads")) threads = static_cast<unsigned>(std::wcstoul(argv[++i], nullptr, 10));
-    else if (!std::wcscmp(argv[i], L"--report")) report = argv[++i];
+  bool compile = false;
+  for (int i = 2; i < argc; ++i) {
+    if (!std::wcscmp(argv[i], L"--compile")) compile = true;
+    else if (i + 1 < argc && !std::wcscmp(argv[i], L"--threads")) {
+      threads = static_cast<unsigned>(std::wcstoul(argv[++i], nullptr, 10));
+    } else if (i + 1 < argc && !std::wcscmp(argv[i], L"--report")) {
+      report = argv[++i];
+    }
+  }
+  Host host;
+  if (compile && !open_host(&host)) {
+    std::fprintf(stderr, "no host device for --compile\n");
+    return 1;
   }
   std::vector<Result> results;
   WIN32_FIND_DATAW entry;
@@ -214,7 +320,7 @@ int wmain(int argc, wchar_t** argv) {
   std::vector<std::thread> workers;
   for (unsigned t = 0; t < threads; ++t) {
     workers.emplace_back([&] {
-      std::vector<uint8_t> blob;
+      std::vector<uint8_t> blob, bytecode;
       for (size_t i; (i = next.fetch_add(1)) < results.size();) {
         Result& r = results[i];
         if (!read_file(dir + L"\\" + r.name, &blob)) {
@@ -222,8 +328,9 @@ int wmain(int argc, wchar_t** argv) {
           continue;
         }
         const auto t0 = std::chrono::steady_clock::now();
-        translate_one(blob, &r);
+        translate_one(blob, &r, compile ? &bytecode : nullptr);
         r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (compile && r.ok && (r.kind == Kind::Compute || r.kind == Kind::RawCompute)) compile_one(host, bytecode, &r);
       }
     });
   }
@@ -259,12 +366,39 @@ int wmain(int argc, wchar_t** argv) {
   std::sort(sorted.rbegin(), sorted.rend());
   if (!sorted.empty()) std::printf("failures by reason:\n");
   for (const auto& [count, text] : sorted) std::printf("  %6zu  %s\n", count, text.c_str());
+  if (compile) {
+    // The host compiler's time by translation size.
+    static const size_t kLimits[] = {64 << 10, 256 << 10, 1 << 20, 4 << 20, SIZE_MAX};
+    static const char* const kNames[] = {"under 64 KiB", "64-256 KiB", "256 KiB-1 MiB", "1-4 MiB", "4 MiB and up"};
+    size_t counts[5] = {}, refused = 0;
+    double sums[5] = {}, bytes[5] = {}, total = 0;
+    for (const Result& r : results) {
+      if (r.compile_ms < 0) continue;
+      if (FAILED(r.compile_result)) {
+        ++refused;
+        continue;
+      }
+      size_t b = 0;
+      while (r.bytes_out >= kLimits[b]) ++b;
+      ++counts[b];
+      sums[b] += r.compile_ms;
+      bytes[b] += static_cast<double>(r.bytes_out);
+      total += r.compile_ms;
+    }
+    std::printf("host compiler (shader caches %s): %.1f s over the compute translations, %zu refused\n",
+                host.caches_off ? "off" : "ON: times may be cache hits", total / 1000, refused);
+    for (int b = 0; b < 5; ++b) {
+      if (!counts[b]) continue;
+      std::printf("  %-14s %6zu programs, %8.1f ms each, %6.1f ms per MiB\n", kNames[b], counts[b],
+                  sums[b] / counts[b], sums[b] / (bytes[b] / 1048576.0));
+    }
+  }
   if (!report.empty()) {
     FILE* file = _wfopen(report.c_str(), L"w");
     if (file) {
       for (const Result& r : results) {
-        std::fprintf(file, "%ls\t%s\t%s\t%.3f\t%s\n", r.name.c_str(), kind_name(r.kind), r.ok ? "ok" : "failed", r.ms,
-                     r.error.c_str());
+        std::fprintf(file, "%ls\t%s\t%s\t%.3f\t%zu\t%zu\t%.3f\t%s\n", r.name.c_str(), kind_name(r.kind),
+                     r.ok ? "ok" : "failed", r.ms, r.bytes_in, r.bytes_out, r.compile_ms, r.error.c_str());
       }
       std::fclose(file);
     }

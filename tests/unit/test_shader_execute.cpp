@@ -617,6 +617,43 @@ TEST(page_table_entries_place_pages_at_their_view_offsets) {
   EXPECT(after[34] == 0);       // before the view
 }
 
+// Scalar memory addresses (documented): the two low bits of each part (base,
+// offset, instruction offset) are ignored, so scalar loads read whole,
+// aligned dwords.
+TEST(scalar_loads_ignore_the_low_address_bits) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // s_load_dword s4, s[0:1], 0x4; s_buffer_load_dword s5, s[12:15], s7;
+  // v_mov_b32 v0, s4; v_mov_b32 v1, s5; buffer_store_dwordx2 v[0:1], off,
+  // s[8:11], 0 offset:128; s_endpgm.
+  const std::vector<uint32_t> program = {0xF4000100u, 0xFA000004u, 0xF4200146u, 0x0E000000u, 0x7E000204u,
+                                         0x7E020205u, 0xE0740080u, 0x80020000u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  info.user_sgprs = 16;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  // The address 2^32 + 2 (plus 4: word 1) and a buffer at 2^32 read at
+  // offset 10 (word 2); unaligned reads would combine two words.
+  EXPECT(gpu.set_constants({2, 1, 0, 0, 0, 0, 0, 10, 0, 1, 256, 0, 0, 1, 256, 0}, true));
+  std::vector<uint32_t> contents(64);
+  for (uint32_t i = 0; i < 64; ++i) contents[i] = 0x1000 + i;
+  const std::vector<uint32_t> after = gpu.dispatch(cs, contents);
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[32] == 0x1001);
+  EXPECT(after[33] == 0x1002);
+}
+
 // Cached pages (shader/translate.h): the fourth page of the window is cache
 // line 0, whose copy is slot 2 (a buffer holding 0x2000 + i) and whose page
 // itself is slot 1 from view offset 0x80. Reads take the copy until a write;
@@ -689,7 +726,11 @@ TEST(cached_pages_read_their_copy_until_written) {
   info.user_sgprs = 8;
   std::vector<uint8_t> cs;
   std::string error;
+  TranslatorOptions options;
+  options.page_cache_reads = true;
+  set_translator_options(options);
   EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  set_translator_options(TranslatorOptions());
   EXPECT(gpu.set_constants({0x30000, 1, 256, 0, 0, 1, 256, 0}, true));
   std::vector<uint32_t> contents(64);
   for (uint32_t i = 0; i < 64; ++i) contents[i] = 0x1000 + i;

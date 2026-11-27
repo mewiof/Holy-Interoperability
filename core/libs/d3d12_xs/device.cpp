@@ -33,6 +33,7 @@
 #include "core/libs/d3d12_xs/frame_pacing.h"
 #include "core/libs/d3d12_xs/present.h"
 #include "core/libs/d3d12_xs/ngg.h"
+#include "core/libs/d3d12_xs/page_cache.h"
 #include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/d3d12_xs/shader_container.h"
@@ -1312,6 +1313,11 @@ Device* create_device(const void* parameters) {
       dred->Release();
     }
   }
+  // Before any translation: programs test for cached pages only when the
+  // page cache runs.
+  TranslatorOptions options;
+  options.page_cache_reads = page_cache_enabled();
+  set_translator_options(options);
   ID3D12Device* host = nullptr;
   const HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&host));
   if (FAILED(hr)) {

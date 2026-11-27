@@ -337,12 +337,18 @@ std::map<uintptr_t, std::pair<uintptr_t, HeapRecord>>::iterator retire_locked(
   return region_heaps().erase(it);
 }
 
+// Heaps out of the memory map, let go of once the GPU finished the work
+// submitted before they left it (it may read their memory): a title that
+// releases memory too early then keeps it charged a while instead of the GPU
+// reading released memory. Oldest first.
+std::mutex g_released_lock;
+std::vector<std::pair<GpuEpoch, HeapRecord>> g_released;
+
 void release_retired(const std::vector<HeapRecord>& retired) {
-  for (const HeapRecord& record : retired) {
-    record.whole->Release();
-    record.heap->Release();
-  }
-  if (!retired.empty()) c_heaps_released().add(static_cast<int64_t>(retired.size()));
+  if (retired.empty()) return;
+  const GpuEpoch epoch = gpu_epoch_now();
+  std::lock_guard<std::mutex> guard(g_released_lock);
+  for (const HeapRecord& record : retired) g_released.emplace_back(epoch, record);
 }
 
 void release_title_memory(const void* address, size_t size) {
@@ -356,6 +362,7 @@ void release_title_memory(const void* address, size_t size) {
     while (it != region_heaps().end() && it->second.first < end) it = retire_locked(it, &retired);
   }
   release_retired(retired);
+  collect_released_heaps();
 }
 
 // The page table (g_lock held), made on first use: a buffer in system memory
@@ -715,6 +722,24 @@ bool map_host_buffer(Device* device, ID3D12Resource* buffer, uint64_t alias, uin
   if (!slot) return false;
   map_pages(alias, alias + size, slot, 0);
   return true;
+}
+
+void collect_released_heaps() {
+  std::vector<HeapRecord> done;
+  {
+    std::lock_guard<std::mutex> guard(g_released_lock);
+    size_t count = 0;
+    while (count < g_released.size() && gpu_epoch_done(g_released[count].first)) {
+      done.push_back(g_released[count].second);
+      ++count;
+    }
+    g_released.erase(g_released.begin(), g_released.begin() + static_cast<std::ptrdiff_t>(count));
+  }
+  for (const HeapRecord& record : done) {
+    record.whole->Release();
+    record.heap->Release();
+  }
+  if (!done.empty()) c_heaps_released().add(static_cast<int64_t>(done.size()));
 }
 
 void unmap_range(uint64_t title_va, uint64_t size) {

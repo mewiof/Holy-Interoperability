@@ -473,8 +473,11 @@ Notes describe the platform, never a title.
   1,026 MiB charged). The runtime therefore lets go of heaps over title memory before the title's `VirtualFree`
   and `XMemFree` release it (`HolySetReleaseHook`); measured: no growth over the same rounds. Titles release memory
   once the GPU is done with it, as on the console. Host copies of textures filled from released memory leave the
-  registry with it (a texture viewed there later is a new one, filled then); their host textures are let go of
-  two seconds later (*assumed*: no work submitted before still reads them by then). A heap still recorded over
+  registry with it (a texture viewed there later is a new one, filled then). Their host textures, and the heaps
+  over the memory, are let go of once the GPU finished all work submitted to any queue before the release (each
+  queue's fence is signalled after every submission), as host objects must outlive the GPU's use of them; a title
+  releasing memory the GPU still reads keeps it charged until then. *Measured* (sample title): with the heap
+  released at once instead, the host did not remove the device either. A heap still recorded over
   memory whose allocation is gone or changed (released where the runtime does not hear of it) is let go of and
   opened again when an address in it is next located. Partial: memory released that way and allocated again at
   the same base is not told apart.

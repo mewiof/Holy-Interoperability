@@ -39,7 +39,7 @@ struct CommandQueue {
   // Signalled after every submission, so host command lists know when the
   // GPU is done with them.
   ID3D12Fence* fence = nullptr;
-  uint64_t submitted = 0;
+  std::atomic<uint64_t> submitted{0};
   std::mutex lock;  // submission and its signal stay in order
 };
 
@@ -193,5 +193,17 @@ std::string recorded_work_summary();
 // not passed to the host.
 HRESULT create_command_queue(Device* device, const D3D12_COMMAND_QUEUE_DESC* desc, bool console_flags,
                              void** out);
+
+// The GPU's progress over every queue the runtime submits work to (the
+// title's and its own): each queue's last submission when the epoch was
+// taken. Done once the GPU finished all of them, so whatever that work
+// reads can go. A queue's fence is signalled with `*submitted` after each
+// submission; both live as long as the process.
+struct GpuEpoch {
+  std::vector<std::pair<ID3D12Fence*, uint64_t>> marks;
+};
+void register_gpu_timeline(ID3D12Fence* fence, const std::atomic<uint64_t>* submitted);
+GpuEpoch gpu_epoch_now();
+bool gpu_epoch_done(const GpuEpoch& epoch);
 
 }  // namespace holy::d3d12

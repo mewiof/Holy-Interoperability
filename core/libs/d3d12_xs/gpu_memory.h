@@ -73,6 +73,9 @@ bool map_alias(Device* device, uint64_t alias, uint64_t size, uint64_t target);
 // of its own and translated programs read at those addresses.
 bool map_host_buffer(Device* device, ID3D12Resource* buffer, uint64_t alias, uint64_t size);
 void unmap_range(uint64_t title_va, uint64_t size);
+// Lets go of the heaps over memory the title released that the GPU is done
+// with (called before submissions; also when the title releases memory).
+void collect_released_heaps();
 
 // A slot views kSlotBytes of its heap's buffer (2^27 raw elements, the
 // desktop's limit for buffer views), one every kSlotStride bytes: consecutive

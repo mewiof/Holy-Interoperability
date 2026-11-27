@@ -9,12 +9,15 @@
 #include <d3d12.h>
 #include <intrin.h>
 
+#include <mutex>
+
 #include <string>
 #include <vector>
 
 #include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/forward.h"
+#include "core/libs/d3d12_xs/gpu_memory.h"
 #include "core/libs/d3d12_xs/present.h"
 #include "core/libs/d3d12_xs/texture_upload.h"
 #include "core/libs/support.h"
@@ -69,6 +72,7 @@ void STDMETHODCALLTYPE queue_execute_command_lists_x(CommandQueue* self, UINT co
     LIB_LOG(lib::kDebug, "d3d12", "queue type %d executes title lists%s", self->type, numbers.c_str());
   }
   refresh_textures(self->device, self->host);
+  collect_released_heaps();
   submit_command_lists(self, count, lists);
 }
 
@@ -200,8 +204,46 @@ HRESULT create_command_queue(Device* device, const D3D12_COMMAND_QUEUE_DESC* des
   queue->host = host;
   queue->type = desc->Type;
   queue->fence = fence;
+  register_gpu_timeline(fence, &queue->submitted);
   *out = queue;
   return S_OK;
+}
+
+namespace {
+
+struct Timeline {
+  ID3D12Fence* fence;
+  const std::atomic<uint64_t>* submitted;
+};
+std::mutex g_timelines_lock;
+std::vector<Timeline>& timelines() {
+  static auto* list = new std::vector<Timeline>();
+  return *list;
+}
+
+}  // namespace
+
+void register_gpu_timeline(ID3D12Fence* fence, const std::atomic<uint64_t>* submitted) {
+  fence->AddRef();
+  std::lock_guard<std::mutex> guard(g_timelines_lock);
+  timelines().push_back({fence, submitted});
+}
+
+GpuEpoch gpu_epoch_now() {
+  GpuEpoch epoch;
+  std::lock_guard<std::mutex> guard(g_timelines_lock);
+  for (const Timeline& t : timelines()) {
+    const uint64_t value = t.submitted->load(std::memory_order_acquire);
+    if (value) epoch.marks.emplace_back(t.fence, value);
+  }
+  return epoch;
+}
+
+bool gpu_epoch_done(const GpuEpoch& epoch) {
+  for (const auto& [fence, value] : epoch.marks) {
+    if (fence->GetCompletedValue() < value) return false;
+  }
+  return true;
 }
 
 }  // namespace holy::d3d12

@@ -28,7 +28,7 @@ struct Uploader {
   ID3D12GraphicsCommandList* list = nullptr;
   ID3D12Fence* fence = nullptr;
   HANDLE event = nullptr;
-  uint64_t value = 0;
+  std::atomic<uint64_t> value{0};
   std::vector<ID3D12Resource*> staging;  // released once the work submitted with them is done
 };
 
@@ -75,18 +75,16 @@ struct Change {
   uint64_t begin;
   uint64_t size;
   bool released;  // the title released the memory (else it changed)
-  ULONGLONG when;  // GetTickCount64 when it was reported
 };
 std::vector<Change> g_changes;
 // Host textures of records dropped because their memory was released, let go
-// of a while later (GPU work submitted before may still read them).
+// of once the GPU finished the work submitted before (it may read them).
 struct Retired {
-  ULONGLONG since;
+  GpuEpoch epoch;
   ID3D12Resource* texture;
   uint64_t bytes;  // in title memory (the live count's share)
 };
-std::vector<Retired> g_retired;  // under g_lock
-constexpr ULONGLONG kRetireMs = 2000;
+std::vector<Retired> g_retired;  // under g_lock, oldest first
 std::atomic<bool> g_any_change{false};
 
 const lib::Counter& c_refreshes() {
@@ -198,18 +196,17 @@ void scan_range(Tracked& allocation, uint64_t begin, uint64_t end) {
   }
 }
 
-void drop(Record* record, ULONGLONG released = 0);
+void drop(Record* record, bool later = false);
 
 // Drops the records filled from memory over [begin, end) (g_lock held): the
-// title released the memory at `released` (GetTickCount64), so the textures
-// there are gone; a texture viewed there later is a new one, filled from the
-// memory then.
-void drop_range(uint64_t begin, uint64_t end, ULONGLONG released) {
+// title released the memory, so the textures there are gone; a texture
+// viewed there later is a new one, filled from the memory then.
+void drop_range(uint64_t begin, uint64_t end) {
   auto it = textures().lower_bound(Key{begin > g_largest ? begin - g_largest : 0, 0, 0, 0, 0, 0, 0});
   while (it != textures().end() && std::get<0>(it->first) < end) {
     Record* record = it->second;
     if (record->from_memory && record->address + record->size > begin) {
-      drop(record, released);
+      drop(record, true);
       it = textures().erase(it);
     } else {
       ++it;
@@ -217,12 +214,15 @@ void drop_range(uint64_t begin, uint64_t end, ULONGLONG released) {
   }
 }
 
-// Lets go of the retired host textures old enough to be done with (g_lock held).
-void release_retired(ULONGLONG now) {
-  while (!g_retired.empty() && now - g_retired.front().since > kRetireMs) {
-    release_filled(g_retired.front().texture, g_retired.front().bytes);
-    g_retired.erase(g_retired.begin());
+// Lets go of the retired host textures the GPU is done with (g_lock held).
+// Epochs are taken in order: once one is not done, later ones are not either.
+void release_retired() {
+  size_t done = 0;
+  while (done < g_retired.size() && gpu_epoch_done(g_retired[done].epoch)) {
+    release_filled(g_retired[done].texture, g_retired[done].bytes);
+    ++done;
   }
+  g_retired.erase(g_retired.begin(), g_retired.begin() + static_cast<std::ptrdiff_t>(done));
 }
 
 // Applies the queued changes (g_lock held).
@@ -236,7 +236,7 @@ void apply_changes() {
   }
   for (const Change& change : changes) {
     if (change.released) {
-      drop_range(change.begin, change.begin + change.size, change.when);
+      drop_range(change.begin, change.begin + change.size);
     } else {
       mark_range(change.begin, change.begin + change.size);
     }
@@ -249,8 +249,8 @@ void apply_changes() {
 // allocation, over the span its textures cover (g_lock held).
 void scan() {
   apply_changes();
+  release_retired();
   const ULONGLONG now = GetTickCount64();
-  release_retired(now);
   if (now - g_last_scan < 16) return;
   g_last_scan = now;
   for (auto& [base, allocation] : tracked()) {
@@ -285,10 +285,9 @@ void track(Record* record) {
   }
 }
 
-// The registry lets go of a record (g_lock held). `released`: when the title
-// released its memory (GetTickCount64); its host texture then goes kRetireMs
-// after that. 0: at once.
-void drop(Record* record, ULONGLONG released) {
+// The registry lets go of a record (g_lock held); `later`: its host texture
+// goes once the GPU finished the work submitted until now.
+void drop(Record* record, bool later) {
   if (record->protected_watch) unwatch(reinterpret_cast<WatchToken>(record));
   g_dirty.erase(std::remove(g_dirty.begin(), g_dirty.end(), record), g_dirty.end());
   for (auto& [base, allocation] : tracked()) {
@@ -296,8 +295,8 @@ void drop(Record* record, ULONGLONG released) {
     list.erase(std::remove(list.begin(), list.end(), record), list.end());
   }
   if (record->texture && record->from_memory) {
-    if (released) {
-      g_retired.push_back({released, record->texture, record->size});
+    if (later) {
+      g_retired.push_back({gpu_epoch_now(), record->texture, record->size});
     } else {
       release_filled(record->texture, record->size);
     }
@@ -321,6 +320,7 @@ bool make_uploader(Device* device, Uploader* out) {
   if (made) {
     out->queue->SetName(L"holy texture upload queue");
     out->list->SetName(L"holy texture upload");
+    register_gpu_timeline(out->fence, &out->value);  // its copies read title memory
   }
   return made;
 }
@@ -558,7 +558,7 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   // Released memory's textures go first: a texture viewed in memory the title
   // released and reused is a new one.
   apply_changes();
-  release_retired(GetTickCount64());
+  release_retired();
   auto found = textures().find(key);
   if (found != textures().end()) return found->second->texture;
 
@@ -632,14 +632,14 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
 void texture_memory_released(uint64_t address, uint64_t size) {
   if (!size) return;
   std::lock_guard<std::mutex> guard(g_changes_lock);
-  g_changes.push_back({address, size, true, GetTickCount64()});
+  g_changes.push_back({address, size, true});
   g_any_change.store(true, std::memory_order_release);
 }
 
 void texture_memory_changed(uint64_t address, uint64_t size) {
   if (!size) return;
   std::lock_guard<std::mutex> guard(g_changes_lock);
-  g_changes.push_back({address, size, false, GetTickCount64()});
+  g_changes.push_back({address, size, false});
   g_any_change.store(true, std::memory_order_release);
 }
 

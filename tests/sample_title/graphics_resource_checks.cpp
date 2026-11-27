@@ -627,8 +627,10 @@ void test_released_memory(void* device) {
 }
 
 // Textures viewed in title memory the title then releases: the runtime's host
-// copies of them go (a while later, when the GPU is done with them), read from
-// the runtime's live count of host textures filled from title memory.
+// copies of them go once the GPU is done with the work submitted before (here
+// at once: it is idle), read from the runtime's live count of host textures
+// filled from title memory. The memory is held until all are viewed, so every
+// texture is at another address.
 void test_released_texture_memory(void* device) {
   using CounterFn = volatile int64_t* (*)(const char*);
   const HMODULE runtime = GetModuleHandleW(L"holyrt.dll");
@@ -658,25 +660,30 @@ void test_released_texture_memory(void* device) {
   view.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   view.srv.Texture2D.MipLevels = 1;
   const uint64_t descriptor = call<uint64_t>(heap, 9);
-  auto view_and_release = [&] {
-    void* memory = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!memory) return;
+  auto view_at = [&](void* memory) {
     view.address = reinterpret_cast<uint64_t>(memory);
     call<void>(device, 70, &texture, &view, descriptor);
-    VirtualFree(memory, 0, MEM_RELEASE);
   };
   const int64_t before = *live;
   constexpr int kRounds = 8;
-  for (int i = 0; i < kRounds; ++i) view_and_release();
+  void* blocks[kRounds] = {};
+  for (void*& block : blocks) {
+    block = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (block) view_at(block);
+  }
   const int64_t held = *live - before;
-  // The released textures' host copies go once old enough: the next view
-  // lets go of them.
-  Sleep(2100);
-  view_and_release();
+  for (void* block : blocks) {
+    if (block) VirtualFree(block, 0, MEM_RELEASE);
+  }
+  // The next view applies the releases.
+  void* last = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  if (last) view_at(last);
   const int64_t after = *live - before;
-  std::printf("    (host textures from title memory: %+lld after %d views of released memory, %+lld later)\n",
+  if (last) VirtualFree(last, 0, MEM_RELEASE);
+  std::printf("    (host textures from title memory: %+lld after %d views, %+lld once the memory was released and "
+              "another viewed)\n",
               static_cast<long long>(held), kRounds, static_cast<long long>(after));
-  check(held == kRounds && after <= 1, "host copies of textures in memory the title released are let go of");
+  check(held == kRounds && after == 1, "host copies of textures in memory the title released are let go of");
   call<ULONG>(heap, 2);
 }
 
@@ -1299,6 +1306,118 @@ void test_draw_recording_cost(void* device, void* queue) {
   VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+// Title memory released while the GPU still reads it (a title's mistake the
+// console may forgive): the work finishes, later work runs, and the runtime's
+// heap over the memory goes once the GPU is done (its count of released
+// heaps). The reads take tens of milliseconds (test_memory_read_cost).
+void test_memory_released_while_read(void* device, void* queue) {
+  void* allocator = nullptr;
+  void* list = nullptr;
+  void* fence = nullptr;
+  void* heap = nullptr;
+  void* root = nullptr;
+  void* pipeline = nullptr;
+  void* placed = nullptr;
+  const uint32_t list_desc[4] = {0, 2, 1, 0};
+  call<HRESULT>(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), &allocator);
+  if (allocator) call<HRESULT>(device, 73, list_desc, allocator, static_cast<void*>(nullptr), kListIid, &list);
+  call<HRESULT>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), &fence);
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                                       1};
+  call<HRESULT>(device, 14, &heap_desc, __uuidof(ID3D12DescriptorHeap), &heap);
+  D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+  D3D12_ROOT_PARAMETER1 parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable = {1, &range};
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants = {0, 0, 2};
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+  root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  root_desc.Desc_1_1.NumParameters = 2;
+  root_desc.Desc_1_1.pParameters = parameters;
+  ID3DBlob* serialized = nullptr;
+  if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&root_desc, &serialized, nullptr)) && serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &root);
+  }
+  // The program of test_memory_read_cost: 16 reads of 16 bytes per thread.
+  std::vector<uint32_t> code = {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE940305u, 0xBE950306u, 0xBE9603FFu,
+                                0x00010000u, 0xBE970380u, 0x8018FF05u, 0x00010000u, 0x82198006u, 0xBE9A03FFu,
+                                0x00000400u, 0xBE9B0380u, 0x34020084u, 0x7E0C0280u, 0x7E0E0280u, 0x7E100280u,
+                                0x7E120280u};
+  for (uint32_t k = 0; k < 16; ++k) {
+    for (uint32_t word : {0xE0381000u | (k * 256u), 0x80050201u, 0xBF8C3F70u, 0x4A0C0D02u, 0x4A0E0F03u, 0x4A101104u,
+                          0x4A121305u}) {
+      code.push_back(word);
+    }
+  }
+  for (uint32_t word : {0xE0781000u, 0x80060601u, 0xBF810000u}) code.push_back(word);
+  const std::vector<uint8_t> container = native_only_container(code);
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+  pso.CS = {container.data(), container.size()};
+  call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
+                __uuidof(ID3D12PipelineState), &pipeline);
+  using CounterFn = volatile int64_t* (*)(const char*);
+  const HMODULE runtime = GetModuleHandleW(L"holyrt.dll");
+  const auto counter = runtime ? reinterpret_cast<CounterFn>(GetProcAddress(runtime, "HolyCounter")) : nullptr;
+  volatile int64_t* released = counter ? counter("d3d12.gpu_heaps_released") : nullptr;
+  auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  if (!list || !fence || !heap || !root || !pipeline || !memory || !released) {
+    check(false, "the objects for releasing memory the GPU reads exist");
+    return;
+  }
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 0x20000;
+  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  call<HRESULT>(device, 133, base, &buffer, static_cast<UINT>(0xFFFFFFFF), static_cast<const void*>(nullptr),
+                __uuidof(ID3D12Resource), &placed);
+  if (placed) call<ULONG>(placed, 2);
+  bool recorded = call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
+  void* heaps[] = {heap};
+  call<void>(list, 32, 1u, static_cast<void* const*>(heaps));
+  const uint32_t constants[2] = {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32)};
+  call<void>(list, 33, root);
+  call<void>(list, 35, 0u, call<uint64_t>(heap, 10));
+  call<void>(list, 39, 1u, 2u, static_cast<const void*>(constants), 0u);
+  call<void>(list, 25, pipeline);
+  for (uint32_t i = 0; i < 4; ++i) call<void>(list, 14, 4096u, 1u, 1u);
+  recorded = recorded && call<HRESULT>(list, 9) == S_OK;
+  void* lists[] = {list};
+  const int64_t released_before = *released;
+  call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+  call<HRESULT>(queue, 16, fence, UINT64{1});
+  VirtualFree(memory, 0, MEM_RELEASE);  // while the GPU reads it
+  const int64_t released_at_once = *released - released_before;
+  const auto* value = call<const volatile uint64_t*>(fence, 12);
+  for (int i = 0; value && *value < 1 && i < 10000; ++i) Sleep(1);
+  // Later work: an empty submission (which also lets go of what the GPU is
+  // done with), then the fence again.
+  recorded = recorded && call<HRESULT>(allocator, 8) == S_OK &&
+             call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK &&
+             call<HRESULT>(list, 9) == S_OK;
+  call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+  call<HRESULT>(queue, 16, fence, UINT64{2});
+  for (int i = 0; value && *value < 2 && i < 10000; ++i) Sleep(1);
+  const int64_t released_later = *released - released_before;
+  std::printf("    (heaps let go of: %lld when the memory was released, %lld after the GPU finished; fence %llu)\n",
+              static_cast<long long>(released_at_once), static_cast<long long>(released_later),
+              static_cast<unsigned long long>(value ? *value : 0));
+  check(recorded && value && *value == 2 && released_at_once == 0 && released_later >= 1,
+        "title memory released while the GPU reads it stays until the GPU is done, and later work runs");
+
+  call<ULONG>(pipeline, 2);
+  call<ULONG>(root, 2);
+  call<ULONG>(heap, 2);
+  call<ULONG>(fence, 2);
+  call<ULONG>(list, 2);
+  call<ULONG>(allocator, 2);
+}
+
 // A recording keeps its root arguments however much is recorded after it: a
 // list records one dispatch of a native program storing a root constant, a
 // second list records 100,000 more (more than the runtime's memory for root
@@ -1811,6 +1930,7 @@ void test_graphics_resources(void* device, void* queue) {
   if (queue) test_draw_recording_cost(device, queue);
   if (queue) test_memory_read_cost(device, queue);
   if (queue) test_root_arguments_outlive_later_recording(device, queue);
+  if (queue) test_memory_released_while_read(device, queue);
   if (queue) test_native_depth(device, queue, false);
   if (queue) test_native_depth(device, queue, true);
   test_page_mapping_update(device);

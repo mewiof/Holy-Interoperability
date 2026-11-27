@@ -445,6 +445,25 @@ Notes describe the platform, never a title.
   as the title maps and unmaps pages); descriptor heaps' GPU ranges when the heaps are made; buffers the bound tables, root views and vertex buffers name are located before the call if their page
   is not in the table yet. Partial: memory nothing has located (reached only through pointers held in memory)
   reads as zero; the ring is not fenced.
+- *measured* host behaviour (development host; a desktop compute program reading 16-byte elements, GB/s): the GPU
+  does not keep memory of heaps opened over process memory (`OpenExistingHeapFromAddress`) or over a section
+  (`OpenExistingHeapFromFileMapping`) in its second-level cache, while it does keep memory the host allocates:
+
+  | Working set | Heap over process memory | Heap over a section | Host write-back heap | Upload heap | Video memory |
+  | --- | --- | --- | --- | --- | --- |
+  | 1 MiB, read once | 23 | 23 | 218 | 218 | 512 |
+  | 16 MiB, read once | 10-14 | 10 | 165-197 | 186-189 | 1,928 |
+  | 64-256 MiB, read once | 10-13 | 10-13 | 10-13 | 11-13 | 405-472 |
+  | 4 KiB, read 64 times per thread | 2,675 | 2,682 | 4,145 | 4,145 | 4,161 |
+  | 64 KiB, read 64 times per thread | 200 | 405 | 4,080 | 4,049 | 4,112 |
+
+  Title memory reaches the GPU through heaps of the first two kinds, so whatever misses the first-level caches
+  (vertices, structured data, tables beyond a few KiB) crosses the bus each time: about 20 times slower than video
+  memory. Measured through the runtime (sample title): a native compute program and the same program in HLSL
+  reading title memory take the same time (47 against 46-52 ms for 4 GiB of reads), so the memory, not the
+  translation, sets the cost. Textures are not affected (host copies in video memory). Partial: buffers in title
+  memory are read where they are; copies in video memory kept current with the title's writes (as textures are)
+  are planned once the reference title's own access pattern can be measured.
 - *measured* host behaviour (development host): memory a heap was opened over stays charged to the process after
   the title releases it, for as long as the heap lives (16 rounds of 64 MiB placed, released and freed left
   1,026 MiB charged). The runtime therefore lets go of heaps over title memory before the title's `VirtualFree`

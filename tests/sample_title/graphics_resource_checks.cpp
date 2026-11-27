@@ -1299,6 +1299,173 @@ void test_draw_recording_cost(void* device, void* queue) {
   VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+// What translated memory reads cost the GPU against the desktop's: a native
+// compute program and the same program in HLSL each read 16 times 16 bytes
+// per thread (unrolled) and store the sums, dispatched 4 times 4096 groups of
+// 64 between GPU timestamps. Both sums must agree; the times are printed (the
+// ratio is the cost of reaching title memory through the memory map).
+void test_memory_read_cost(void* device, void* queue) {
+  void* allocator = nullptr;
+  void* list = nullptr;
+  void* fence = nullptr;
+  void* heap = nullptr;
+  void* native_root = nullptr;
+  void* desktop_root = nullptr;
+  void* native = nullptr;
+  void* desktop = nullptr;
+  void* placed = nullptr;
+  const uint32_t list_desc[4] = {0, 2, 1, 0};
+  call<HRESULT>(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), &allocator);
+  if (allocator) call<HRESULT>(device, 73, list_desc, allocator, static_cast<void*>(nullptr), kListIid, &list);
+  call<HRESULT>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), &fence);
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                                       1};
+  call<HRESULT>(device, 14, &heap_desc, __uuidof(ID3D12DescriptorHeap), &heap);
+  // Native: a table (unused) and two constants, the memory's address.
+  D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+  D3D12_ROOT_PARAMETER1 parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable = {1, &range};
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants = {0, 0, 2};
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+  root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  root_desc.Desc_1_1.NumParameters = 2;
+  root_desc.Desc_1_1.pParameters = parameters;
+  ID3DBlob* serialized = nullptr;
+  if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&root_desc, &serialized, nullptr)) && serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &native_root);
+  }
+  // Desktop: the data as a root view, the sums as a root UAV.
+  D3D12_ROOT_PARAMETER1 views[2] = {};
+  views[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+  views[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  root_desc.Desc_1_1.pParameters = views;
+  serialized = nullptr;
+  if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&root_desc, &serialized, nullptr)) && serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &desktop_root);
+  }
+  // s_load_dwordx4 s[4:7], s[0:1] (the root table: s[5:6] the address);
+  // s[20:23] the data (64 KiB at it), s[24:27] the sums (1 KiB at +64 KiB);
+  // v1 = v0 << 4; v[6:9] = 0; 16 times: buffer_load_dwordx4 v[2:5], v1,
+  // s[20:23] offen offset:256k, then v[6:9] += v[2:5]; buffer_store_dwordx4
+  // v[6:9], v1, s[24:27] offen; s_endpgm.
+  std::vector<uint32_t> code = {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE940305u, 0xBE950306u, 0xBE9603FFu,
+                                0x00010000u, 0xBE970380u, 0x8018FF05u, 0x00010000u, 0x82198006u, 0xBE9A03FFu,
+                                0x00000400u, 0xBE9B0380u, 0x34020084u, 0x7E0C0280u, 0x7E0E0280u, 0x7E100280u,
+                                0x7E120280u};
+  for (uint32_t k = 0; k < 16; ++k) {
+    for (uint32_t word : {0xE0381000u | (k * 256u), 0x80050201u, 0xBF8C3F70u, 0x4A0C0D02u, 0x4A0E0F03u, 0x4A101104u,
+                          0x4A121305u}) {
+      code.push_back(word);
+    }
+  }
+  for (uint32_t word : {0xE0781000u, 0x80060601u, 0xBF810000u}) code.push_back(word);
+  const std::vector<uint8_t> container = native_only_container(code);
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+  pso.CS = {container.data(), container.size()};
+  call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
+                __uuidof(ID3D12PipelineState), &native);
+  HMODULE compiler = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  using CompileFn = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*,
+                                     UINT, UINT, void**, void**);
+  const auto compile = compiler ? reinterpret_cast<CompileFn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+  const char source[] =
+      "ByteAddressBuffer data : register(t0); RWByteAddressBuffer sums : register(u0);"
+      "[numthreads(64,1,1)] void main(uint3 t : SV_GroupThreadID) { uint4 sum = 0;"
+      "[unroll] for (uint k = 0; k < 16; ++k) sum += data.Load4(t.x * 16 + k * 256);"
+      "sums.Store4(t.x * 16, sum); }";
+  void* shader = nullptr;
+  if (compile) compile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_1", 0, 0, &shader, nullptr);
+  if (shader && desktop_root) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desktop_pso{};
+    desktop_pso.pRootSignature = static_cast<ID3D12RootSignature*>(desktop_root);
+    desktop_pso.CS = {blob_pointer(shader), blob_size(shader)};
+    call<HRESULT>(device, 62, &desktop_pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
+                  __uuidof(ID3D12PipelineState), &desktop);
+  }
+  // Data at +0, native sums at +64 KiB, desktop sums at +128 KiB, timestamps
+  // at +192 KiB.
+  auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x40000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  if (!list || !fence || !heap || !native_root || !desktop_root || !native || !desktop || !memory) {
+    check(false, "the objects for measuring translated memory reads exist");
+    return;
+  }
+  auto* data = reinterpret_cast<uint32_t*>(memory);
+  for (uint32_t i = 0; i < 0x4000; ++i) data[i] = i * 2654435761u;
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 0x40000;
+  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  call<HRESULT>(device, 133, base, &buffer, static_cast<UINT>(0xFFFFFFFF), static_cast<const void*>(nullptr),
+                __uuidof(ID3D12Resource), &placed);
+  const uint64_t stamps = base + 0x30000;
+  D3D12_GLOBAL_BARRIER global{D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                              D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS};
+  D3D12_BARRIER_GROUP group{};
+  group.Type = D3D12_BARRIER_TYPE_GLOBAL;
+  group.NumBarriers = 1;
+  group.pGlobalBarriers = &global;
+  constexpr uint32_t kRepeats = 4, kGroups = 4096;
+  bool recorded = call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
+  void* heaps[] = {heap};
+  call<void>(list, 32, 1u, static_cast<void* const*>(heaps));
+  call<void>(list, 72, stamps, UINT64{0}, UINT64{0}, 1u);
+  const uint32_t constants[2] = {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32)};
+  call<void>(list, 33, native_root);
+  call<void>(list, 35, 0u, call<uint64_t>(heap, 10));
+  call<void>(list, 39, 1u, 2u, static_cast<const void*>(constants), 0u);
+  call<void>(list, 25, native);
+  for (uint32_t i = 0; i < kRepeats; ++i) call<void>(list, 14, kGroups, 1u, 1u);
+  call<void>(list, 146, 1u, static_cast<const D3D12_BARRIER_GROUP*>(&group));
+  call<void>(list, 72, stamps + 8, UINT64{0}, UINT64{0}, 1u);
+  call<void>(list, 33, desktop_root);
+  call<void>(list, 43, 0u, base);
+  call<void>(list, 45, 1u, base + 0x20000);
+  call<void>(list, 25, desktop);
+  for (uint32_t i = 0; i < kRepeats; ++i) call<void>(list, 14, kGroups, 1u, 1u);
+  call<void>(list, 146, 1u, static_cast<const D3D12_BARRIER_GROUP*>(&group));
+  call<void>(list, 72, stamps + 16, UINT64{0}, UINT64{0}, 1u);
+  recorded = recorded && call<HRESULT>(list, 9) == S_OK;
+  void* lists[] = {list};
+  call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+  call<HRESULT>(queue, 16, fence, UINT64{1});
+  const auto* value = call<const volatile uint64_t*>(fence, 12);
+  for (int i = 0; value && *value < 1 && i < 10000; ++i) Sleep(1);
+  UINT64 frequency = 0;
+  call<HRESULT>(queue, 18, &frequency);
+  const auto* times = reinterpret_cast<const volatile uint64_t*>(memory + 0x30000);
+  const double native_ms = frequency ? static_cast<double>(times[1] - times[0]) * 1e3 / static_cast<double>(frequency) : 0;
+  const double desktop_ms = frequency ? static_cast<double>(times[2] - times[1]) * 1e3 / static_cast<double>(frequency) : 0;
+  const bool same = std::memcmp(memory + 0x10000, memory + 0x20000, 0x400) == 0;
+  uint32_t expected = 0;
+  for (uint32_t k = 0; k < 16; ++k) expected += data[k * 64];
+  const uint32_t first_sum = *reinterpret_cast<const volatile uint32_t*>(memory + 0x10000);
+  std::printf("    (16 reads of 16 bytes per thread, %u x %u groups of 64: translated %.3f ms, desktop %.3f ms on the "
+              "GPU, %.1fx; sums %s; fence %llu)\n",
+              kRepeats, kGroups, native_ms, desktop_ms, desktop_ms > 0 ? native_ms / desktop_ms : 0.0,
+              same && first_sum == expected ? "agree" : "differ", static_cast<unsigned long long>(value ? *value : 0));
+  check(recorded && value && *value == 1 && same && first_sum == expected,
+        "a native program reading title memory computes what the same desktop program does");
+
+  if (placed) call<ULONG>(placed, 2);
+  call<ULONG>(desktop, 2);
+  call<ULONG>(native, 2);
+  call<ULONG>(desktop_root, 2);
+  call<ULONG>(native_root, 2);
+  call<ULONG>(heap, 2);
+  call<ULONG>(fence, 2);
+  call<ULONG>(list, 2);
+  call<ULONG>(allocator, 2);
+  VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 // Pipelines from native descriptions (device slot 57). `stencil` false: the
 // render state tests and writes depth (DB_DEPTH_CONTROL: less), and a near
 // triangle drawn before a far one keeps its colour. True: a first pipeline
@@ -1533,6 +1700,7 @@ void test_native_depth(void* device, void* queue, bool stencil) {
 void test_graphics_resources(void* device, void* queue) {
   if (queue) test_native_draw(device, queue);
   if (queue) test_draw_recording_cost(device, queue);
+  if (queue) test_memory_read_cost(device, queue);
   if (queue) test_native_depth(device, queue, false);
   if (queue) test_native_depth(device, queue, true);
   test_page_mapping_update(device);

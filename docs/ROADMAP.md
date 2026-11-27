@@ -152,6 +152,12 @@ The largest piece.
   translate; programs using them were refused.
 - next: textures streamed into scattered pool pages are copied through the CPU.
 - open: textures the GPU writes in title memory as seen by the CPU.
+- next: buffers in video memory. The GPU reads title memory over the bus without its second-level cache, about
+  20 times slower than video memory once data misses the first-level caches (measured, `PLATFORM_NOTES.md`).
+  Plan: copies in video memory of title memory the GPU reads, kept current with the title's writes as textures
+  are (write watching, announced kernel writes), the page table pointing translated reads at them; memory the GPU
+  writes, atomics in particular, stays where the CPU sees it. To be sized against the reference title's own
+  traffic first.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.
 - open: interaction with graphics helper DLLs that packages ship and that call into the device.

@@ -40,7 +40,7 @@ flowchart LR
 | Runs for minutes without crashing | 🟡 three stops in the title's first seconds fixed (a calling-convention bug, packed render-target formats, depth textures asking for unordered access); it now loads thousands of resources and stops at its own check when a buffer cannot be placed over physical pages (seen with the host's commit exhausted) |
 | No memory leaks (RAM, VRAM, system commit) | 🟡 live-object counters in every run; host heaps no longer leak system commit after exit, released textures free their host copies |
 | A correct picture | ⬜ frames are black |
-| Menus and input | ⬜ no input devices yet |
+| Menus and input | 🟡 a gamepad from the host controller or keyboard; menus not reached yet |
 | Sound | ⬜ silent audio device |
 | In game at a stable 30 FPS, no leaks | ⬜ |
 
@@ -55,7 +55,7 @@ flowchart LR
 | Graphics: pipelines and caches | `███████░░░` 70% |
 | Graphics: correct output | `█░░░░░░░░░` 8% |
 | Graphics: performance | `█░░░░░░░░░` 10% |
-| Input | `█░░░░░░░░░` 10% |
+| Input | `████░░░░░░` 40% |
 | Audio | `█░░░░░░░░░` 10% |
 | Measurement: statistics, profiler, leak checks | `███████░░░` 70% |
 
@@ -90,7 +90,7 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `d3d12_xs` (graphics) | Device on the host's Direct3D 12, queues, fences, descriptor heaps, views, resources and heaps in title memory, pipelines from DXIL or from native GPU code translated to host bytecode (compute, vertex, pixel and NGG programs), compiled at first use and shared by content, translations cached on disk, command recording (state, root arguments, draws, dispatches, barriers), queue-ordered page mapping updates, presentation onto the title's window paced at its frame interval, captured frames; parts of translated code checked on the host GPU, translated rendering as a whole not yet checked against known results |
 | `xgameruntime` (game runtime) | Entry points, task queues and async calls, networking (offline), users (nobody signed in), system identity, package state, persistent local storage, display mode, speech synthesis (refused by the host engine inside the sandbox); other services missing |
 | `xcrdapi` (fast storage) | Factory, file opening, status arrays, queues, file and memory requests including zlib (processed synchronously) |
-| `gameinput` (input) | Interface present; no input devices surfaced yet |
+| `gameinput` (input) | One gamepad from the host's first XInput controller and the keyboard: readings, device enumeration and information, rumble |
 | Offline switch, interposers for DLLs the package ships | Working, tested end to end |
 | `xg_xs` (texture layout) | Swizzle mode suggestion, texture copies into a desktop-compatible layout, tiling queries |
 | Audio console libraries (`AcpHal`, `xapu`, `chad`) | Audio processor heap; shape contexts, control and audio processors as a silent device (nothing is decoded, mixed or played) |

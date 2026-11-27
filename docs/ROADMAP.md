@@ -134,9 +134,10 @@ output through the host's audio stack.
 The console flavour of the input API, built under an alias because the host has a different DLL of the same
 name.
 
-- done: `GameInputCreate` and the `IGameInput` methods titles call first, answering as a console with no
-  input device attached.
-- open: surfacing host controllers (and keyboard and mouse) as devices and readings.
+- done: `GameInputCreate` and the `IGameInput` methods titles call first.
+- done: one gamepad from the host's first XInput controller and the keyboard (readings, device enumeration,
+  device information, rumble).
+- open: reading callbacks, several gamepads, keyboard and mouse readings.
 
 ## 7. Storage (`xcrdapi`) — partial
 

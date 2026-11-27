@@ -510,8 +510,17 @@ Notes describe the platform, never a title.
   public v0 slot order (slot 9 receives `RegisterDeviceCallback`'s seven arguments: device, kind mask,
   status filter, enumeration kind, context, callback, token).
 - *observed*: `0x838A0003` (`GAMEINPUT_E_READING_NOT_FOUND`) is the "no reading" result.
-- Implementation, partial: no input device is surfaced yet. Enumeration finds no device, reading queries
-  return `0x838A0003`, callback registrations succeed and never fire. Slots 3-6, 8, 9, 12 and 13 are bound.
+- *documented* (public GameInput.h): readings (`IGameInputReading`, v0 order: 3 `GetInputKind`, 4
+  `GetSequenceNumber`, 5 `GetTimestamp`, 6 `GetDevice`, 22 `GetGamepadState`), devices (`IGameInputDevice`: 3
+  `GetDeviceInfo`, 4 `GetDeviceStatus`, 5 `GetBatteryState`, 10 `SetRumbleState`), the gamepad state (buttons, then
+  triggers and sticks as floats), the device information layout, the device callback's arguments and the
+  enumeration kinds (0 none, 1 asynchronous, 2 before the registration returns).
+- Implementation: one gamepad, always connected: the host's first XInput controller, and the keyboard while a
+  window of the process has the focus (mapping in [USAGE.md](USAGE.md)). Current readings are the latest state;
+  a next reading exists when the state changed since the reference reading (states between polls are not
+  kept). Device enumeration reports the gamepad; it never disconnects. Rumble goes to the XInput controller.
+  Partial: reading callbacks register and never fire; keyboard and mouse readings report `0x838A0003`; one
+  gamepad only.
 
 ## Fast storage (`XCRDAPI.dll`)
 

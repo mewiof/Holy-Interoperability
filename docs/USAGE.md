@@ -82,6 +82,22 @@ E [import]   rcx=… rdx=… r8=… r9=…
 
 That line is the project's to-do list for the title, in order. See [ROADMAP.md](ROADMAP.md).
 
+### Input
+
+Titles see one gamepad: the host's first XInput controller, and the keyboard while the title's window has the
+focus:
+
+| Gamepad | Keyboard |
+| --- | --- |
+| left stick | W A S D |
+| right stick | I J K L |
+| d-pad | arrow keys |
+| A / B / X / Y | Space / Escape or Backspace / R / F |
+| menu / view | Enter / Tab |
+| left / right shoulder | Q / E |
+| left / right trigger | Z / C |
+| left / right stick click | Left Shift / V |
+
 ### The network
 
 By default the title runs offline: it is told there is no connectivity, host names do not resolve, and

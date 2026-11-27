@@ -608,25 +608,58 @@ void test_fast_storage() {
   reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(file))[2])(file);
 }
 
-// The console input library, with no input device attached.
+// The console input library: one gamepad (the host's controller and keyboard).
 void test_input() {
   void* input = nullptr;
   check(GameInputCreate(&input) == S_OK && input != nullptr, "GameInputCreate returns the input interface");
   if (!input) return;
   using GetCurrentReadingFn = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, void*, void**);
+  using GetNextReadingFn = HRESULT(STDMETHODCALLTYPE*)(void*, void*, uint32_t, void*, void**);
   using RegisterDeviceCallbackFn =
       HRESULT(STDMETHODCALLTYPE*)(void*, void*, uint32_t, uint32_t, uint32_t, void*, void*, uint64_t*);
   void** vtable = *static_cast<void***>(input);
-  void* reading = reinterpret_cast<void*>(1);
+  void* reading = nullptr;
   const HRESULT hr = reinterpret_cast<GetCurrentReadingFn>(vtable[4])(input, 0x40000, nullptr, &reading);
-  check(hr == static_cast<HRESULT>(0x838A0003) && reading == nullptr,
-        "with no device attached there is no gamepad reading");
+  struct {
+    uint32_t buttons;
+    float axes[6];
+  } state{0xFFFFFFFFu, {}};
+  bool got_state = false;
+  if (reading) {
+    void** r = *static_cast<void***>(reading);
+    got_state = reinterpret_cast<bool(STDMETHODCALLTYPE*)(void*, void*)>(r[22])(reading, &state);
+  }
+  check(hr == S_OK && reading && got_state && state.buttons != 0xFFFFFFFFu,
+        "the gamepad has a current reading with its state");
+  void* keyboard = reinterpret_cast<void*>(1);
+  check(reinterpret_cast<GetCurrentReadingFn>(vtable[4])(input, 0x10, nullptr, &keyboard) ==
+                static_cast<HRESULT>(0x838A0003) &&
+            keyboard == nullptr,
+        "there is no keyboard reading");
+  if (reading) {
+    void* next = nullptr;
+    const HRESULT later = reinterpret_cast<GetNextReadingFn>(vtable[5])(input, reading, 0x40000, nullptr, &next);
+    check(later == S_OK || later == static_cast<HRESULT>(0x838A0003), "next readings are asked for after a reading");
+    if (next) reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(next))[2])(next);
+    reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(reading))[2])(reading);
+  }
   static int s_device_callbacks = 0;
+  static void* s_device = nullptr;
   uint64_t token = 0;
-  const auto callback = +[](uint64_t, void*, void*, uint64_t, uint32_t, uint32_t) { ++s_device_callbacks; };
+  const auto callback = +[](uint64_t, void*, void* device, uint64_t, uint32_t status, uint32_t) {
+    ++s_device_callbacks;
+    if (status & 1) s_device = device;
+  };
   const HRESULT registered = reinterpret_cast<RegisterDeviceCallbackFn>(vtable[9])(
       input, nullptr, 0x40000, 1, 2, nullptr, reinterpret_cast<void*>(callback), &token);
-  check(registered == S_OK && token != 0 && s_device_callbacks == 0, "blocking device enumeration finds no devices");
+  uint32_t supported = 0;
+  if (s_device) {
+    const auto* info = reinterpret_cast<const uint8_t*(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(s_device))[3])(
+        s_device);
+    if (info) std::memcpy(&supported, info + 104, 4);  // supportedInput
+  }
+  check(registered == S_OK && token != 0 && s_device_callbacks == 1 && (supported & 0x40000),
+        "blocking device enumeration reports one connected gamepad");
 }
 
 // The offline switch, seen from the title image and from a DLL the package

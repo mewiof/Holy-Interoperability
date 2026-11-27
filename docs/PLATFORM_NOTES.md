@@ -362,7 +362,11 @@ Notes describe the platform, never a title.
   the blend controls from 0x34 (offsets for the first layout). Other layouts are refused. No field names the depth
   format, which the host needs in the pipeline: draws with a depth target bound use a variant of the pipeline with
   the depth test, writes and function of `DB_DEPTH_CONTROL` and the target's format (made at first such draw).
-  Partial: the stencil test is not applied (the registers of its operations and masks are not established).
+  The stencil test too: dwords 0x2F-0x31 are non-zero only where `DB_DEPTH_CONTROL` enables it, holding
+  `DB_STENCIL_CONTROL` (operations of both faces) and `DB_STENCILREFMASK` of front and back faces (test and write
+  masks; the reference is 0, titles set it with the command list's stencil reference). Partial: the desktop has one
+  pair of masks for both faces (the front's are used) and no stencil operations ONES, REPLACE_OP or the logical
+  ones (logged, kept).
 - *measured* host behaviour: the host's vertex index (`SV_VertexID`) does not include a draw's first vertex (a point
   drawn from vertex 5 has index 0). *observed*: native vertex programs add s2 to their vertex index; draws without
   indices pass the first vertex there (indexed draws: the base vertex).

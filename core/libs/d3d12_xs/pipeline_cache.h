@@ -76,6 +76,8 @@ struct Recipe {
   // bound use a variant with this depth state and the target's format
   // (pipeline_host_depth).
   uint32_t depth_control = 0;
+  uint32_t stencil_control = 0;  // DB_STENCIL_CONTROL
+  uint32_t stencil_masks = 0;    // DB_STENCILREFMASK
 };
 
 struct HostPipeline;
@@ -107,7 +109,7 @@ void stream_append(std::vector<uint8_t>* stream, uint32_t type, const void* data
 // can be derived from it.
 HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream, std::vector<ProgramRef> programs,
                                  bool translated, const lib::VtableInfo* info, void* const* vtable, void** pipeline,
-                                 uint32_t depth_control = 0);
+                                 uint32_t depth_control = 0, uint32_t stencil_control = 0, uint32_t stencil_masks = 0);
 
 // A title pipeline around a host pipeline made elsewhere (taking over the
 // reference); it cannot be derived from.

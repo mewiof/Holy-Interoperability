@@ -626,6 +626,14 @@ void test_released_memory(void* device) {
         "committed title memory the GPU used goes back to the host when released");
 }
 
+// The host's commit left, in GiB: printed with GPU results, since with it used
+// up the host refuses pipelines and memory and such checks read zeros.
+double host_commit_left() {
+  PERFORMANCE_INFORMATION host{};
+  K32GetPerformanceInfo(&host, sizeof(host));
+  return static_cast<double>(host.CommitLimit - host.CommitTotal) * static_cast<double>(host.PageSize) / (1ull << 30);
+}
+
 // A native compute program reads a texture the title viewed in its memory,
 // all four channels, through the descriptor in the bound heap, and writes them
 // to an address passed as root constants, in memory a buffer is placed in
@@ -993,7 +1001,8 @@ void test_native_draw(void* device, void* queue) {
   for (int i = 0; value && *value < 1 && i < 5000; ++i) Sleep(1);
   auto close_to = [](float a, float b) { return a > b - 0.01f && a < b + 0.01f; };
   const float pixel[4] = {output[0], output[1], output[2], output[3]};
-  std::printf("    (pixel the draw left: %.3f %.3f %.3f %.3f)\n", pixel[0], pixel[1], pixel[2], pixel[3]);
+  std::printf("    (pixel the draw left: %.3f %.3f %.3f %.3f; host commit left %.1f GiB)\n", pixel[0], pixel[1],
+              pixel[2], pixel[3], host_commit_left());
   check(recorded && value && *value == 1 && close_to(pixel[0], 0.25f) && close_to(pixel[1], 0.5f) &&
             close_to(pixel[2], 0.75f) && close_to(pixel[3], 1.0f),
         "a draw from vertex 3 with native programs fetching vertices through the vertex buffer table colours its "
@@ -1013,10 +1022,12 @@ void test_native_draw(void* device, void* queue) {
   VirtualFree(memory, 0, MEM_RELEASE);
 }
 
-// A pipeline from a native description (device slot 57) whose render state
-// tests and writes depth (DB_DEPTH_CONTROL: less): a near triangle drawn
-// before a far one keeps its colour where both cover the target.
-void test_native_depth(void* device, void* queue) {
+// Pipelines from native descriptions (device slot 57). `stencil` false: the
+// render state tests and writes depth (DB_DEPTH_CONTROL: less), and a near
+// triangle drawn before a far one keeps its colour. True: a first pipeline
+// replaces the stencil value (DB_STENCIL_CONTROL, reference 1), a second
+// tests it for equality with 0, and the first's colour stays.
+void test_native_depth(void* device, void* queue, bool stencil) {
   void* allocator = nullptr;
   void* list = nullptr;
   void* fence = nullptr;
@@ -1025,6 +1036,7 @@ void test_native_depth(void* device, void* queue) {
   void* depths = nullptr;
   void* compute_root = nullptr;
   void* draw_pipeline = nullptr;
+  void* second_pipeline = nullptr;
   void* read_pipeline = nullptr;
   void* target = nullptr;
   void* depth = nullptr;
@@ -1038,6 +1050,7 @@ void test_native_depth(void* device, void* queue) {
   call<HRESULT>(device, 14, &heap_desc, __uuidof(ID3D12DescriptorHeap), &heap);
   D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 1};
   call<HRESULT>(device, 14, &rtv_desc, __uuidof(ID3D12DescriptorHeap), &targets);
+  const DXGI_FORMAT depth_format = stencil ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT;
   D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 1};
   call<HRESULT>(device, 14, &dsv_desc, __uuidof(ID3D12DescriptorHeap), &depths);
   D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
@@ -1064,7 +1077,11 @@ void test_native_depth(void* device, void* queue) {
   uint32_t state[0x17C / 4] = {};
   state[0x1D] = 0x060201BCu;
   state[0x1E] = 0xF;           // target 0 written
-  state[0x2E] = 0x2 | 0x4 | (1u << 4);  // depth tested (less) and written
+  // Depth tested (less) and written; or (stencil) the stencil test always
+  // passing and replacing the value with the reference, masks 0xFF.
+  state[0x2E] = stencil ? 0x1u | (7u << 8) | (7u << 20) : 0x2u | 0x4u | (1u << 4);
+  state[0x2F] = stencil ? 0x30030u : 0u;
+  state[0x30] = state[0x31] = stencil ? 0x1FFFF00u : 0u;
   state[0x34] = 0x80000000u;   // no blending
   uint32_t pipeline_block[0xBC / 4] = {};
   pipeline_block[4] = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1085,6 +1102,11 @@ void test_native_depth(void* device, void* queue) {
   native[11] = reinterpret_cast<uint64_t>(meta);
   native[12] = sizeof(meta);
   call<HRESULT>(device, 57, static_cast<const uint64_t*>(native), __uuidof(ID3D12PipelineState), &draw_pipeline);
+  // The second: the stencil test passing where the value equals the reference, kept.
+  state[0x2E] = stencil ? 0x1u | (2u << 8) | (2u << 20) : state[0x2E];
+  state[0x2F] = 0;
+  state[0x30] = state[0x31] = stencil ? 0x100FF00u : 0u;
+  call<HRESULT>(device, 57, static_cast<const uint64_t*>(native), __uuidof(ID3D12PipelineState), &second_pipeline);
   const std::vector<uint8_t> read_cs = native_only_container(
       {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE880304u, 0xBE890380u, 0xF40C0304u, 0xFA000000u, 0xBF8CC07Fu,
        0x7E000280u, 0x7E020280u, 0xF0001F08u, 0x00030200u, 0xBF8C3F70u, 0xBE940305u, 0xBE950306u, 0xB0160040u,
@@ -1109,21 +1131,28 @@ void test_native_depth(void* device, void* queue) {
                 static_cast<const D3D12_CLEAR_VALUE*>(nullptr), static_cast<void*>(nullptr), 0u,
                 static_cast<const void*>(nullptr), __uuidof(ID3D12Resource), &target);
   D3D12_RESOURCE_DESC depth_texture = texture;
-  depth_texture.Format = DXGI_FORMAT_D32_FLOAT;
+  depth_texture.Format = depth_format;
   depth_texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
   call<HRESULT>(device, 127, &local, D3D12_HEAP_FLAG_NONE, &depth_texture,
                 static_cast<UINT>(D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE), static_cast<const D3D12_CLEAR_VALUE*>(nullptr),
                 static_cast<void*>(nullptr), 0u, static_cast<const void*>(nullptr), __uuidof(ID3D12Resource), &depth);
 
   auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  if (!list || !fence || !heap || !targets || !depths || !compute_root || !draw_pipeline || !read_pipeline || !target ||
-      !depth || !memory) {
+  if (!list || !fence || !heap || !targets || !depths || !compute_root || !draw_pipeline || !second_pipeline ||
+      !read_pipeline || !target || !depth || !memory) {
     check(false, "the objects for a native draw with depth exist");
     return;
   }
-  // Six vertices: a near green triangle, then a far red one, both covering the target.
-  const float vertices[6][8] = {{-1, -1, 0.5f, 1, 0, 1, 0, 1}, {-1, 3, 0.5f, 1, 0, 1, 0, 1}, {3, -1, 0.5f, 1, 0, 1, 0, 1},
-                                {-1, -1, 0.7f, 1, 1, 0, 0, 1}, {-1, 3, 0.7f, 1, 1, 0, 0, 1}, {3, -1, 0.7f, 1, 1, 0, 0, 1}};
+  // Six vertices: a near green triangle, then a far red one, both covering
+  // the target (with the stencil test: red first, then green).
+  float vertices[6][8] = {{-1, -1, 0.5f, 1, 0, 1, 0, 1}, {-1, 3, 0.5f, 1, 0, 1, 0, 1}, {3, -1, 0.5f, 1, 0, 1, 0, 1},
+                          {-1, -1, 0.7f, 1, 1, 0, 0, 1}, {-1, 3, 0.7f, 1, 1, 0, 0, 1}, {3, -1, 0.7f, 1, 1, 0, 0, 1}};
+  if (stencil) {
+    for (int v = 0; v < 6; ++v) {
+      vertices[v][4] = v < 3 ? 1.0f : 0.0f;
+      vertices[v][5] = v < 3 ? 0.0f : 1.0f;
+    }
+  }
   std::memcpy(memory, vertices, sizeof(vertices));
   auto* output = reinterpret_cast<volatile float*>(memory + 0x10000);
   const uint64_t output_address = reinterpret_cast<uint64_t>(output);
@@ -1140,7 +1169,7 @@ void test_native_depth(void* device, void* queue) {
   const uint64_t dsv = call<uint64_t>(depths, 9);
   call<void>(device, 20, target, static_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(nullptr), rtv);
   D3D12_DEPTH_STENCIL_VIEW_DESC dsv_view{};
-  dsv_view.Format = DXGI_FORMAT_D32_FLOAT;
+  dsv_view.Format = depth_format;
   dsv_view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
   call<void>(device, 21, depth, &dsv_view, dsv);
   D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -1155,8 +1184,9 @@ void test_native_depth(void* device, void* queue) {
   const D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle{static_cast<SIZE_T>(dsv)};
   const float black[4] = {0, 0, 0, 0};
   call<void>(list, 52, static_cast<SIZE_T>(rtv), black, 0u, static_cast<const D3D12_RECT*>(nullptr));
-  call<void>(list, 51, static_cast<SIZE_T>(dsv), D3D12_CLEAR_FLAG_DEPTH, 1.0f, static_cast<UINT8>(0), 0u,
-             static_cast<const D3D12_RECT*>(nullptr));
+  call<void>(list, 51, static_cast<SIZE_T>(dsv),
+             static_cast<D3D12_CLEAR_FLAGS>(D3D12_CLEAR_FLAG_DEPTH | (stencil ? D3D12_CLEAR_FLAG_STENCIL : 0)), 1.0f,
+             static_cast<UINT8>(0), 0u, static_cast<const D3D12_RECT*>(nullptr));
   call<void>(list, 25, draw_pipeline);
   call<void>(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   const D3D12_VERTEX_BUFFER_VIEW vertex_buffer{reinterpret_cast<uint64_t>(memory), sizeof(vertices), 32};
@@ -1166,8 +1196,11 @@ void test_native_depth(void* device, void* queue) {
   const D3D12_RECT scissor{0, 0, 64, 64};
   call<void>(list, 21, 1u, &viewport);
   call<void>(list, 22, 1u, &scissor);
-  call<void>(list, 12, 3u, 1u, 0u, 0u);  // near, green
-  call<void>(list, 12, 3u, 1u, 3u, 0u);  // far, red: hidden
+  call<void>(list, 24, 1u);              // stencil reference
+  call<void>(list, 12, 3u, 1u, 0u, 0u);  // near, green (stencil: red, writing 1)
+  call<void>(list, 25, second_pipeline);
+  call<void>(list, 24, 0u);
+  call<void>(list, 12, 3u, 1u, 3u, 0u);  // far, red: hidden (stencil: green, failing the test)
   D3D12_TEXTURE_BARRIER barrier{};
   barrier.SyncBefore = D3D12_BARRIER_SYNC_RENDER_TARGET;
   barrier.SyncAfter = D3D12_BARRIER_SYNC_COMPUTE_SHADING;
@@ -1197,15 +1230,19 @@ void test_native_depth(void* device, void* queue) {
   const auto* value = call<const volatile uint64_t*>(fence, 12);
   for (int i = 0; value && *value < 1 && i < 5000; ++i) Sleep(1);
   const float pixel[4] = {output[0], output[1], output[2], output[3]};
-  std::printf("    (pixel after a near and a far draw: %.3f %.3f %.3f %.3f)\n", pixel[0], pixel[1], pixel[2], pixel[3]);
-  check(recorded && value && *value == 1 && pixel[0] < 0.01f && pixel[1] > 0.99f && pixel[2] < 0.01f,
-        "a native pipeline's depth state hides a far triangle drawn after a near one");
+  std::printf("    (pixel after the two draws: %.3f %.3f %.3f %.3f; host commit left %.1f GiB)\n", pixel[0], pixel[1],
+              pixel[2], pixel[3], host_commit_left());
+  const bool first_kept = stencil ? pixel[0] > 0.99f && pixel[1] < 0.01f : pixel[0] < 0.01f && pixel[1] > 0.99f;
+  check(recorded && value && *value == 1 && first_kept && pixel[2] < 0.01f,
+        stencil ? "a native pipeline's stencil state keeps a second draw out where the first replaced the value"
+                : "a native pipeline's depth state hides a far triangle drawn after a near one");
 
   if (placed) call<ULONG>(placed, 2);
   call<ULONG>(depth, 2);
   call<ULONG>(target, 2);
   call<ULONG>(read_pipeline, 2);
   call<ULONG>(draw_pipeline, 2);
+  call<ULONG>(second_pipeline, 2);
   call<ULONG>(compute_root, 2);
   call<ULONG>(depths, 2);
   call<ULONG>(targets, 2);
@@ -1218,7 +1255,8 @@ void test_native_depth(void* device, void* queue) {
 
 void test_graphics_resources(void* device, void* queue) {
   if (queue) test_native_draw(device, queue);
-  if (queue) test_native_depth(device, queue);
+  if (queue) test_native_depth(device, queue, false);
+  if (queue) test_native_depth(device, queue, true);
   test_page_mapping_update(device);
   test_released_memory(device);
   if (queue) {

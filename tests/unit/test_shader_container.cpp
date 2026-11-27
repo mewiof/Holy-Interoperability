@@ -224,10 +224,12 @@ TEST(native_graphics_description_with_sparse_stage_slots) {
   state[0x33] = 0xFF;
   state[0x3D] = 0x201A42u;
   state[0x43] = 0x7007E2u;
+  state[0x44] = 0x30030u;
+  state[0x45] = 0x1FFFF00u;
   state[0x49] = 0xE5010504u;
   EXPECT(native_graphics_description(desc, &out, &error));
   EXPECT(out.target_mask == 0xFF && out.mode_control == 0x201A42u && out.depth_control == 0x7007E2u &&
-         out.blend[0] == 0xE5010504u);
+         out.blend[0] == 0xE5010504u && out.stencil_control == 0x30030u && out.stencil_masks == 0x1FFFF00u);
   // A layout without the marker is refused.
   state[0x32] = 0;
   EXPECT(!native_graphics_description(desc, &out, &error));

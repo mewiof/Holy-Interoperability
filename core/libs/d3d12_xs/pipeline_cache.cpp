@@ -652,7 +652,7 @@ HRESULT create_from_recipe(Device* device, std::shared_ptr<Recipe> recipe, const
 
 HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream, std::vector<ProgramRef> programs,
                                  bool translated, const lib::VtableInfo* info, void* const* vtable, void** pipeline,
-                                 uint32_t depth_control) {
+                                 uint32_t depth_control, uint32_t stencil_control, uint32_t stencil_masks) {
   if (!pipeline) return E_POINTER;
   *pipeline = nullptr;
   auto recipe = std::make_shared<Recipe>();
@@ -660,6 +660,8 @@ HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream, st
   recipe->programs = std::move(programs);
   recipe->translated = translated;
   recipe->depth_control = depth_control;
+  recipe->stencil_control = stencil_control;
+  recipe->stencil_masks = stencil_masks;
   for (const ProgramRef& program : recipe->programs) {
     if (!program) return E_INVALIDARG;
   }
@@ -867,8 +869,8 @@ ID3D12PipelineState* pipeline_host_depth(const void* object, DXGI_FORMAT format)
   Pipeline* pipeline = as_pipeline(object);
   if (!pipeline || !pipeline->recipe || !pipeline->shared || format == DXGI_FORMAT_UNKNOWN) return nullptr;
   const uint32_t control = pipeline->recipe->depth_control;
-  const bool test = (control >> 1) & 1, write = (control >> 2) & 1;
-  if (!test && !write) return nullptr;
+  const bool test = (control >> 1) & 1, write = (control >> 2) & 1, stencil = control & 1;
+  if (!test && !write && !stencil) return nullptr;
   std::shared_ptr<HostPipeline> variant;
   {
     std::lock_guard<std::mutex> guard(g_variant_lock);
@@ -878,16 +880,54 @@ ID3D12PipelineState* pipeline_host_depth(const void* object, DXGI_FORMAT format)
     // DB_DEPTH_CONTROL: Z_ENABLE bit 1, Z_WRITE_ENABLE bit 2, ZFUNC bits 4-6
     // (never, less, equal, less or equal, greater, not equal, greater or
     // equal, always: the desktop's comparison functions less one).
-    // Partial: the stencil test (STENCIL_ENABLE bit 0) is not applied (the
-    // registers of its operations and masks are not established).
     D3D12_DEPTH_STENCIL_DESC depth{};
-    depth.DepthEnable = TRUE;  // writes need the test on on the host (always passing when only writing)
+    depth.DepthEnable = test || write;  // writes need the test on on the host (always passing when only writing)
     depth.DepthWriteMask = write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     depth.DepthFunc = test ? static_cast<D3D12_COMPARISON_FUNC>(((control >> 4) & 7) + 1) : D3D12_COMPARISON_FUNC_ALWAYS;
-    depth.StencilReadMask = depth.StencilWriteMask = 0xFF;
-    const D3D12_DEPTH_STENCILOP_DESC keep{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
-                                          D3D12_COMPARISON_FUNC_ALWAYS};
-    depth.FrontFace = depth.BackFace = keep;
+    // The stencil test: STENCIL_ENABLE bit 0, the functions in bits 8-10
+    // and 20-22 (back faces, when BACKFACE_ENABLE, bit 7), the operations
+    // (DB_STENCIL_CONTROL: fail, depth pass, depth fail, four bits each,
+    // back faces from bit 12) and masks (DB_STENCILREFMASK: test mask bits
+    // 8-15, write mask 16-23, operation value 24-31).
+    depth.StencilEnable = stencil;
+    const uint32_t masks = pipeline->recipe->stencil_masks;
+    depth.StencilReadMask = static_cast<UINT8>((masks >> 8) & 0xFF);
+    depth.StencilWriteMask = static_cast<UINT8>((masks >> 16) & 0xFF);
+    const uint32_t ops = pipeline->recipe->stencil_control;
+    auto op = [&](uint32_t value) {
+      // KEEP, ZERO, ONES, REPLACE_TEST, REPLACE_OP, ADD_CLAMP, SUB_CLAMP,
+      // INVERT, ADD_WRAP, SUB_WRAP, then logical operations.
+      switch (value & 0xF) {
+        case 0: return D3D12_STENCIL_OP_KEEP;
+        case 1: return D3D12_STENCIL_OP_ZERO;
+        case 3: return D3D12_STENCIL_OP_REPLACE;
+        case 5: return D3D12_STENCIL_OP_INCR_SAT;
+        case 6: return D3D12_STENCIL_OP_DECR_SAT;
+        case 7: return D3D12_STENCIL_OP_INVERT;
+        case 8: return D3D12_STENCIL_OP_INCR;
+        case 9: return D3D12_STENCIL_OP_DECR;
+        default: {
+          static std::atomic<int> logged{0};
+          if (logged.fetch_add(1) < 4) {
+            LIB_LOG(lib::kError, "d3d12", "stencil operation %u has no desktop equivalent (kept)", value & 0xF);
+          }
+          return D3D12_STENCIL_OP_KEEP;
+        }
+      }
+    };
+    if (stencil && ((masks >> 24) & 0xFF) != 1 && (ops & 0xEEEEEE)) {
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 4) {
+        LIB_LOG(lib::kError, "d3d12", "stencil operation value %u (the desktop's steps are 1)", (masks >> 24) & 0xFF);
+      }
+    }
+    auto face = [&](uint32_t shift, uint32_t function) {
+      return D3D12_DEPTH_STENCILOP_DESC{op(ops >> shift), op(ops >> (shift + 8)), op(ops >> (shift + 4)),
+                                        static_cast<D3D12_COMPARISON_FUNC>((function & 7) + 1)};
+    };
+    depth.FrontFace = face(0, control >> 8);
+    const bool back = (control >> 7) & 1;
+    depth.BackFace = back ? face(12, control >> 20) : depth.FrontFace;
     auto recipe = std::make_shared<Recipe>(*pipeline->recipe);
     bool has_depth = false, has_format = false;
     walk(recipe->stream, [&](uint32_t type, size_t inner, size_t size) {

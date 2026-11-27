@@ -475,6 +475,14 @@ bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription
   out->target_mask = state[0x1E + shift];
   out->mode_control = state[0x28 + shift];
   out->depth_control = state[0x2E + shift];
+  // Observed: non-zero only in pipelines whose DB_DEPTH_CONTROL enables the
+  // stencil test: dword 0x2F the operations (DB_STENCIL_CONTROL: 0x80080,
+  // 0x30030), 0x30 and 0x31 the masks of front and back faces
+  // (DB_STENCILREFMASK: 0x1FFFF00, 0x1808000; reference 0: titles set it
+  // with the command list's stencil reference).
+  out->stencil_control = state[0x2F + shift];
+  out->stencil_masks = state[0x30 + shift];
+  out->stencil_masks_back = state[0x31 + shift];
   for (int i = 0; i < 8; ++i) out->blend[i] = state[0x34 + shift + i];
   return true;
 }

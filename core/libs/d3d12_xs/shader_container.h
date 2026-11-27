@@ -72,7 +72,10 @@ struct NativeGraphicsDescription {
   uint32_t target_mask = 0;
   uint32_t mode_control = 0;
   uint32_t blend[8] = {};
-  uint32_t depth_control = 0;  // DB_DEPTH_CONTROL (observed values; see native_graphics_description)
+  uint32_t depth_control = 0;    // DB_DEPTH_CONTROL (observed values; see native_graphics_description)
+  uint32_t stencil_control = 0;  // DB_STENCIL_CONTROL
+  uint32_t stencil_masks = 0;    // DB_STENCILREFMASK (front faces)
+  uint32_t stencil_masks_back = 0;  // DB_STENCILREFMASK_BF
 };
 // The render state block has been seen at 0x17C, 0x184 and 0x18C bytes with
 // the same dwords up to the blend controls; only those are required (in the

@@ -1115,7 +1115,8 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   std::vector<ProgramRef> programs{vs};
   if (ps) programs.push_back(ps);
   const HRESULT hr = create_recorded_pipeline(self, std::move(stream), std::move(programs), true, &kPipelineInfo,
-                                              kPipelineVtable.data(), out, native.depth_control);
+                                              kPipelineVtable.data(), out, native.depth_control,
+                                              native.stencil_control, native.stencil_masks);
   if (SUCCEEDED(hr) && ngg) {
     // The graphics pipeline holds the compute pass's reference.
     Pipeline* graphics = as_pipeline(*out);

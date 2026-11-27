@@ -119,6 +119,9 @@ const TranslatorOptions& translator_options();
 // options it translates with: stored translations are keyed by it, so a
 // changed translator misses them.
 std::string translator_build();
+// The same without the options: stored translations are kept in a directory
+// per code build, so switching options keeps the translations of both.
+std::string translator_code_build();
 
 // Graphics stages. Vertex shaders get the vertex id in v0 and the instance id
 // in v3 (assumed); all 16 user SGPRs come from the HolySystem user values.

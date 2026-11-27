@@ -4775,8 +4775,12 @@ const TranslatorOptions& translator_options() {
   return g_options;
 }
 
+std::string translator_code_build() {
+  return std::string(__DATE__ " " __TIME__) + "/" + dxbc_build() + "/" + rdna_build();
+}
+
 std::string translator_build() {
-  return std::string(__DATE__ " " __TIME__) + "/" + dxbc_build() + "/" + rdna_build() +
+  return translator_code_build() +
          (g_options.page_cache_reads ? "/page cache reads" : "") + (g_options.reference ? "/reference" : "");
 }
 }  // namespace holy::d3d12

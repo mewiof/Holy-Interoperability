@@ -30,10 +30,21 @@ struct Header {
 };
 static_assert(sizeof(Header) == 64);
 
-// The translator build the translations come from.
+// The translator build the translations come from, with its options (in
+// every key).
 uint64_t library_stamp() {
   static const uint64_t stamp = [] {
     const std::string build = translator_build();
+    return TranslationKey().add(build.data(), build.size()).value();
+  }();
+  return stamp;
+}
+
+// The translator's code build alone: the directory (translations of the same
+// code with other options stay, for runs that switch options back).
+uint64_t directory_stamp() {
+  static const uint64_t stamp = [] {
+    const std::string build = translator_code_build();
     return TranslationKey().add(build.data(), build.size()).value();
   }();
   return stamp;
@@ -106,7 +117,7 @@ std::wstring directory() {
     const std::wstring root = root_directory();
     if (root.empty()) return std::wstring();
     wchar_t name[24];
-    std::swprintf(name, 24, L"%016llx", static_cast<unsigned long long>(library_stamp()));
+    std::swprintf(name, 24, L"%016llx", static_cast<unsigned long long>(directory_stamp()));
     CreateDirectoryW(root.c_str(), nullptr);
     const std::wstring mine = root + L"\\" + name;
     CreateDirectoryW(mine.c_str(), nullptr);

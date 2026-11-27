@@ -453,9 +453,29 @@ bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription
   // pipelines and not understood (not translated).
   out->topology_type = (pipeline[9] >> 16) & 0xF;
   out->sample_count = pipeline[10] ? pipeline[10] : 1;
-  out->target_mask = state[0x1E];
-  out->mode_control = state[0x28];
-  for (int i = 0; i < 8; ++i) out->blend[i] = state[0x34 + i];
+  // Observed, in a title's 11,233 pipelines: two layouts of the state block,
+  // told apart by where the constant 0x060201bc is (dword 0x1D; in 477
+  // pipelines, whose dword 1 is 6 instead of 4, dword 0x32): the later one
+  // holds the same registers 0x15 dwords further on (the target mask after
+  // the constant, the mode control, DB_DEPTH_CONTROL, the blend controls).
+  // Other layouts are refused rather than read wrong.
+  constexpr uint32_t kMarker = 0x060201BCu;
+  uint32_t shift = 0;
+  if (state[0x1D] == kMarker) {
+    shift = 0;
+  } else if (desc[2] >= kNativeRenderStateLaterBytes && state[0x32] == kMarker) {
+    shift = 0x15;
+  } else {
+    char text[96];
+    std::snprintf(text, sizeof(text), "a render state block of unknown layout (dword 1: 0x%x, 0x%llx bytes)", state[1],
+                  static_cast<unsigned long long>(desc[2]));
+    *error = text;
+    return false;
+  }
+  out->target_mask = state[0x1E + shift];
+  out->mode_control = state[0x28 + shift];
+  out->depth_control = state[0x2E + shift];
+  for (int i = 0; i < 8; ++i) out->blend[i] = state[0x34 + shift + i];
   return true;
 }
 

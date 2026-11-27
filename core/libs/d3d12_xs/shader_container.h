@@ -72,10 +72,13 @@ struct NativeGraphicsDescription {
   uint32_t target_mask = 0;
   uint32_t mode_control = 0;
   uint32_t blend[8] = {};
+  uint32_t depth_control = 0;  // DB_DEPTH_CONTROL (observed values; see native_graphics_description)
 };
 // The render state block has been seen at 0x17C, 0x184 and 0x18C bytes with
-// the same dwords up to the blend controls; only those are required.
+// the same dwords up to the blend controls; only those are required (in the
+// later layout, which has its registers 0x15 dwords further on, 0x144).
 inline constexpr size_t kNativeRenderStateBytes = 0xF0;
+inline constexpr size_t kNativeRenderStateLaterBytes = 0x144;
 inline constexpr size_t kNativePipelineBlockBytes = 0x30;
 bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription* out, std::string* error);
 

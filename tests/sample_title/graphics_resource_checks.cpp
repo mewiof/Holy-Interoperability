@@ -767,7 +767,14 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   for (int i = 0; value && *value < 1 && i < 5000; ++i) Sleep(1);
   auto close_to = [](float a, float b) { return a > b - 0.002f && a < b + 0.002f; };
   const float texel[4] = {output[0], output[1], output[2], output[3]};
-  std::printf("    (texel read on the GPU: %.3f %.3f %.3f %.3f)\n", texel[0], texel[1], texel[2], texel[3]);
+  // With the host's commit nearly used up, physical pages cannot be committed
+  // and read as zero: said with the result, so such a failure tells.
+  PERFORMANCE_INFORMATION host{};
+  K32GetPerformanceInfo(&host, sizeof(host));
+  const double commit_left =
+      static_cast<double>(host.CommitLimit - host.CommitTotal) * static_cast<double>(host.PageSize) / (1ull << 30);
+  std::printf("    (texel read on the GPU: %.3f %.3f %.3f %.3f; host commit left %.1f GiB)\n", texel[0], texel[1],
+              texel[2], texel[3], commit_left);
   check(recorded && value && *value == 1 && close_to(texel[0], texel_bytes[0] / 255.0f) &&
             close_to(texel[1], texel_bytes[1] / 255.0f) && close_to(texel[2], texel_bytes[2] / 255.0f) &&
             close_to(texel[3], texel_bytes[3] / 255.0f),

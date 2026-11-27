@@ -181,6 +181,7 @@ TEST(native_graphics_description_with_sparse_stage_slots) {
   const uint32_t vs_code[] = {0xF80008CFu, 0x03020100u, 0xBF810000u};
   uint32_t meta[12] = {};
   uint32_t state[0x17C / 4] = {};
+  state[0x1D] = 0x060201BCu;  // the layout's marker
   state[0x1E] = 0xF;
   uint32_t pipeline[0xBC / 4] = {};
   pipeline[3] = 1;   // one target ...
@@ -216,6 +217,21 @@ TEST(native_graphics_description_with_sparse_stage_slots) {
   pipeline[5] = 0x00001C22u;
   EXPECT(native_graphics_description(desc, &out, &error));
   EXPECT(out.render_targets == 6 && out.formats[0] == 0x1D && out.formats[4] == 0x22 && out.formats[5] == 0x1C);
+  // The later layout: the same registers 0x15 dwords further on.
+  state[0x1D] = 0x80;
+  state[0x1E] = 0x80;
+  state[0x32] = 0x060201BCu;
+  state[0x33] = 0xFF;
+  state[0x3D] = 0x201A42u;
+  state[0x43] = 0x7007E2u;
+  state[0x49] = 0xE5010504u;
+  EXPECT(native_graphics_description(desc, &out, &error));
+  EXPECT(out.target_mask == 0xFF && out.mode_control == 0x201A42u && out.depth_control == 0x7007E2u &&
+         out.blend[0] == 0xE5010504u);
+  // A layout without the marker is refused.
+  state[0x32] = 0;
+  EXPECT(!native_graphics_description(desc, &out, &error));
+  state[0x1D] = 0x060201BCu;
   // A state block shorter than the dwords read is refused.
   desc[2] = 0xEC;
   EXPECT(!native_graphics_description(desc, &out, &error));

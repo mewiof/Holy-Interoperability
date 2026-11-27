@@ -354,6 +354,13 @@ Notes describe the platform, never a title.
 - *observed*: in the pipeline block of a native graphics pipeline description, bytes 16-23 list one DXGI format per
   render target from target 0 on, ended by a zero byte; in all 11,233 pipelines a title created, the list was
   contiguous, and dword 3 was 0 or 1 whatever its length (not the target count; meaning not established).
+- *observed*: the render state block of a native graphics pipeline description comes in two layouts, told apart by
+  where the constant 0x060201BC is: dword 0x1D (dword 1 is 4), or dword 0x32 (dword 1 is 6; 477 of 11,233
+  pipelines), the later layout holding the same registers 0x15 dwords further on: the target mask (four bits a
+  target) after the constant, the mode control (`PA_SU_SC_MODE_CNTL`) at 0x28, `DB_DEPTH_CONTROL` at 0x2E (values
+  such as 0x7007F0: depth off; 0x7007E2: depth test GEQUAL; 0x7007A2: EQUAL; 0x7007E7: written, with stencil) and
+  the blend controls from 0x34 (offsets for the first layout). Other layouts are refused. Implementation: the
+  depth state is not applied yet (no field names the depth format; the host needs it in the pipeline).
 - *observed*: device slot 108 is `GetResourceAllocationInfo1`; titles retry without a small alignment when the
   alignment returned differs and treat sizes of 4 GiB or more as fatal.
 - *observed*: titles set texture layout 0x105 on 3D textures (a console swizzle mode, *assumed*); console layouts

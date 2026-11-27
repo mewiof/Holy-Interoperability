@@ -70,8 +70,8 @@ The largest piece.
 - partial: shader translation from native GPU code (titles' own shaders carry nothing else): compute, vertex
   and pixel programs are translated straight into host bytecode (DXBC) without a shader compiler, covering
   scalar and vector ALU, scalar, buffer, global and group-shared memory, atomics, exports and interpolation.
-  Open: image instructions, cross-lane operations, hull/domain/geometry stages, and checking translated code
-  against known results once draws and dispatches run.
+  Open: cross-lane operations beyond quads in pixel programs, hull/domain/geometry stages, and checking
+  translated code against known results (unit tests run chosen instructions on the host GPU).
 - done: query heaps, command signatures, desktop-order committed resources, console samplers (field meaning
   partly assumed), heaps over title memory, pipeline state streams (desktop or translated programs).
 - partial: `xg_xs` texture layout: swizzle mode suggestion and the texture computer's copy into the layout it
@@ -86,25 +86,40 @@ The largest piece.
 - done: native pipeline descriptions with sparse stage slots, `buffer_load_format_*` with the descriptor's format
   and selects, pixel-program quad permutes through fine derivatives (bit-exact, checked on the host GPU),
   DPP source-1 modifiers, `s_bfm_b64`; constant buffer views at unaligned addresses (null on the host).
-- next: the host device is removed as hung (`DXGI_ERROR_DEVICE_HUNG`) at times, a second into the reference
-  title's first frames, with its next command list stopped near its start. Not established yet: the debug layer
-  reports nothing, GPU-based validation makes it go away, and it persists without presents, immediate writes,
-  timestamps, barriers or draws. The host was short of memory at the time (another process held 37 GB).
+- done: the console's rectangle-list topology no longer reaches the host (it removed the host device as hung a
+  second into the reference title's first frames); command lists resubmitted while executing get pooled host
+  lists.
+- partial: rectangle lists are drawn as triangle lists (half of each rectangle); a geometry stage that adds the
+  fourth corner is next.
+- done: NGG vertex programs (a compute pass writing vertex and primitive records, then an indexed draw of them),
+  half-precision interpolation after them, image instructions with 16-bit data, cube, multisampled,
+  explicit-gradient and unnormalised images, packed 16-bit and sub-dword ALU operations, lane permutes through
+  group-memory instructions, program data read through the program counter.
+- done: translations cached on disk across runs and host pipelines compiled on worker threads; presents paced
+  at the title's frame interval; console-only DXGI formats; the texture computer's tiling query.
+- done: whole-wave reductions and other cross-lane operations in pixel and vertex programs (the quad as the
+  wave), lane-mask counting consistent with one-lane waves, image atomics, subroutine calls, data after the end
+  of programs, half-precision attributes after plain vertex programs.
+- next: amplification and mesh pipelines in pipeline streams; ray intersection image instructions
+  (`image_bvh_intersect_ray`) in compute programs; NGG pipelines with indexed draws; integer views of images for
+  plain loads and stores (they are declared as float).
+- next: a crash of the reference title a minute or two in, in its own code (a texture record whose resource
+  pointer points into a stack); textures streamed into scattered pool pages are copied through the CPU.
 - open: textures the GPU writes in title memory as seen by the CPU.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.
 - open: interaction with graphics helper DLLs that packages ship and that call into the device.
 
-## 5. Audio (`acphal`, `xapu`, `chad`) — open
+## 5. Audio (`acphal`, `xapu`, `chad`) — partial
 
 Hardware audio processing interfaces. Plan: software implementations of the processing the title requests,
 output through the host's audio stack.
 
 - done: the audio processor heap (`ApuCreateHeap`, `ApuAlloc`, `ApuFree`, address mapping and validity).
-- next: shape contexts and the processors' command queues (`AcpHalAllocateShapeContexts`, `AcpHalCreate`,
-  `XApu*`, `XDsp*`), which the reference title calls right after creating the heap. They include decoding the
-  console's compressed audio format, which needs either an original decoder or a third-party one (a decision
-  for the maintainer).
+- partial: shape contexts, the control processor and both audio processors' connections and command queues, as a
+  silent device: titles start audio, nothing is decoded, mixed or played.
+- open: carrying out the processors' commands. They include decoding the console's compressed audio format, which
+  needs either an original decoder or a third-party one (a decision for the maintainer).
 
 ## 6. Input (`gameinput`) — partial
 
@@ -120,6 +135,7 @@ name.
 The console's fast-storage factory. Plan: implement on host file I/O first, the host's equivalent API later.
 
 - done: factory, `OpenFile`, staging size, status arrays, queues, file and memory requests, zlib requests.
+- done: a table-driven inflater that writes straight into the destination.
 - open: asynchronous processing (requests are carried out one at a time when enqueued), other request kinds.
 
 ## Cross-cutting

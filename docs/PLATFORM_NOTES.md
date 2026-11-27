@@ -161,10 +161,12 @@ Notes describe the platform, never a title.
 - *observed*: slot 70 is also called for textures (a texture description, a view description and the texture's
   address in title memory, laid out as the texture layout library reported). Implementation: a host texture of
   the same shape is created and filled from that memory with buffer-to-texture copies, once per address and
-  shape. Partial: memory written after that is not copied again; textures the GPU writes are not supported.
+  shape; textures in pages mapped one by one (no host heap backs them as a whole) are copied from the title's
+  addresses through the CPU. Partial: memory written after that is not copied again; textures the GPU writes are
+  not supported.
 - *observed*: device slot 67 takes (description, pipeline interface id, out) and returns an `HRESULT`. The
   description holds the root signature and (pointer, size) pairs: 28 bytes of compute registers (dword 3 the
-  thread group width and height, 4 its depth, 6 `COMPUTE_PGM_RSRC2` in the public RDNA layout: user SGPRs, group
+  thread group width and height, the low half of dword 4 its depth (its high half, 0x10 seen, is not understood), 6 `COMPUTE_PGM_RSRC2` in the public RDNA layout: user SGPRs, group
   id and group information enables, LDS size), 20 bytes not understood, and native GPU code. It creates compute
   pipelines from native code given directly; they are translated.
 - *observed*: titles create constant buffer views of 128 bytes; the desktop requires multiples of 256 and removes
@@ -217,6 +219,10 @@ Notes describe the platform, never a title.
     gets a host heap opened over the same memory (from the physical-page section, or from the committed
     address) and a buffer spanning it; title GPU addresses translate into it, placed buffers are placed in it,
     and a placed buffer's `Map` yields the title's memory.
+  - *observed*: titles commit stretches of a reservation and leave the rest reserved. *observed* host
+    behaviour: `OpenExistingHeapFromAddress` refuses an allocation that is not committed throughout, while
+    `OpenExistingHeapFromAddress1` (`ID3D12Device13`) opens a heap over a committed stretch given with its size;
+    such allocations get a heap per committed stretch.
   - Descriptor heaps take their CPU memory from `XMemAlloc` as above; title CPU handles translate to host heaps
     by offset. Shader-visible heaps above the host's limit of 1,000,000 descriptors are created at the limit
     (partial: descriptors past it are refused).
@@ -267,11 +273,24 @@ Notes describe the platform, never a title.
   remapped when the call is made, through the memory library (`XMemMapPhysicalPages` with the physical pages
   behind the pool pages). GPU addresses are resolved when commands are recorded, so recorded work keeps the old
   pages; partial: work recorded before the call but submitted after it would see the new ones on the console.
-- *observed* host behaviour, open: during the first frames of a title the host device is at times removed as
-  hung (`DXGI_ERROR_DEVICE_HUNG`, with a matching display driver error event) about a second after the title
-  first submits work; device-removed data shows the next title command list stopped right after its start. It
-  happened with presents, immediate writes, timestamp queries, barriers or draws each left out, and not with
-  the debug layer's GPU-based validation on (which serialises GPU work). Not established.
+- *observed*: titles set primitive topology 17 (0x11) with slot 20, a value the desktop does not define: the
+  console GPU's rectangle list (*documented* in public RDNA register references as `DI_PT_RECTLIST`): each three
+  vertices are three corners of a rectangle, the GPU adds the fourth. *observed* host behaviour: given to the host
+  as is, the host device is removed as hung (`DXGI_ERROR_DEVICE_HUNG`) within milliseconds of the list's next
+  submitted work, whatever that work is (an immediate write to the host's own memory is enough); device-removed
+  data shows the list stopped before its first operation. Implementation, partial: rectangle lists are drawn as
+  triangle lists (one half of each rectangle is drawn); other topologies the desktop does not define report
+  themselves.
+- *observed*: titles reset a command list and submit it again while its previous submission is still executing;
+  the desktop forbids submitting a list before the GPU has finished its previous submission (the debug layer
+  refuses it). Implementation: title lists record into host lists from a pool; a reset whose host list may still
+  be executing takes one the GPU is done with (queues signal a fence after each submission), and a recording
+  submitted twice waits for its first submission.
+- Implementation: draws with a pipeline whose vertex program is an NGG program (see Graphics shaders) are two
+  host passes: a dispatch of the translated program writes the draw's vertex and primitive records into scratch
+  memory owned by the host list (returned to a pool when the list is reset), then an indexed triangle-list draw
+  of those records. The title's index buffer and topology are restored afterwards. Partial: indexed draws with
+  such pipelines are not drawn (logged).
 - *observed*: fence slot 12 (past the desktop `ID3D12Fence1`) returns the address of the fence's current value;
   titles poll it, reading all ones as a removed device. Implementation: a cell per fence kept at the host value by
   a thread that waits for each completion.
@@ -287,7 +306,15 @@ Notes describe the platform, never a title.
   source rectangles, destination placement, colour space). Implementation: a flip-model swap chain on the
   title's window (the largest visible top-level window of the process); the first plane's display buffer is
   copied into it and presented with sync interval 0 (titles pace their frames with frame events, so the
-  present does not also wait for the display). Presents 1, 30, 300 and every 1800th are also written to
+  present does not also wait for the display). A present reaches "presented" (event 2) at the first boundary
+  of the frame interval the title set (slot 78) after its GPU work is done, as a console flip happens at the
+  interval; a thread carries presents out in order. Titles that wait for an earlier frame's present are so held
+  to the interval (30 frames a second with a 33,333 µs interval).
+- *observed*: device slot 81 takes `(frame token, type mask, count*, records*)` and returns an `HRESULT`: titles
+  pass the token of a frame a few frames back, the mask `0x11100`, a count of 6 and room for six 56-byte records,
+  and use the records only when the call succeeds with a nonzero count (dword 0 of a record is one bit of the
+  mask, byte 8 a flag, bytes 0x18-0x1F a 64-bit value). *assumed*: timing statistics of a frame's events.
+  Implementation: none are kept; the call succeeds with no records. Presents 1, 30, 300 and every 1800th are also written to
   `<data>/frames/present-<n>.bmp`. Partial: one plane; colour space and placement not applied.
 
 ### Resources
@@ -303,7 +330,14 @@ Notes describe the platform, never a title.
   layout (3 and 6 seen, then named as the layout before the first barrier). Implementation: host textures are
   created in that layout (`CreateCommittedResource3`); each placement gets its own host texture.
 - *observed*: slot 70 may be called with a description buffer the title left unwritten (dimension zero in the
-  title's own texture record); a null view of the requested kind is made.
+  title's own texture record); a null view of the requested kind is made. The same is done, and logged, for
+  descriptions no texture can have (sizes above 65,536, more than 17 levels, sample counts outside 1-16, formats
+  past 255).
+- *documented* (format numbers public in open-source texture tooling): the console adds DXGI formats 116 and 117
+  (10:10:10:2 float, 7e3 and 6e4), 118 (16-bit depth with 8-bit stencil) with its depth (119) and stencil (120)
+  views, and 190 (R4G4). Implementation: host resources, views and clear values use the nearest desktop format
+  (16-bit float RGBA, the 24/8 depth family, R8G8); host textures never live in title memory, so only precision
+  and size differ.
 - *observed*: device slot 55 derives a pipeline from a base pipeline and 0x14C-byte entries: a type dword and a
   desktop `D3D12_DEPTH_STENCIL_DESC` (0), `D3D12_RASTERIZER_DESC` (1) or `D3D12_BLEND_DESC` (2). Type 5 (written
   next to depth-stencil entries with zero depth fields) is not established and not applied. Implementation:
@@ -478,9 +512,9 @@ Notes describe the platform, never a title.
 - *assumed*: queue slots 5 `EnqueueSignal(fence, value)` and 6 `Submit()`, status array slots 3
   `IsComplete(index)` and 4 `GetHResult(index)`, in the desktop order (not yet called by titles).
 - Implementation: requests are carried out when enqueued (reads through the title's path translation, zlib
-  inflated by the project's decoder), so they complete earlier than on the console; a status entry gets the
-  first failure since the previous one. Partial: requests are processed one at a time on the calling thread
-  (slow: titles stream thousands at start-up); other request kinds and queue slots report themselves.
+  inflated by the project's decoder straight into the destination, Adler-32 checked), so they complete earlier
+  than on the console; a status entry gets the first failure since the previous one. Partial: requests are
+  processed one at a time on the calling thread; other request kinds and queue slots report themselves.
 
 ## Graphics shaders
 
@@ -548,8 +582,25 @@ Notes describe the platform, never a title.
   lane's `EXEC` bit) so every step is exact (checked on the host GPU by a unit test that renders four quads);
   the quad position (console lane order: 0 top left, 1 top right, 2 bottom left, 3 bottom right) comes from
   `SV_Position`. Like implicit-derivative sampling this requires the four lanes of a quad to reach the
-  instruction together. Other DPP controls in pixel programs (reading outside the quad) report themselves.
-  DPP source-1 negate/absolute modifiers are applied in every stage; `s_bfm_b64` is translated.
+  instruction together. DPP source-1 negate/absolute modifiers are applied in every stage; `s_bfm_b64` is
+  translated.
+- *observed*: pixel programs also carry the console compiler's whole-wave reductions: `s_or_saveexec` with all
+  lanes, the identity of the operation for lanes that were inactive, DPP `quad_perm`, `row_half_mirror` and
+  `row_mirror` steps (fetching inactive lanes), `v_permlanex16_b32` and the operation once more, then
+  `v_readlane_b32` of lane 31; and DPP8, row shifts, lane reads and permutes. Implementation: a pixel program's
+  wave is taken to hold its quad alone, as lanes 0-3 (a packing the console GPU may also choose, so programs
+  cannot rely on others). Reads from lanes in the quad are exact (through fine derivatives); a lane outside it has
+  no pixel and reads as the identity of the operation consuming it where there is one (the reductions are then
+  exact over the quad), as an invalid source for moves, and as the lane's own value for lane reads and permutes
+  without such an operation. Vertex programs' wave is the lane alone.
+- Implementation, lane masks: compute and graphics programs keep only the lane's own bit in lane masks (EXEC,
+  VCC, compare results), each lane following its own control flow. `s_bcnt1` of such a mask counts 1,
+  `v_mbcnt` of a mask held in a register counts 0 lanes below, and `v_readfirstlane_b32` reads the lane's own
+  value: the wave of one lane the masks describe. That is consistent with the console compiler's wave-coalesced
+  atomics (one atomic for the wave's active lanes, its result broadcast with `v_readfirstlane`, each lane's slot
+  offset by `v_mbcnt` of EXEC) and makes scalarising loops finish. A constant mask counts by lane index
+  (`v_mbcnt` of -1 is the lane's index). Data movement between lanes (DPP, lane reads and writes, permutes,
+  `ds_swizzle`, `ds_bpermute`) uses real lanes in compute programs, through the exchange.
 - Implementation, native graphics programs (vertex and pixel): the same translation, with the 16 user SGPRs
   from the system constants. Parameter exports (`PARAMn`) become `TEXCOORDn` outputs in register n + 1 and the
   first position export `SV_Position`; a pixel shader's attribute n is the input `TEXCOORDn`, interpolated by
@@ -569,6 +620,55 @@ Notes describe the platform, never a title.
   it without asking the host again.
 - *observed*: titles do not write GPU command packets themselves; draws and dispatches go through the
   console D3D12 interfaces.
+- *observed*: vertex programs of native graphics pipelines may be NGG (primitive) programs: they group vertex
+  ids (`v_lshrrev_b32 vN, k, v5`: groups of 2^k), request output space with `s_sendmsg` 9 (`GS_ALLOC_REQ`),
+  share data through group memory and export primitives to target 20, each as three 9-bit vertex indices
+  within the group at bits 0, 10 and 20 with bit 31 marking a null primitive. *documented* (open-source drivers
+  for the hardware): inputs `s2` the group information, `s3` the merged wave information (the wave's index in
+  the group in bits 24-27), `v5` the vertex id, `v8` the instance id; user SGPRs from `s8`. Implementation: such
+  a program is translated into a compute program, a group per vertex group and instance, that writes each
+  vertex's position and parameters (a record of 16 bytes for each, in export order) and each primitive's three
+  indices (null primitives degenerate); a generated vertex program reads the records for the host draw.
+- *documented*: half-precision interpolation (`v_interp_p1ll_f16`, `v_interp_p1lv_f16`, `v_interp_p2_f16`) names
+  the attribute in bits 0-5 of the source-0 field, the channel in bits 6-7 and the high half in bit 8.
+  Implementation: an attribute read so holds pairs of halves; the pixel program takes each channel's halves as
+  two interpolated inputs (`HALFPARAMn`, after the attributes read whole) that the generated NGG vertex program
+  unpacks from the records. After a vertex program that is not NGG, the vertex program is translated for the
+  pixel program that follows: it outputs the attributes read whole and, for those read as halves, each exported
+  channel's halves as floats in the same registers.
+- *documented* image operations: cube images take face coordinates and the face (open-source drivers form them
+  from `v_cube*`: each minor axis over twice the major one, plus 1.5); the translation turns them back into a
+  direction for a host cube view (cube arrays: slice 0 is read). Multisampled loads take the sample after x and y;
+  `image_sample_d` takes the x then y gradients before the coordinates; unnormalised coordinates (texels) are
+  divided by the size of level 0; addresses may be given as a list of registers (NSA encoding); D16 data packs
+  two components a register. Partial: compare with gradients samples level 0; `image_get_lod` only in pixel
+  programs; gathers with an explicit level read level 0.
+- *documented*: programs may read data placed after their code through the program counter (`s_getpc_b64`, then
+  scalar or buffer loads from it). *observed*: such tables also sit right after `s_endpgm`, before `s_code_end`.
+  Implementation: the program's words are an immediate constant buffer of the translation and such loads read it;
+  only instructions control flow reaches are translated (from the entry, following branches).
+- *observed*: programs call subroutines: `s_getpc_b64` into an SGPR pair, `s_add_u32` of a literal to its low half,
+  `s_swappc_b64` (the return address into another pair), and the subroutine returns with `s_setpc_b64`.
+  Implementation: the addresses the idiom forms are blocks of the translation, as are return points; `s_setpc_b64`
+  and `s_swappc_b64` jump through the block dispatcher. Partial: addresses formed otherwise are not found.
+- *documented* (RDNA 2): image atomics (`image_atomic_*` 15-26: swap, compare-swap, add, sub, signed and unsigned
+  min and max, and, or, xor) on 32-bit texels, the previous value returned with GLC. Implementation: typed
+  atomics through integer UAV arrays over the same heap (spaces 21 and up). *documented*: with dmask 0x3 they
+  work on 64-bit texels (the value in two registers, low dword first); *observed*: titles' pixel programs keep
+  64-bit maxima (a depth above an id) that way. Host bytecode (shader model 5.1) has neither 64-bit atomics nor
+  typed atomics on 64-bit texels: the texel's two 32-bit channels are read, combined and written, through a
+  rasterizer-ordered view in pixel programs (exclusive and in primitive order per pixel: exact for lanes that
+  access their own pixel, as observed), not atomically elsewhere. Containers then declare the features they need
+  (raster-ordered views, typed UAV loads of additional formats) in an `SFI0` part. LDS D16 loads and stores (0xA0-0xA7:
+  bytes and shorts into or from one half of a register), 96-bit LDS loads and stores, and `ds_append` /
+  `ds_consume` (the dword at M0's base plus the offset, by one a lane: see lane masks) are translated, as are SDWA
+  output modifiers (clamp, omod), the 16-bit pack conversions (`v_cvt_pknorm_*`, `v_cvt_pk_*16_*32`) and
+  `v_pk_fmac_f16`.
+- Implementation, translation cache: translations are stored in `<data>/translated` under a hash of the native
+  code, the parameters that shape the translation and the translator build, and reused by later runs. Host
+  pipelines are compiled on worker threads; translations of more than 256 KiB are compiled one at a time
+  (*observed* host behaviour: the driver refuses some such programs with `E_OUTOFMEMORY` when several compile at
+  once, and accepts them alone), with one retry. The private host cache is discarded only after such a refusal.
 
 ## Texture layout (`xg_xs.dll`)
 
@@ -583,6 +683,11 @@ Notes describe the platform, never a title.
   desktop's copyable footprint layout (subresources in order, each at a multiple of 512 bytes, rows 256 bytes
   apart; core/libs/texture_layout.h); the swizzle mode reported is 0 (*assumed* linear). Other computer slots
   report themselves.
+- *observed*: computer slot 10 takes `(tile count*, packed mip info*, tile shape*, subresource tiling count*
+  (in/out, 16 seen), first subresource tiling, subresource tilings*)`, the arguments of the desktop
+  `ID3D12Device::GetResourceTiling` after its resource; titles stream tiled textures in 64 KiB pages.
+  Implementation: the host's answer for a reserved resource of the same description (console flag bits
+  dropped).
 
 ## Audio processor heap (`AcpHal.dll`)
 
@@ -596,15 +701,20 @@ Notes describe the platform, never a title.
   uses) and `void* ApuMapApuAddress(uint32_t)`.
 - Implementation: both heaps in one reservation, committed as handed out; an audio address is the offset in it
   plus a fixed base (never 0); first-fit allocation per heap; a range is valid within one allocation.
-- *observed*: titles then call `AcpHalAllocateShapeContexts(description)` (a structure of context counts the
-  title fills in first), `AcpHalCreate(IAcpHal** out)` and methods of that object (slot 0 with two 4 KiB sizes,
-  slot 2 with a message mask), and talk to two audio processors through `xapu.dll`
-  (`XApuConnect`/`Disconnect`/`EnqueueCommand`/`DequeueResult`/`GetResultCount`) and `chad.dll`
-  (`XDspActivate`/`ConnectWithMaximumStreamLimit`/`Deactivate`/`Disconnect`/`SubmitCommand`). These do the
-  hardware's audio processing (decoding the console's compressed audio among it) and are not implemented; they
-  report themselves.
-
-## Libraries not started
-
-Import names seen, contracts open: the audio processors' command interfaces (`xapu.dll`, `chad.dll`) and
-`AcpHal.dll`'s shape contexts (see above).
+- *observed*: titles then call `HRESULT AcpHalAllocateShapeContexts(contexts*)`: six 32-bit context counts the
+  title fills in, followed by six pointers the call writes (arrays of 64 bytes a context; titles clear them
+  themselves); `AcpHalReleaseShapeContexts()`; `HRESULT AcpHalCreate(IAcpHal** out)`, whose object takes slot 0
+  `(4 KiB, 4 KiB)` once, slot 2 `(command, cookie, 0xFFFFFFFF, payload, extra)` to send commands (a failure of
+  the first is fatal to titles), and slots 1 and 5 when audio shuts down.
+- *observed*: `xapu.dll`: `HRESULT XApuConnect(const config*, void** memory, handle*)` (six dwords
+  `{1, 0x100, 2, size, 0, 1}`; dword 3 is the size of the memory block the call returns, which titles lay out as
+  0x280-byte records followed by 0x1E00-byte buffers; a failure is fatal), `XApuEnqueueCommand(handle, 64-byte
+  command, flags)`, `uint32_t XApuGetResultCount(handle, uint32_t)` and `XApuDequeueResult(handle, result*)`
+  (titles dequeue as many results as counted), `XApuDisconnect(handle)`.
+- *observed*: `chad.dll`: `HRESULT XDspConnectWithMaximumStreamLimit(memory, bytes, streams, 0x80, 1, handle*)`
+  (a block of title memory, 0x60000 bytes and 30 streams seen; titles require exactly `S_OK` and stop
+  otherwise), `XDspActivate(handle, ...)` (four arguments) and `XDspSubmitCommand(handle, command)`, both
+  counted as successful when 0, `XDspDeactivate(handle)`, `XDspDisconnect(handle)`.
+- Implementation: a silent audio device. Shape contexts and the processor's memory are audio processor memory;
+  connections, activations and commands are accepted and not carried out (nothing is decoded, mixed or played),
+  so the audio processor never produces results. Other control processor slots report themselves.

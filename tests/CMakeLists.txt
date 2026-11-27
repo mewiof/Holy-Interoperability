@@ -24,6 +24,13 @@ holy_target_defaults(holy_unit_tests)
 target_link_libraries(holy_unit_tests PRIVATE holy_common holy_pe holy_package holy_analysis d3d12 dxgi)
 add_test(NAME unit COMMAND holy_unit_tests)
 
+# The run report (tools/run_report): its parser and verdicts on built-in logs.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME tools.run_report
+    COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/run_report/run_report.py" --self-test)
+endif()
+
 # --- sample title ---------------------------------------------------------------
 #
 # A small program written for this repository that is built the way a console

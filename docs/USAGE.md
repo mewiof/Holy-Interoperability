@@ -154,6 +154,18 @@ for finding out what a title asks for. Whatever happens after the first such cal
 Tracing only ever wraps imported functions (data imports are left alone), so any library can be named, but
 tracing everything (`*`) is slow and noisy.
 
+### Reading a run
+
+```sh
+python tools/run_report/run_report.py <data>/logs/runtime.log [--warmup SECONDS] [--min-fps FPS]
+```
+
+Turns the runtime log's statistics reports into a verdict: frames a second for every ten seconds, the longest
+frame, frames over 50 ms, commit and working-set growth a minute after the warm-up (default 60 s, loading), the
+least free system commit (under 1 GiB, failures are suspect), and leak suspects: counters of live objects or
+held bytes that grew in every report after the warm-up. With `--min-fps` the exit code says what failed (1: a
+steady interval below it, 2: a leak suspect, 3: both, 4: no reports), for scripts that run a title and check it.
+
 ### Translating shaders offline
 
 ```sh

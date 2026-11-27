@@ -338,6 +338,7 @@ class Translator {
   // flag set), else for a read (cached pages: the copy unless flagged).
   std::pair<uint32_t, uint32_t> find(const Operand& lo, const Operand& hi, bool write = false) {
     const uint32_t view = fresh(), offset = fresh();
+    const uint32_t mark = scratch_;  // what find uses besides its results goes when it returns
     const Operand alo = in_temp(lo), ahi = in_temp(hi);
     put(view, I(0));
     put(offset, I(0));
@@ -381,6 +382,7 @@ class Translator {
       put(offset, alo);
       end_if();
     }
+    scratch_ = mark;
     return {view, offset};
   }
   // The program dword at a byte offset (4-aligned), 0 outside the data the

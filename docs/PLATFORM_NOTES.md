@@ -490,7 +490,10 @@ Notes describe the platform, never a title.
   from the copies against 0.97 ms from title memory (3.1 times), with the same results; the CPU's writes, a
   native store read back in the same program and a buffer copy into the memory are all seen. Reads of several
   dwords at an address that is a multiple of 4 are one load (dword by dword otherwise): with the copies, 0.39 ms
-  before that.
+  before that. *Measured* and not kept: a per-thread memo of the last uncached page (skipping the two table reads
+  for the same page again) took the uncached read from 0.98 to 0.91 ms, but the copied one from 0.31 to 0.43 ms
+  (cached pages pay its test without using it), and the host refused graphics pipelines whose vertex programs
+  kept it (out of memory).
 - *measured* host behaviour (development host): memory a heap was opened over stays charged to the process after
   the title releases it, for as long as the heap lives (16 rounds of 64 MiB placed, released and freed left
   1,026 MiB charged). The runtime therefore lets go of heaps over title memory before the title's `VirtualFree`

@@ -166,32 +166,15 @@ TranslationKey graphics_translation_key(const uint8_t* code, size_t size, Graphi
   return key;
 }
 
-bool load_translation(uint64_t key, std::vector<uint8_t>* bytecode, ShaderInterface* link, NggInfo* ngg) {
-  const std::wstring dir = directory();
-  if (dir.empty()) return false;
-  const HANDLE file =
-      CreateFileW(path_of(key).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    g_misses.fetch_add(1);
-    return false;
-  }
-  Header header{};
-  DWORD read = 0;
-  bool ok = ReadFile(file, &header, sizeof(header), &read, nullptr) && read == sizeof(header) &&
-            header.magic == kMagic && header.version == kVersion && header.key == key &&
-            header.bytecode_size > 0 && header.bytecode_size < (64u << 20) && header.stored_size > 0 &&
-            header.stored_size <= header.bytecode_size + header.bytecode_size / 8 + 64;
-  if (ok) {
-    std::vector<uint8_t> stored(header.stored_size);
-    ok = ReadFile(file, stored.data(), header.stored_size, &read, nullptr) && read == header.stored_size;
-    bytecode->resize(header.bytecode_size);
-    ok = ok && lib::lz_decompress(stored.data(), stored.size(), bytecode->data(), bytecode->size());
-  }
-  CloseHandle(file);
-  if (!ok) {
-    g_misses.fetch_add(1);
-    return false;
-  }
+namespace {
+
+bool valid_header(const Header& header, uint64_t key) {
+  return header.magic == kMagic && header.version == kVersion && header.key == key && header.bytecode_size > 0 &&
+         header.bytecode_size < (64u << 20) && header.stored_size > 0 &&
+         header.stored_size <= header.bytecode_size + header.bytecode_size / 8 + 64;
+}
+
+void header_interface(const Header& header, ShaderInterface* link, NggInfo* ngg) {
   if (link) {
     *link = ShaderInterface{};
     if (header.has_link) {
@@ -207,11 +190,68 @@ bool load_translation(uint64_t key, std::vector<uint8_t>* bytecode, ShaderInterf
     ngg->group = header.ngg[0];
     ngg->stride = header.ngg[1];
   }
+}
+
+void count_hit() {
   const uint32_t hits = g_hits.fetch_add(1) + 1;
   if (hits == 1 || hits % 1000 == 0) {
     LIB_LOG(lib::kInfo, "d3d12", "translated programs from the cache: %u (%u translated afresh)", hits,
             g_misses.load());
   }
+}
+
+}  // namespace
+
+bool translation_header(uint64_t key, uint32_t* bytecode_size, ShaderInterface* link, NggInfo* ngg) {
+  const std::wstring dir = directory();
+  if (dir.empty()) return false;
+  const HANDLE file =
+      CreateFileW(path_of(key).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    g_misses.fetch_add(1);
+    return false;
+  }
+  Header header{};
+  DWORD read = 0;
+  const bool ok = ReadFile(file, &header, sizeof(header), &read, nullptr) && read == sizeof(header) &&
+                  valid_header(header, key);
+  CloseHandle(file);
+  if (!ok) {
+    g_misses.fetch_add(1);
+    return false;
+  }
+  *bytecode_size = header.bytecode_size;
+  header_interface(header, link, ngg);
+  count_hit();
+  return true;
+}
+
+bool load_translation(uint64_t key, std::vector<uint8_t>* bytecode, ShaderInterface* link, NggInfo* ngg) {
+  const std::wstring dir = directory();
+  if (dir.empty()) return false;
+  const HANDLE file =
+      CreateFileW(path_of(key).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    g_misses.fetch_add(1);
+    return false;
+  }
+  Header header{};
+  DWORD read = 0;
+  bool ok = ReadFile(file, &header, sizeof(header), &read, nullptr) && read == sizeof(header) &&
+            valid_header(header, key);
+  if (ok) {
+    std::vector<uint8_t> stored(header.stored_size);
+    ok = ReadFile(file, stored.data(), header.stored_size, &read, nullptr) && read == header.stored_size;
+    bytecode->resize(header.bytecode_size);
+    ok = ok && lib::lz_decompress(stored.data(), stored.size(), bytecode->data(), bytecode->size());
+  }
+  CloseHandle(file);
+  if (!ok) {
+    g_misses.fetch_add(1);
+    return false;
+  }
+  header_interface(header, link, ngg);
+  count_hit();
   return true;
 }
 

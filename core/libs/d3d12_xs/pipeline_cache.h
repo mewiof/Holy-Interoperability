@@ -44,12 +44,12 @@ class Program {
   // null if they cannot be had.
   std::shared_ptr<const std::vector<uint8_t>> bytes() const;
 
-  // For intern_program only.
-  Program(std::shared_ptr<const std::vector<uint8_t>> bytes, uint64_t hash, uint64_t disk_key);
+  // For intern_program and stored_program only.
+  Program(std::shared_ptr<const std::vector<uint8_t>> bytes, size_t size, uint64_t hash, uint64_t disk_key);
   ~Program();
 
  private:
-  uint64_t hash_;
+  uint64_t hash_;  // the bytes' hash, or for programs in the translation cache its key's (stored_identity)
   size_t size_;
   uint64_t disk_key_;
   std::shared_ptr<const std::vector<uint8_t>> strong_;  // programs not on disk
@@ -58,8 +58,14 @@ class Program {
 using ProgramRef = std::shared_ptr<const Program>;
 
 // The shared program with these bytes. `disk_key` is the translation cache
-// key the bytes are stored under (0 if they are not stored).
+// key the bytes are stored under (0 if they are not stored): such programs
+// are known by the key (which follows from the native code, the
+// translation's parameters and the translator's build), so their bytes are
+// not hashed, and they are dropped while no compile needs them.
 ProgramRef intern_program(std::vector<uint8_t> bytes, uint64_t disk_key = 0);
+// The shared program stored in the translation cache under `disk_key`,
+// `size` bytes long, read from the cache when first needed.
+ProgramRef stored_program(uint64_t disk_key, size_t size);
 
 // How a pipeline is made: a host pipeline stream whose shader subobjects
 // point at `programs` (in subobject order; patched in when compiling) and

@@ -277,11 +277,16 @@ bool translate_graphics_cached(const uint8_t* code, size_t size, GraphicsStage s
   }
   std::vector<uint8_t> dxbc;
   const uint64_t disk_key = graphics_translation_key(code, size, stage, consumer).value();
-  bool on_disk = load_translation(disk_key, &dxbc, link);
-  if (!on_disk) {
-    if (!translate_graphics(code, size, stage, &dxbc, link, error, consumer)) return false;
-    on_disk = store_translation(disk_key, dxbc, link);
+  uint32_t stored_size = 0;
+  if (translation_header(disk_key, &stored_size, link)) {
+    // Stored: the bytes are read when a pipeline using it is compiled.
+    *program = stored_program(disk_key, stored_size);
+    std::lock_guard<std::mutex> guard(lock);
+    (*cache)[key] = Entry{*program, *link};
+    return true;
   }
+  if (!translate_graphics(code, size, stage, &dxbc, link, error, consumer)) return false;
+  const bool on_disk = store_translation(disk_key, dxbc, link);
   if (HolyLogEnabled(lib::kDebug)) {
     dump_shader(code, size, stage == GraphicsStage::Vertex ? "vertex" : "pixel");
     LIB_LOG(lib::kDebug, "d3d12", "native %s program %016llx -> host %016llx",

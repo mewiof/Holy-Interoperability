@@ -832,7 +832,8 @@ HRESULT create_compute_pipeline_from_code(Device* self, const uint8_t* code, siz
   std::string error;
   const ULONGLONG start = GetTickCount64();
   const uint64_t key = compute_translation_key(code, size, info).value();
-  const bool cached = load_translation(key, &bytecode, nullptr);
+  uint32_t stored_size = 0;
+  const bool cached = translation_header(key, &stored_size, nullptr);  // the bytes are read when compiling
   const bool translated = cached || translate_compute(code, size, info, &bytecode, &error);
   const bool on_disk = cached || (translated && store_translation(key, bytecode, nullptr));
   if (!translated) {
@@ -843,10 +844,11 @@ HRESULT create_compute_pipeline_from_code(Device* self, const uint8_t* code, siz
   }
   ID3D12RootSignature* root = translated_root_signature(self);
   if (!root) return E_FAIL;
+  const size_t program_size = cached ? stored_size : bytecode.size();
   LIB_LOG(cached ? lib::kDebug : lib::kInfo, "d3d12", "%s compute shader (%u threads, %zu bytes of host bytecode) in %llu ms",
-          cached ? "cached" : "translated", info.threads[0] * info.threads[1] * info.threads[2], bytecode.size(),
+          cached ? "cached" : "translated", info.threads[0] * info.threads[1] * info.threads[2], program_size,
           static_cast<unsigned long long>(GetTickCount64() - start));
-  if (HolyLogEnabled(lib::kDebug)) {
+  if (HolyLogEnabled(lib::kDebug) && !cached) {
     LIB_LOG(lib::kDebug, "d3d12", "native compute program %016llx -> host %016llx",
             static_cast<unsigned long long>(shader_hash(dump, dump_size)),
             static_cast<unsigned long long>(shader_hash(bytecode.data(), bytecode.size())));
@@ -855,9 +857,10 @@ HRESULT create_compute_pipeline_from_code(Device* self, const uint8_t* code, siz
   // (pipeline_stream.cpp): titles create pipelines by the thousand.
   std::vector<uint8_t> stream;
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, sizeof(root));
-  const D3D12_SHADER_BYTECODE cs{nullptr, bytecode.size()};  // patched in when compiling
+  const D3D12_SHADER_BYTECODE cs{nullptr, program_size};  // patched in when compiling
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &cs, sizeof(cs));
-  std::vector<ProgramRef> programs{intern_program(std::move(bytecode), on_disk ? key : 0)};
+  std::vector<ProgramRef> programs{cached ? stored_program(key, stored_size)
+                                          : intern_program(std::move(bytecode), on_disk ? key : 0)};
   return create_recorded_pipeline(self, std::move(stream), std::move(programs), true, &kPipelineInfo,
                                   kPipelineVtable.data(), pipeline);
 }
@@ -1069,7 +1072,9 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   if (ngg) {
     std::vector<uint8_t> cs;
     const uint64_t key = ngg_translation_key(native.vertex_code, native.vertex_size).value();
-    bool on_disk = load_translation(key, &cs, &vs_link, &ngg_info);
+    uint32_t stored_size = 0;
+    const bool stored = translation_header(key, &stored_size, &vs_link, &ngg_info);
+    bool on_disk = stored;
     if (!on_disk) {
       if (!translate_ngg(native.vertex_code, native.vertex_size, &cs, &vs_link, &ngg_info, &error)) {
         dump_shader(native.vertex_code, native.vertex_size, "native graphics");
@@ -1080,7 +1085,7 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
       }
       on_disk = store_translation(key, cs, &vs_link, &ngg_info);
     }
-    ngg_program = intern_program(std::move(cs), on_disk ? key : 0);
+    ngg_program = stored ? stored_program(key, stored_size) : intern_program(std::move(cs), on_disk ? key : 0);
     // The vertex program is written once the pixel program's attributes are
     // known.
   } else if (!translate(native.vertex_code, native.vertex_size, GraphicsStage::Vertex, &vs, &vs_link)) {

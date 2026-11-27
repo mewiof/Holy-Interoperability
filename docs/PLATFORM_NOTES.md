@@ -922,7 +922,12 @@ Notes describe the platform, never a title.
   11 GB uncompressed for the reference title), one file a translation (*measured* on the development host:
   reading a 60 KB file costs 27-30 us against 8 us for the same bytes inside one large file, about 0.5 s a start
   for 23,000 programs; writing costs 0.4 ms a file, once, on the threads that translate; a single archive would
-  save less than a second a start and need crash-safe appends from many threads), and reused by later runs; directories
+  save less than a second a start and need crash-safe appends from many threads), and reused by later runs.
+  Pipeline creation reads only a stored translation's header (its size and stage interface); the bytes are read
+  when a pipeline using it is compiled, and programs in the cache are known by their cache key rather than a hash
+  of their bytes (*measured*: hashing them runs at 1.3 GB/s and decompressing at 3.7 GB/s, so reading every
+  stored program at creation cost about 11 s of processor time a start for the reference title's 10.5 GB of
+  translations); directories
   of other translator builds are deleted in the background when a run first uses the cache (they are never hit
   again). Translations of more than 256 KiB are compiled one at a time (*observed* host behaviour: the driver
   refuses some such programs with `E_OUTOFMEMORY` when several compile at once, and accepts them alone), with

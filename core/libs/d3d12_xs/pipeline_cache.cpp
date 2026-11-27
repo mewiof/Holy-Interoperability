@@ -91,10 +91,42 @@ std::unordered_map<uint64_t, std::weak_ptr<const Program>>& programs() {
 }
 size_t g_program_sweep_at = 4096;
 
+// The identity of a program in the translation cache: its key, apart from
+// the bytes' hashes the other programs go by.
+uint64_t stored_identity(uint64_t disk_key) { return disk_key ^ 0x5D3F4C2B1A098765ull; }
+
+ProgramRef intern(std::shared_ptr<const std::vector<uint8_t>> bytes, size_t size, uint64_t hash, uint64_t disk_key) {
+  ProgramRef found;
+  AcquireSRWLockShared(&g_program_lock);
+  {
+    auto it = programs().find(hash);
+    if (it != programs().end()) found = it->second.lock();
+  }
+  ReleaseSRWLockShared(&g_program_lock);
+  if (found && found->size() == size) return found;
+  auto made = std::make_shared<const Program>(std::move(bytes), size, hash, disk_key);
+  ProgramRef expired;  // dropped outside the lock
+  AcquireSRWLockExclusive(&g_program_lock);
+  auto& slot = programs()[hash];
+  found = slot.lock();
+  if (!found) {
+    slot = made;
+    found = made;
+  }
+  if (programs().size() >= g_program_sweep_at) {
+    for (auto it = programs().begin(); it != programs().end();) {
+      it = it->second.expired() ? programs().erase(it) : std::next(it);
+    }
+    g_program_sweep_at = programs().size() * 2 + 4096;
+  }
+  ReleaseSRWLockExclusive(&g_program_lock);
+  return found;
+}
+
 }  // namespace
 
-Program::Program(std::shared_ptr<const std::vector<uint8_t>> bytes, uint64_t hash, uint64_t disk_key)
-    : hash_(hash), size_(bytes ? bytes->size() : 0), disk_key_(disk_key) {
+Program::Program(std::shared_ptr<const std::vector<uint8_t>> bytes, size_t size, uint64_t hash, uint64_t disk_key)
+    : hash_(hash), size_(size), disk_key_(disk_key) {
   if (disk_key_) {
     weak_ = bytes;
   } else {
@@ -114,7 +146,7 @@ std::shared_ptr<const std::vector<uint8_t>> Program::bytes() const {
   ReleaseSRWLockShared(&g_program_lock);
   if (held) return held;
   std::vector<uint8_t> loaded;
-  if (!load_translation(disk_key_, &loaded, nullptr) || shader_hash(loaded.data(), loaded.size()) != hash_) {
+  if (!load_translation(disk_key_, &loaded, nullptr) || loaded.size() != size_) {
     LIB_LOG(lib::kError, "d3d12", "host program %016llx is no longer in the translation cache",
             static_cast<unsigned long long>(hash_));
     return nullptr;
@@ -132,32 +164,13 @@ std::shared_ptr<const std::vector<uint8_t>> Program::bytes() const {
 }
 
 ProgramRef intern_program(std::vector<uint8_t> bytes, uint64_t disk_key) {
-  const uint64_t hash = shader_hash(bytes.data(), bytes.size());
-  ProgramRef found;
-  AcquireSRWLockShared(&g_program_lock);
-  {
-    auto it = programs().find(hash);
-    if (it != programs().end()) found = it->second.lock();
-  }
-  ReleaseSRWLockShared(&g_program_lock);
-  if (found && found->size() == bytes.size()) return found;
-  auto made = std::make_shared<const Program>(counted_bytes(std::move(bytes)), hash, disk_key);
-  ProgramRef expired;  // dropped outside the lock
-  AcquireSRWLockExclusive(&g_program_lock);
-  auto& slot = programs()[hash];
-  found = slot.lock();
-  if (!found) {
-    slot = made;
-    found = made;
-  }
-  if (programs().size() >= g_program_sweep_at) {
-    for (auto it = programs().begin(); it != programs().end();) {
-      it = it->second.expired() ? programs().erase(it) : std::next(it);
-    }
-    g_program_sweep_at = programs().size() * 2 + 4096;
-  }
-  ReleaseSRWLockExclusive(&g_program_lock);
-  return found;
+  const size_t size = bytes.size();
+  const uint64_t hash = disk_key ? stored_identity(disk_key) : shader_hash(bytes.data(), bytes.size());
+  return intern(counted_bytes(std::move(bytes)), size, hash, disk_key);
+}
+
+ProgramRef stored_program(uint64_t disk_key, size_t size) {
+  return intern(nullptr, size, stored_identity(disk_key), disk_key);
 }
 
 // --- content keys ---------------------------------------------------------------------------

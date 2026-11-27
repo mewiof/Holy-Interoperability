@@ -37,7 +37,7 @@ flowchart LR
 | Graphics device, title memory as GPU memory, pipelines from native GPU code | ✅ done; translated rendering not yet checked against known results |
 | Start-up in seconds, memory within the host's means | ✅ first frame after 3 s; about 5 GiB of commit at the first frames (was 17 GiB) |
 | Frames presented at the title's pace | ✅ 30 a second, measured |
-| Runs for minutes without crashing | 🟡 the fault seconds after the first frame is fixed (a calling-convention bug); next: a breakpoint in the title's own code about 18 s in |
+| Runs for minutes without crashing | 🟡 three stops in the title's first seconds fixed (a calling-convention bug, packed render-target formats, depth textures asking for unordered access); it now loads thousands of resources and stops at its own check when a buffer cannot be placed over physical pages (seen with the host's commit exhausted) |
 | No memory leaks (RAM, VRAM, system commit) | 🟡 live-object counters in every run; host heaps no longer leak system commit after exit, released textures free their host copies |
 | A correct picture | ⬜ frames are black |
 | Menus and input | ⬜ no input devices yet |
@@ -53,7 +53,7 @@ flowchart LR
 | Graphics: device, resources, command recording | `█████░░░░░` 50% |
 | Graphics: shader translation | `████░░░░░░` 40% |
 | Graphics: pipelines and caches | `███████░░░` 70% |
-| Graphics: correct output | `█░░░░░░░░░` 5% |
+| Graphics: correct output | `█░░░░░░░░░` 8% |
 | Graphics: performance | `█░░░░░░░░░` 10% |
 | Input | `█░░░░░░░░░` 10% |
 | Audio | `█░░░░░░░░░` 10% |
@@ -100,7 +100,7 @@ What this means in practice: a retail title image loads, runs its static initial
 game runtime, creates its window, graphics device and over 80,000 pipelines (shaders translated from native
 GPU code), streams its start-up data through fast storage, and presents frames onto a swap chain on its window
 at 30 a second from 3 seconds after start, with about 5 GiB of commit. Its frames are still black, and it
-stops at a breakpoint in its own code about 18 seconds in (see [docs/ROADMAP.md](docs/ROADMAP.md)). No
+stops at its own consistency check about 14 seconds in (see [docs/ROADMAP.md](docs/ROADMAP.md)). No
 title is playable.
 
 Progress is measured as *console library coverage*: of the console-only symbols a title imports, how many

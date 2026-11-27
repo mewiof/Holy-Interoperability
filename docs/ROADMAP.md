@@ -106,7 +106,12 @@ The largest piece.
 - done: the crash of the reference title some seconds after its first frame (a resource whose `GetDesc` was
   called in the other argument order, which overwrote the resource object); host heaps over physical pages no
   longer leak system commit after the process ends.
-- next: the reference title stops at a breakpoint in its own code about 18 seconds in (cause open).
+- done: packed 16-bit render targets and depth textures that ask for unordered access are made as the host
+  supports them (the reference title stopped at its own checks on both).
+- next: title memory as tiled host resources: a reserved buffer per placeholder region whose 64 KiB tiles map to
+  the physical pages' storage (UpdateTileMappings, in queue order like the console's page mapping updates), so
+  buffers over pages that are not contiguous in one section can be placed (the reference title stops at its own
+  check when one cannot).
 - next: textures streamed into scattered pool pages are copied through the CPU.
 - open: textures the GPU writes in title memory as seen by the CPU.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed

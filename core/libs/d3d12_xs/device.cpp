@@ -112,6 +112,12 @@ HRESULT STDMETHODCALLTYPE create_queue_x(Device* self, const D3D12_COMMAND_QUEUE
 const lib::VtableInfo kFenceInfo{kLibrary, "ID3D12FenceX"};
 Device* g_device = nullptr;
 
+}  // namespace
+
+ID3D12Device* host_device() { return g_device ? g_device->host : nullptr; }
+
+namespace {
+
 HRESULT STDMETHODCALLTYPE get_device_of_child(Wrapper*, REFIID, void** device) {
   if (!device) return E_POINTER;
   g_device->refs.fetch_add(1);

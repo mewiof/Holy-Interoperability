@@ -104,6 +104,8 @@ struct Resource {
 };
 
 Device* create_device(const void* parameters);
+// The host device (null before the title made its device).
+ID3D12Device* host_device();
 
 // With debug logging: where the resource vtables are (for reading crash reports).
 void log_object_vtables();
@@ -137,6 +139,10 @@ ID3D12RootSignature* translated_root_signature(Device* device);
 // replacement (host_view_format).
 D3D12_RESOURCE_DESC desktop_resource_desc(const D3D12_RESOURCE_DESC& desc);
 DXGI_FORMAT host_view_format(const void* resource, DXGI_FORMAT format);
+// A barrier layout for a texture's host texture: layouts of usages it does not
+// have (see desktop_resource_desc) become the common layout.
+D3D12_BARRIER_LAYOUT layout_for_flags(D3D12_BARRIER_LAYOUT layout, D3D12_RESOURCE_FLAGS host_flags);
+D3D12_BARRIER_LAYOUT host_texture_layout(const Resource* resource, D3D12_BARRIER_LAYOUT layout);
 // The desktop format for a format the console adds to DXGI (the format
 // itself otherwise).
 DXGI_FORMAT desktop_format(DXGI_FORMAT format);

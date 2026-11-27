@@ -331,9 +331,10 @@ void STDMETHODCALLTYPE list_barrier(CommandList* self, UINT32 count, const D3D12
           LIB_LOG(lib::kDebug, "d3d12", "texture barrier sync 0x%x->0x%x access 0x%x->0x%x layout %u->%u flags 0x%x",
                   b.SyncBefore, b.SyncAfter, b.AccessBefore, b.AccessAfter, b.LayoutBefore, b.LayoutAfter, b.Flags);
         }
-        b.pResource = b.pResource ? static_cast<Resource*>(static_cast<void*>(b.pResource))->host : nullptr;
-        b.LayoutBefore = host_layout(b.LayoutBefore);
-        b.LayoutAfter = host_layout(b.LayoutAfter);
+        const auto* title = static_cast<const Resource*>(static_cast<const void*>(b.pResource));
+        b.pResource = title ? title->host : nullptr;
+        b.LayoutBefore = host_texture_layout(title, host_layout(b.LayoutBefore));
+        b.LayoutAfter = host_texture_layout(title, host_layout(b.LayoutAfter));
         note_texture_layout(static_cast<Resource*>(static_cast<void*>(g.pTextureBarriers[i].pResource)), b.LayoutAfter);
         textures.push_back(b);
       }

@@ -143,6 +143,25 @@ void test_resources(void* device) {
           "a resource reports its description, with the result pointer first or second");
   }
 
+  // A placed depth texture that also asks for unordered access (which the
+  // desktop does not allow), in the unordered-access layout (3), as titles
+  // place shadow maps.
+  D3D12_RESOURCE_DESC depth{};
+  depth.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  depth.Width = 64;
+  depth.Height = 64;
+  depth.DepthOrArraySize = 6;
+  depth.MipLevels = 1;
+  depth.Format = DXGI_FORMAT_R16_TYPELESS;
+  depth.SampleDesc.Count = 1;
+  depth.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x80300006);  // depth, unordered access, console bits
+  void* shadow = nullptr;
+  check(call<HRESULT>(device, 133, address, &depth, static_cast<UINT>(3), static_cast<const void*>(nullptr),
+                      __uuidof(ID3D12Resource), &shadow) == S_OK &&
+            shadow,
+        "a depth texture asking for unordered access is placed in the unordered-access layout");
+  if (shadow) call<ULONG>(shadow, 2);
+
   // A committed texture like the display buffers titles create: render target
   // and unordered access, created in the unordered-access layout (3).
   D3D12_RESOURCE_DESC texture{};
@@ -162,6 +181,26 @@ void test_resources(void* device) {
                                      static_cast<const void*>(nullptr), __uuidof(ID3D12Resource), &committed);
   check(made == S_OK && committed, "the device creates committed display textures");
   if (committed) call<ULONG>(committed, 2);
+
+  // Packed 16-bit render targets with console flag bits: the size (slot 25,
+  // result pointer first) is a real one (titles stop at sizes of 4 GiB and
+  // more), and the texture can be made.
+  D3D12_RESOURCE_DESC packed = texture;
+  packed.Width = 2560;
+  packed.Height = 1440;
+  packed.Format = DXGI_FORMAT_B4G4R4A4_UNORM;
+  packed.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0xC00001);
+  D3D12_RESOURCE_ALLOCATION_INFO info{};
+  using InfoFn = D3D12_RESOURCE_ALLOCATION_INFO*(STDMETHODCALLTYPE*)(void*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*);
+  reinterpret_cast<InfoFn>((*static_cast<void***>(device))[25])(&info, device, 1u, 1u, &packed);
+  void* packed_texture = nullptr;
+  const HRESULT packed_made = call<HRESULT>(device, 127, &heap, D3D12_HEAP_FLAG_NONE, &packed, 2u,  // render target
+                                            static_cast<const void*>(nullptr), static_cast<void*>(nullptr), 0u,
+                                            static_cast<const void*>(nullptr), __uuidof(ID3D12Resource),
+                                            &packed_texture);
+  check(info.SizeInBytes > 0 && info.SizeInBytes < (1ull << 32) && packed_made == S_OK && packed_texture,
+        "packed 16-bit render targets have a size and can be made");
+  if (packed_texture) call<ULONG>(packed_texture, 2);
 }
 
 void test_root_signature_and_pipeline(void* device) {

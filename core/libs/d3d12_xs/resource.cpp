@@ -229,14 +229,51 @@ D3D12_CLEAR_VALUE desktop_clear_value(const D3D12_CLEAR_VALUE& clear) {
   return host;
 }
 
+// Whether the host GPU supports `format` for the usages `flags` ask for
+// (render target, depth-stencil, typed unordered access), asked once per
+// format and usage.
+bool host_supports(DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags) {
+  constexpr D3D12_RESOURCE_FLAGS kUsages = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  const auto usage = static_cast<uint32_t>(flags & kUsages);
+  const auto index = static_cast<uint32_t>(format);
+  if (!usage || index >= 256) return true;
+  static std::atomic<int8_t> known[256][8] = {};  // 0 unknown, 1 supported, -1 not
+  const uint32_t slot = (usage & 1) | ((usage >> 1) & 2) | ((usage >> 1) & 4);  // RT, DS, UAV bits
+  if (const int8_t answer = known[index][slot].load(std::memory_order_relaxed)) return answer > 0;
+  ID3D12Device* host = host_device();
+  if (!host) return true;
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+  bool ok = SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)));
+  if ((flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && !(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
+    ok = false;
+  }
+  if ((flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && !(support.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL)) {
+    ok = false;
+  }
+  if ((flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+      !(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) {
+    ok = false;
+  }
+  known[index][slot].store(ok ? 1 : -1, std::memory_order_relaxed);
+  return ok;
+}
+
+// Observed: titles ask for packed 16-bit formats (B5G6R5, B5G5R5A1,
+// B4G4R4A4) as render targets and with typed unordered access; hosts may
+// support neither (asked of the host, host_supports). Such textures are made
+// as 8-bit RGBA with matching views: host textures never live in title
+// memory, so only precision and size differ.
 DXGI_FORMAT substitute_format(DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags) {
   format = desktop_format(format);
-  if (!(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return format;
   switch (format) {
     case DXGI_FORMAT_B5G6R5_UNORM:
     case DXGI_FORMAT_B5G5R5A1_UNORM:
     case DXGI_FORMAT_B4G4R4A4_UNORM:
-      return DXGI_FORMAT_R8G8B8A8_UNORM;
+      return host_supports(format, static_cast<D3D12_RESOURCE_FLAGS>(flags & kDesktopFlags))
+                 ? format
+                 : DXGI_FORMAT_R8G8B8A8_UNORM;
     default:
       return format;
   }
@@ -270,13 +307,41 @@ HRESULT create_host_committed(Device* device, const D3D12_HEAP_PROPERTIES& heap,
     layout = D3D12_BARRIER_LAYOUT_UNDEFINED;
   } else if (initial > D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON) {
     layout = D3D12_BARRIER_LAYOUT_COMMON;
+  } else {
+    layout = layout_for_flags(layout, desc.Flags);
   }
   const bool target = (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
-  const D3D12_CLEAR_VALUE host_clear = clear ? desktop_clear_value(*clear) : D3D12_CLEAR_VALUE{};
+  D3D12_CLEAR_VALUE host_clear = clear ? desktop_clear_value(*clear) : D3D12_CLEAR_VALUE{};
+  if (clear) host_clear.Format = substitute_format(clear->Format, desc.Flags);
   const HRESULT hr = device10->CreateCommittedResource3(&heap, flags, &desc1, layout, target && clear ? &host_clear : nullptr,
                                                         nullptr, 0, nullptr, IID_PPV_ARGS(out));
   device10->Release();
   return hr;
+}
+
+// Observed: titles create textures in, and move them to, layouts of usages
+// the host texture does not have (unordered access of depth textures, which
+// the desktop does not allow: desktop_resource_desc). Such layouts become
+// the common layout, which allows every access the host texture has.
+D3D12_BARRIER_LAYOUT layout_for_flags(D3D12_BARRIER_LAYOUT layout, D3D12_RESOURCE_FLAGS flags) {
+  switch (layout) {
+    case D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS:
+    case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS:
+    case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS:
+      return (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? layout : D3D12_BARRIER_LAYOUT_COMMON;
+    case D3D12_BARRIER_LAYOUT_RENDER_TARGET:
+      return (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ? layout : D3D12_BARRIER_LAYOUT_COMMON;
+    case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE:
+    case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ:
+      return (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ? layout : D3D12_BARRIER_LAYOUT_COMMON;
+    default:
+      return layout;
+  }
+}
+
+D3D12_BARRIER_LAYOUT host_texture_layout(const Resource* resource, D3D12_BARRIER_LAYOUT layout) {
+  if (!resource || resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return layout;
+  return layout_for_flags(layout, desktop_resource_desc(resource->desc).Flags);
 }
 
 DXGI_FORMAT host_view_format(const void* resource, DXGI_FORMAT format) {
@@ -313,7 +378,8 @@ HRESULT create_committed_resource(Device* device, const D3D12_HEAP_PROPERTIES* p
   const bool render_target = (host_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                                                  D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
   ID3D12Resource* host = nullptr;
-  const D3D12_CLEAR_VALUE host_clear = clear ? desktop_clear_value(*clear) : D3D12_CLEAR_VALUE{};
+  D3D12_CLEAR_VALUE host_clear = clear ? desktop_clear_value(*clear) : D3D12_CLEAR_VALUE{};
+  if (clear) host_clear.Format = substitute_format(clear->Format, host_desc.Flags);
   const HRESULT hr =
       layout ? create_host_committed(device, host_properties, host_flags, host_desc, state, clear, &host)
              : device->host->CreateCommittedResource(&host_properties, host_flags, &host_desc,

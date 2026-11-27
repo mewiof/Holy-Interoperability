@@ -685,7 +685,7 @@ Notes describe the platform, never a title.
 ## Graphics shaders
 
 - *measured* (offline, `holy_translate_corpus`, the reference title's 19,305 saved shaders): every program
-  translates except those with ray intersection instructions (128). Found and translated since: NGG vertex
+  translates (ray intersection instructions, the last 128, since: see below). Found and translated since: NGG vertex
   programs taking their vertex group as `v_readfirstlane_b32 sN, v5` then `s_lshr_b32` (36); relative register
   moves `v_movrels_b32`/`v_movreld_b32` (documented: M0 indexes VGPRs; host temps cannot be indexed, so a
   selection on M0 over the program's VGPRs) (13); doubles (`v_add_f64`, `v_mul_f64`, the conversions to and
@@ -718,6 +718,24 @@ Notes describe the platform, never a title.
   an unchanged size (166 s before the size work); of the reference title's 19,305 saved programs, 18 keep the
   dispatcher loop (they jump through registers: subroutines). Unit tests run nested loops with a branch out of
   both, overlapping loops, and a group barrier between waves.
+- Ray intersection (`image_bvh_intersect_ray` 230, `image_bvh64_intersect_ray` 231): *documented* (RDNA 2) the
+  instruction tests one node of a bounding volume hierarchy: address operands node pointer (two registers for the
+  64-bit form), ray extent, origin, direction and inverse direction (with A16 the directions as halves in three
+  registers: dir.x | dir.y, dir.z | inv.x, inv.y | inv.z); a 4-SGPR descriptor; four results. Node layouts as in
+  AMD's open-source ray tracing library (written for this hardware): a node pointer is the node's offset from the
+  base in 8-byte units with the node type in its low 3 bits (0-3 triangle k of a triangle node, 4 a box node of
+  half floats, 5 of floats; 6-7 instance and procedural nodes, which traversal code reads itself; bits from 54 of
+  the 64-bit form are flags); box nodes hold 4 child pointers then each child's bounds (128 bytes; half floats:
+  64); triangle nodes hold vertex slots of 12 bytes at 0-48 and a triangle id at 60, triangle k using slots
+  (0,1,2), (1,3,2), (2,3,4), (2,4,0), byte k of the id choosing the vertices whose barycentric numerators return
+  (bits 1-0, 3-2). Results as open-source drivers read them: box nodes, the children hit (slab test: exit at or
+  past both entry and 0, entry before the extent), nearest entry first when the descriptor's word 1 bit 31 asks
+  for sorting, then 0xFFFFFFFF; triangle nodes, the watertight test (Woop, Benthin and Wald 2013) giving the
+  distance's numerator and denominator and the two barycentric numerators (word 3 bit 24; a miss: infinity, 1,
+  0, 0). *observed*: the reference title's traversal programs build the descriptor in place (base 0, sorting,
+  barycentric results, word 3 0x890003FF) and pass 64-bit node pointers; its package ships the acceleration
+  structure builder (a DLL), so the nodes it walks are the builder's, in the hardware's layout. Partial: the
+  results were checked against hand-computed ones, not against the console's.
 - *documented* (RDNA 2): the two low bits of each part of a scalar memory address (base, offset, instruction
   offset) are ignored, so `s_load_*` and `s_buffer_load_*` read whole, aligned dwords. Translated as such: one
   load, no alignment test (a unit test reads at unaligned parts).

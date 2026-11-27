@@ -728,6 +728,120 @@ TEST(overlapping_loops_run_as_written) {
   EXPECT(after[34] == 2);
 }
 
+// Ray intersection (image_bvh64_intersect_ray): a box node of floats whose
+// children are hit nearest first, a missed child and an invalid one; a
+// triangle hit (the distance as numerator and denominator, barycentric
+// numerators of the vertices the triangle id selects); the node's second
+// triangle (slots 1, 3, 2) missed.
+TEST(ray_intersection_sorts_box_hits_and_tests_triangles) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  auto bits = [](float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return u;
+  };
+  // v0, v1 = the node pointer (base 0: address / 8, the type in bits 2-0);
+  // v2 = extent 100; v3-v5 = origin 0; v6-v8 = direction (0, 0, 1);
+  // v9-v11 = inverse direction (max, max, 1); image_bvh64_intersect_ray
+  // v[12:15], v[0:11], s[0:3]; buffer_store_dwordx4 v[12:15], off, s[4:7],
+  // 0 offset:192; again for the triangles (offsets 208, 224); s_endpgm.
+  const uint32_t intersect[2] = {0xF19C9F01u, 0x00000C00u};
+  std::vector<uint32_t> program = {0x7E0002FFu, 0x20000005u, 0x7E020280u, 0x7E0402FFu, bits(100.0f),
+                                   0x7E060280u, 0x7E080280u, 0x7E0A0280u, 0x7E0C0280u, 0x7E0E0280u,
+                                   0x7E1002F2u, 0x7E1202FFu, 0x7F7FFFFFu, 0x7E1402FFu, 0x7F7FFFFFu,
+                                   0x7E1602F2u, intersect[0], intersect[1], 0xE07800C0u, 0x80010C00u,
+                                   0x7E0002FFu, 0x20000010u, intersect[0], intersect[1], 0xE07800D0u,
+                                   0x80010C00u, 0x7E0002FFu, 0x20000011u, intersect[0], intersect[1],
+                                   0xE07800E0u, 0x80010C00u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  info.user_sgprs = 8;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  // The BVH descriptor: base 0, box sorting, barycentric triangle results;
+  // then title memory at 2^32 for the results.
+  EXPECT(gpu.set_constants({0, 0x80000000u, 0xFFFFFFFFu, 0x890003FFu, 0, 1, 256, 0}, true));
+  std::vector<uint32_t> memory(64, 0);
+  // The box node at 2^32: children 0x111 (z 5-6), 0x222 (z 2-3), 0x333 (to
+  // the side), an invalid one (in the ray's way).
+  const uint32_t children[4] = {0x111, 0x222, 0x333, 0xFFFFFFFFu};
+  const float bounds[4][6] = {{-1, -1, 5, 1, 1, 6}, {-1, -1, 2, 1, 1, 3}, {5, 5, 0, 6, 6, 1}, {-1, -1, 1, 1, 1, 2}};
+  for (int i = 0; i < 4; ++i) {
+    memory[i] = children[i];
+    for (int c = 0; c < 6; ++c) memory[4 + 6 * i + c] = bits(bounds[i][c]);
+  }
+  // The triangle node at 2^32 + 128: slots (-1,-1,10), (1,-1,10), (0,1,10),
+  // (5,5,10); triangles 0 and 1 return vertex 1's and vertex 2's weights.
+  const float slots[4][3] = {{-1, -1, 10}, {1, -1, 10}, {0, 1, 10}, {5, 5, 10}};
+  for (int s = 0; s < 4; ++s) {
+    for (int c = 0; c < 3; ++c) memory[32 + 3 * s + c] = bits(slots[s][c]);
+  }
+  memory[47] = 0x0909u;
+  const std::vector<uint32_t> after = gpu.dispatch(cs, memory);
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[48] == 0x222 && after[49] == 0x111 && after[50] == 0xFFFFFFFFu && after[51] == 0xFFFFFFFFu);
+  // (0, 0) is a quarter of vertex 0, a quarter of vertex 1, half of vertex 2:
+  // numerators -1, -1, -2 over -4; the distance -40 / -4.
+  EXPECT(after[52] == bits(-40.0f) && after[53] == bits(-4.0f));
+  EXPECT(after[54] == bits(-1.0f) && after[55] == bits(-2.0f));
+  EXPECT(after[56] == 0x7F800000u && after[57] == bits(1.0f) && after[58] == 0 && after[59] == 0);
+  std::printf("      (box %x %x %x %x; triangle %08x %08x %08x %08x; miss %08x %08x %08x %08x)\n", after[48],
+              after[49], after[50], after[51], after[52], after[53], after[54], after[55], after[56], after[57],
+              after[58], after[59]);
+}
+
+// A box node of half floats, directions as halves (A16), sorting off:
+// children in the node's order, misses as 0xFFFFFFFF.
+TEST(ray_intersection_reads_half_boxes_and_half_directions) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // v0, v1 = the node pointer (type 4); v2 = extent 100; v3-v5 = origin 0;
+  // v6 = dir.x | dir.y (0, 0); v7 = dir.z | inv.x (1, 65504); v8 = inv.y |
+  // inv.z (65504, 1); image_bvh64_intersect_ray v[12:15], v[0:8], s[0:3]
+  // a16; buffer_store_dwordx4 v[12:15], off, s[4:7], 0 offset:192; s_endpgm.
+  const std::vector<uint32_t> program = {0x7E0002FFu, 0x20000004u, 0x7E020280u, 0x7E0402FFu, 0x42C80000u,
+                                         0x7E060280u, 0x7E080280u, 0x7E0A0280u, 0x7E0C0280u, 0x7E0E02FFu,
+                                         0x7BFF3C00u, 0x7E1002FFu, 0x3C007BFFu, 0xF19C9F01u, 0x40000C00u,
+                                         0xE07800C0u, 0x80010C00u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  info.user_sgprs = 8;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(gpu.set_constants({0, 0, 0xFFFFFFFFu, 0x890003FFu, 0, 1, 256, 0}, true));
+  // Children 0xA (z 5-6), 0xB (to the side), 0xC (z 2-3), 0xD (to the
+  // side); bounds as halves: min x | min y, min z | max x, max y | max z.
+  const std::vector<uint32_t> node = {0xA,         0xB,         0xC,         0xD,         0xBC00BC00u, 0x3C004500u,
+                                      0x46003C00u, 0x45004500u, 0x46000000u, 0x3C004600u, 0xBC00BC00u, 0x3C004000u,
+                                      0x42003C00u, 0x45004500u, 0x46000000u, 0x3C004600u};
+  std::vector<uint32_t> memory(64, 0);
+  std::copy(node.begin(), node.end(), memory.begin());
+  const std::vector<uint32_t> after = gpu.dispatch(cs, memory);
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[48] == 0xA && after[49] == 0xFFFFFFFFu && after[50] == 0xC && after[51] == 0xFFFFFFFFu);
+}
+
 // A group barrier between local data share writes and reads of other
 // threads' values (two waves of 32: the barrier is the group's).
 TEST(group_barriers_order_local_data_share_between_waves) {

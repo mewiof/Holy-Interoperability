@@ -624,6 +624,7 @@ class Translator {
   bool emit_ds(const Instruction& inst);
   bool emit_export(const Instruction& inst);
   bool emit_image(const Instruction& inst);
+  bool emit_bvh(const Instruction& inst);
   bool image_atomic64(const Instruction& inst, uint32_t slot, uint32_t coord_count, uint32_t index_reg);
   bool emit_vop3p(const Instruction& inst);
   // Cross-lane operations (compute programs): each lane stores the source
@@ -2871,6 +2872,297 @@ bool Translator::emit_export(const Instruction& inst) {
   return fail(format("pixel export target %u", target));
 }
 
+// Ray intersection: image_bvh_intersect_ray (230) and image_bvh64_intersect_ray
+// (231), RDNA 2 (documented: the instruction, its operands and node types;
+// node layouts as in AMD's open-source ray tracing library, which writes
+// them for this hardware; the results' conventions as open-source drivers
+// read them):
+// - address operands: the node pointer (one register, two for 231), the ray
+//   extent, origin x-z, direction x-z, inverse direction x-z; with A16 the
+//   directions are halves, three registers (dir.x | dir.y, dir.z | inv.x,
+//   inv.y | inv.z, low half first);
+// - the resource descriptor (4 SGPRs): base address bits 39-0 in 256-byte
+//   units (word 0, word 1 bits 7-0), box sorting (word 1 bit 31), triangle
+//   return mode (word 3 bit 24: barycentric numerators);
+// - a node pointer is the node's offset from the base in 8-byte units, its
+//   low 3 bits the node type (nodes are 64-byte aligned), bits from 54 of the
+//   64-bit form flags: 0-3 a triangle of a triangle node, 4 a box node of
+//   half floats (64 bytes: 4 child pointers, then per child min x | min y,
+//   min z | max x, max y | max z), 5 a box node of floats (128 bytes: 4 child
+//   pointers, then per child min x-z, max x-z);
+// - box nodes: per child a slab test with the inverse direction (clamped to
+//   finite values), a hit when the exit is at or past both the entry and 0
+//   and the entry is before the extent (children whose pointer is invalid or
+//   whose min x is NaN never hit); the children hit, nearest entry first
+//   when sorting, then 0xFFFFFFFF;
+// - triangle nodes (64 bytes): vertex slots of 12 bytes at 0, 12, 24, 36,
+//   48, a triangle id at 60; triangle k uses slots (0,1,2), (1,3,2),
+//   (2,3,4), (2,4,0); byte k of the id selects the vertices whose
+//   barycentric numerators return as I (bits 1-0) and J (bits 3-2). The test
+//   is the watertight one (Woop, Benthin and Wald 2013): the result is the
+//   distance's numerator and denominator then I and J (a miss: infinity, 1,
+//   0, 0); without the barycentric mode, the numerator, the denominator, the
+//   triangle id and 1 for a hit (partial: assumed).
+// Other node types (instances, procedural nodes) are the traversal's own:
+// they return 0xFFFFFFFF.
+bool Translator::emit_bvh(const Instruction& inst) {
+  const bool wide = inst.op == 231;
+  const bool a16 = (inst.raw[1] >> 30) & 1;
+  const uint32_t nsa = (inst.raw[0] >> 1) & 3;
+  auto address = [&](uint32_t i) {
+    if (i == 0 || !nsa) return R(vreg(inst.src[0] - rdna::kVgpr0 + i));
+    return R(vreg(inst.nsa[(i - 1) % 12]));
+  };
+  const uint32_t data = inst.src[1] - rdna::kVgpr0;
+  const uint16_t desc = inst.src[2];
+  auto fadd = [&](const Operand& x, const Operand& y) { return op2(dx::kAdd, x, y); };
+  auto fsub = [&](const Operand& x, const Operand& y) { return op2(dx::kAdd, x, dxbc::neg(in_temp(y))); };
+  auto fmul = [&](const Operand& x, const Operand& y) { return op2(dx::kMul, x, y); };
+  auto fmin = [&](const Operand& x, const Operand& y) { return op2(dx::kMin, x, y); };
+  auto fmax = [&](const Operand& x, const Operand& y) { return op2(dx::kMax, x, y); };
+  auto flt = [&](const Operand& x, const Operand& y) { return op2(dx::kLt, x, y); };
+  auto fge = [&](const Operand& x, const Operand& y) { return op2(dx::kGe, x, y); };
+  auto half = [&](const Operand& packed, bool high) { return op1(dx::kF16tof32, high ? shr(packed, I(16)) : packed); };
+  constexpr uint32_t kMiss = 0xFFFFFFFFu;
+  constexpr uint32_t kInfinity = 0x7F800000u;
+  constexpr uint32_t kFltMax = 0x7F7FFFFFu;
+
+  if_nz(active());
+  // Operands.
+  uint32_t a = 0;
+  const uint32_t ptr_lo = fresh(), ptr_hi = fresh(), extent = fresh();
+  put(ptr_lo, address(a++));
+  put(ptr_hi, wide ? address(a++) : I(0));
+  put(extent, address(a++));
+  uint32_t origin[3], dir[3], inv[3];
+  for (uint32_t c = 0; c < 3; ++c) {
+    origin[c] = fresh();
+    put(origin[c], address(a++));
+  }
+  for (uint32_t c = 0; c < 3; ++c) dir[c] = fresh(), inv[c] = fresh();
+  if (a16) {
+    const uint32_t inner = scratch_;
+    const Operand p0 = copy(address(a)), p1 = copy(address(a + 1)), p2 = copy(address(a + 2));
+    put(dir[0], half(p0, false));
+    put(dir[1], half(p0, true));
+    put(dir[2], half(p1, false));
+    put(inv[0], half(p1, true));
+    put(inv[1], half(p2, false));
+    put(inv[2], half(p2, true));
+    scratch_ = inner;
+  } else {
+    for (uint32_t c = 0; c < 3; ++c) put(dir[c], address(a++));
+    for (uint32_t c = 0; c < 3; ++c) put(inv[c], address(a++));
+  }
+  // The descriptor and the node's address: base + (pointer & ~7) * 8 (the
+  // pointer's address bits are 53-3).
+  const uint32_t sort = fresh(), barycentric = fresh();
+  put(sort, shr(R(desc + 1u), I(31)));
+  put(barycentric, ubfe(I(1), I(24), R(desc + 3u)));
+  const uint32_t type = fresh();
+  put(type, band(R(ptr_lo), I(7)));
+  const uint32_t view = fresh(), at = fresh();
+  {
+    const uint32_t inner = scratch_;
+    const Operand base_lo = shl(R(desc), I(8));
+    const Operand base_hi = bor(shr(R(desc), I(24)), shl(band(R(desc + 1u), I(0xFF)), I(8)));
+    const Operand off_lo = shl(band(R(ptr_lo), I(~7u)), I(3));
+    const Operand off_hi = bor(shl(band(R(ptr_hi), I(0x3FFFFF)), I(3)), shr(R(ptr_lo), I(29)));
+    auto [lo, carry] = addc(base_lo, off_lo);
+    const Operand hi = add(add(base_hi, off_hi), carry);
+    auto [found_view, found_at] = find(lo, band(hi, I(0xFFFF)));
+    put(view, R(found_view));
+    put(at, R(found_at));
+    scratch_ = inner;
+  }
+  // The node's first 64 bytes; a box node of floats has 64 more.
+  uint32_t node[28];
+  for (uint32_t& n : node) n = fresh();
+  for (uint32_t i = 0; i < 16; i += 4) read_dwords([&](int k) { return node[i + k]; }, 4, view, at, 4 * i, true);
+  if_nz(eq(R(type), I(5)));
+  for (uint32_t i = 16; i < 28; i += 4) read_dwords([&](int k) { return node[i + k]; }, 4, view, at, 4 * i, true);
+  end_if();
+  uint32_t result[4];
+  for (uint32_t& r : result) {
+    r = fresh();
+    put(r, I(kMiss));
+  }
+
+  // Box nodes. Half-float bounds are unpacked into the float node's layout
+  // (from the last child down, so no packed word is overwritten before it is
+  // read).
+  if_nz(uge(R(type), I(4)));
+  if_nz(ult(R(type), I(6)));
+  {
+    const uint32_t mark = scratch_;
+    if_nz(eq(R(type), I(4)));
+    for (int i = 3; i >= 0; --i) {
+      const uint32_t inner = scratch_;
+      const uint32_t w0 = node[4 + 3 * i], w1 = node[5 + 3 * i], w2 = node[6 + 3 * i];
+      uint32_t v[6];
+      for (uint32_t& t : v) t = fresh();
+      put(v[0], half(R(w0), false));
+      put(v[1], half(R(w0), true));
+      put(v[2], half(R(w1), false));
+      put(v[3], half(R(w1), true));
+      put(v[4], half(R(w2), false));
+      put(v[5], half(R(w2), true));
+      for (uint32_t c = 0; c < 6; ++c) put(node[4 + 6 * i + c], R(v[c]));
+      scratch_ = inner;
+    }
+    end_if();
+    uint32_t clamped[3];
+    for (uint32_t c = 0; c < 3; ++c) {
+      clamped[c] = fresh();
+      put(clamped[c], fmax(fmin(R(inv[c]), I(kFltMax)), dxbc::neg(in_temp(I(kFltMax)))));
+    }
+    uint32_t key[4], child[4];
+    for (int i = 0; i < 4; ++i) {
+      key[i] = fresh();
+      child[i] = fresh();
+      const uint32_t inner = scratch_;
+      Operand entry, exit;
+      for (uint32_t c = 0; c < 3; ++c) {
+        const Operand t0 = fmul(fsub(R(node[4 + 6 * i + c]), R(origin[c])), R(clamped[c]));
+        const Operand t1 = fmul(fsub(R(node[7 + 6 * i + c]), R(origin[c])), R(clamped[c]));
+        const Operand near = in_temp(fmin(t0, t1)), far = in_temp(fmax(t0, t1));
+        entry = c == 0 ? near : in_temp(fmax(entry, near));
+        exit = c == 0 ? far : in_temp(fmin(exit, far));
+      }
+      const Operand min_x = R(node[4 + 6 * i]);
+      Operand hit = band(fge(exit, fmax(entry, dxbc::immf(0.0f))), flt(entry, R(extent)));
+      hit = band(hit, op2(dx::kEq, min_x, min_x));  // not NaN
+      hit = in_temp(band(hit, ne(R(node[i]), I(kMiss))));
+      put_select(key[i], hit, entry, I(kInfinity));
+      put_select(child[i], hit, R(node[i]), I(kMiss));
+      scratch_ = inner;
+    }
+    // Sorting network on (entry, child): 0-1, 2-3, 0-2, 1-3, 1-2; a swap
+    // only for a strictly nearer entry.
+    if_nz(R(sort));
+    static const int kPairs[5][2] = {{0, 1}, {2, 3}, {0, 2}, {1, 3}, {1, 2}};
+    for (const auto& pair : kPairs) {
+      const uint32_t inner = scratch_;
+      const uint32_t x = static_cast<uint32_t>(pair[0]), y = static_cast<uint32_t>(pair[1]);
+      const Operand swap = in_temp(flt(R(key[y]), R(key[x])));
+      const Operand old_key = copy(R(key[x])), old_child = copy(R(child[x]));
+      put_select(key[x], swap, R(key[y]), old_key);
+      put_select(child[x], swap, R(child[y]), old_child);
+      put_select(key[y], swap, old_key, R(key[y]));
+      put_select(child[y], swap, old_child, R(child[y]));
+      scratch_ = inner;
+    }
+    end_if();
+    for (int i = 0; i < 4; ++i) put(result[i], R(child[i]));
+    scratch_ = mark;
+  }
+  end_if();
+  end_if();
+
+  // Triangle nodes.
+  if_nz(ult(R(type), I(4)));
+  {
+    const uint32_t mark = scratch_;
+    // Vertex slots of triangle k: (0,1,2), (1,3,2), (2,3,4), (2,4,0).
+    const Operand t1 = in_temp(eq(R(type), I(1))), t2 = in_temp(eq(R(type), I(2))), t3 = in_temp(eq(R(type), I(3)));
+    auto slot = [&](uint32_t s, uint32_t c) { return R(s == 4 ? node[12 + c] : node[3 * s + c]); };
+    // Vertex v's component c (v 0-2: the triangle's first, second, third).
+    auto vertex = [&](int v, uint32_t c) {
+      if (v == 0) return select(bor(t2, t3), slot(2, c), select(t1, slot(1, c), slot(0, c)));
+      if (v == 1) return select(t3, slot(4, c), select(bor(t1, t2), slot(3, c), slot(1, c)));
+      return select(t3, slot(0, c), select(t2, slot(4, c), slot(2, c)));
+    };
+    const uint32_t id_byte = fresh();
+    put(id_byte, ubfe(I(8), shl(R(type), I(3)), R(node[15])));
+    // The barycentric numerators u, v, w, the distance's numerator t and its
+    // denominator det; what computes them goes when they are known.
+    const uint32_t u = fresh(), v = fresh(), w = fresh(), det = fresh(), t = fresh(), hit = fresh();
+    const uint32_t shear_mark = scratch_;
+    // The axis of the largest direction component (kz), the other two
+    // (kx, ky) swapped when it is negative, to keep the winding.
+    const uint32_t kx = fresh(), ky = fresh(), kz = fresh();
+    {
+      const uint32_t inner = scratch_;
+      const Operand ax = in_temp(op1(dx::kMov, dxbc::abs(in_temp(R(dir[0]))))),
+                    ay = in_temp(op1(dx::kMov, dxbc::abs(in_temp(R(dir[1]))))),
+                    az = in_temp(op1(dx::kMov, dxbc::abs(in_temp(R(dir[2])))));
+      put(kz, select(fge(ax, ay), select(fge(ax, az), I(0), I(2)), select(fge(ay, az), I(1), I(2))));
+      scratch_ = inner;
+    }
+    auto pick = [&](const uint32_t* v, uint32_t k) {
+      return select(eq(R(k), I(0)), R(v[0]), select(eq(R(k), I(1)), R(v[1]), R(v[2])));
+    };
+    {
+      const uint32_t inner = scratch_;
+      const Operand next = in_temp(select(eq(R(kz), I(2)), I(0), add(R(kz), I(1))));
+      const Operand after = in_temp(select(eq(next, I(2)), I(0), add(next, I(1))));
+      const Operand negative = in_temp(flt(pick(dir, kz), dxbc::immf(0.0f)));
+      put_select(kx, negative, after, next);
+      put_select(ky, negative, next, after);
+      scratch_ = inner;
+    }
+    const uint32_t sx = fresh(), sy = fresh(), sz = fresh();
+    auto keep = [&](uint32_t reg, auto&& value) {
+      const uint32_t inner = scratch_;
+      put(reg, value());
+      scratch_ = inner;
+    };
+    keep(sz, [&] { return op1(dx::kRcp, pick(dir, kz)); });
+    keep(sx, [&] { return fmul(pick(dir, kx), R(sz)); });
+    keep(sy, [&] { return fmul(pick(dir, ky), R(sz)); });
+    // Vertices relative to the origin, sheared and scaled.
+    uint32_t px[3], py[3], pz[3];
+    for (int k = 0; k < 3; ++k) {
+      px[k] = fresh(), py[k] = fresh(), pz[k] = fresh();
+      const uint32_t inner = scratch_;
+      uint32_t rel[3];
+      for (uint32_t c = 0; c < 3; ++c) {
+        rel[c] = fresh();
+        const uint32_t part = scratch_;
+        put(rel[c], fsub(vertex(k, c), R(origin[c])));
+        scratch_ = part;
+      }
+      const Operand rz = in_temp(pick(rel, kz));
+      put(px[k], fsub(pick(rel, kx), fmul(R(sx), rz)));
+      put(py[k], fsub(pick(rel, ky), fmul(R(sy), rz)));
+      put(pz[k], fmul(R(sz), rz));
+      scratch_ = inner;
+    }
+    keep(u, [&] { return fsub(fmul(R(px[2]), R(py[1])), fmul(R(py[2]), R(px[1]))); });
+    keep(v, [&] { return fsub(fmul(R(px[0]), R(py[2])), fmul(R(py[0]), R(px[2]))); });
+    keep(w, [&] { return fsub(fmul(R(px[1]), R(py[0])), fmul(R(py[1]), R(px[0]))); });
+    keep(t, [&] { return fadd(fadd(fmul(R(u), R(pz[0])), fmul(R(v), R(pz[1]))), fmul(R(w), R(pz[2]))); });
+    scratch_ = shear_mark;
+    {
+      const uint32_t inner = scratch_;
+      const Operand zero = dxbc::immf(0.0f);
+      const Operand negative = bor(bor(flt(R(u), zero), flt(R(v), zero)), flt(R(w), zero));
+      const Operand positive = bor(bor(flt(zero, R(u)), flt(zero, R(v))), flt(zero, R(w)));
+      put(det, fadd(fadd(R(u), R(v)), R(w)));
+      const Operand signed_t = select(flt(R(det), zero), dxbc::neg(in_temp(R(t))), R(t));
+      put(hit, band(bnot(band(negative, positive)), fge(signed_t, zero)));
+      scratch_ = inner;
+    }
+    {
+      const uint32_t inner = scratch_;
+      const Operand isrc = in_temp(band(R(id_byte), I(3)));
+      const Operand jsrc = in_temp(ubfe(I(2), I(2), R(id_byte)));
+      const Operand iv = select(eq(isrc, I(0)), R(u), select(eq(isrc, I(1)), R(v), R(w)));
+      const Operand jv = select(eq(jsrc, I(0)), R(u), select(eq(jsrc, I(1)), R(v), R(w)));
+      put_select(result[0], R(hit), R(t), I(kInfinity));
+      put_select(result[1], R(hit), R(det), dxbc::immf(1.0f));
+      put_select(result[2], R(barycentric), select(R(hit), iv, I(0)), R(node[15]));
+      put_select(result[3], R(barycentric), select(R(hit), jv, I(0)), select(R(hit), I(1), I(0)));
+      scratch_ = inner;
+    }
+    scratch_ = mark;
+  }
+  end_if();
+  for (uint32_t k = 0; k < 4; ++k) put(vreg(data + k), R(result[k]));
+  end_if();
+  return true;
+}
+
 // Image instructions. Descriptor registers: the resource index is dword 0
 // of the image descriptor (s[srsrc]), the sampler index dword 0 of the
 // sampler descriptor (s[ssamp]). Address registers in the hardware order:
@@ -2881,6 +3173,7 @@ bool Translator::emit_export(const Instruction& inst) {
 // high half). Host views are float views, so values pass as half floats.
 bool Translator::emit_image(const Instruction& inst) {
   const uint32_t op = inst.op;
+  if (op == 230 || op == 231) return emit_bvh(inst);
   const bool d16 = (inst.raw[1] >> 31) & 1;
   const uint32_t nsa = (inst.raw[0] >> 1) & 3;
   struct Dim {

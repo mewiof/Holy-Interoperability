@@ -101,9 +101,8 @@ The largest piece.
 - done: whole-wave reductions and other cross-lane operations in pixel and vertex programs (the quad as the
   wave), lane-mask counting consistent with one-lane waves, image atomics, subroutine calls, data after the end
   of programs, half-precision attributes after plain vertex programs.
-- next: amplification and mesh pipelines in pipeline streams; ray intersection image instructions
-  (`image_bvh_intersect_ray`) in compute programs; NGG pipelines with indexed draws; integer views of images for
-  plain loads and stores (they are declared as float).
+- next: amplification and mesh pipelines in pipeline streams; NGG pipelines with indexed draws; integer views of
+  images for plain loads and stores (they are declared as float).
 - done: the crash of the reference title some seconds after its first frame (a resource whose `GetDesc` was
   called in the other argument order, which overwrote the resource object); host heaps over physical pages no
   longer leak system commit after the process ends.
@@ -143,11 +142,10 @@ The largest piece.
 - done: native pipelines with a program that neither exports nor interpolates (depth-only passes) and with an
   unusual target field; placeholder pipelines in the reference title's first minute went from 426 to 66.
 - done: unordered-access views of depth textures, through a twin texture kept in step at barriers.
-- next: ray intersection image instructions in compute programs. Each instruction tests one node of a bounding
-  volume hierarchy in the layout the console's driver builds (box nodes with four children, triangle nodes; the
-  title's own code walks the tree and reads instance nodes), so emulating the instruction also means building
-  acceleration structures in that same layout when the title asks for them; host acceleration structures are
-  opaque and cannot serve.
+- done: ray intersection image instructions (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`) in compute
+  programs: box nodes of floats and of half floats, triangle nodes, sorted or not, A16 directions (unit tests with
+  hand-computed results). Packages ship the builder that writes acceleration structures in the hardware's layout,
+  so no builder is needed here. Partial: results not yet compared with the console's on the same nodes.
 - done: scalar waits and mode writes without a register (`s_waitcnt_vscnt null`, `s_setreg_imm32_b32`)
   translate; programs using them were refused.
 - next: textures streamed into scattered pool pages are copied through the CPU.

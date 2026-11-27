@@ -17,7 +17,7 @@ _Last updated: 2026-11-27._ The goal is a reference title running as smoothly as
 picture, sound and input at a stable 30 frames a second or better. The percentages are rough estimates of how
 much of the work toward that goal each area has, not test coverage.
 
-**Overall: about 20%** `████░░░░░░░░░░░░░░░░`
+**Overall: about 22%** `████░░░░░░░░░░░░░░░░`
 
 ```mermaid
 flowchart LR
@@ -50,7 +50,7 @@ flowchart LR
 | Title memory (`xmem`, commit on demand) | `████████░░` 80% |
 | Fast storage | `███████░░░` 70% |
 | Game runtime services | `██████░░░░` 60% |
-| Graphics: device, resources, command recording | `█████░░░░░` 50% |
+| Graphics: device, resources, command recording | `██████░░░░` 55% (one memory map for translated programs; heaps released with title memory) |
 | Graphics: shader translation | `█████░░░░░` 45% (ray-intersection instructions open) |
 | Graphics: pipelines and caches | `███████░░░` 70% |
 | Graphics: correct output | `█░░░░░░░░░` 8% |

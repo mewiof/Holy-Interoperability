@@ -626,9 +626,136 @@ void test_released_memory(void* device) {
         "committed title memory the GPU used goes back to the host when released");
 }
 
-void test_graphics_resources(void* device) {
+// A native compute program reads a texture the title viewed in its memory,
+// all four channels, through the descriptor in the bound heap, and writes them
+// to an address passed as root constants, in memory a buffer is placed in
+// (the memory map): the whole path of translated work, from recording to the
+// GPU.
+// The command list interface titles ask for.
+constexpr GUID kListIid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+
+void test_compute_reads_a_texture_view(void* device, void* queue) {
+  void* allocator = nullptr;
+  void* list = nullptr;
+  void* fence = nullptr;
+  void* heap = nullptr;
+  void* signature = nullptr;
+  void* pipeline = nullptr;
+  void* placed = nullptr;
+  const uint32_t list_desc[4] = {0, 2, 1, 0};
+  call<HRESULT>(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), &allocator);
+  if (allocator) call<HRESULT>(device, 73, list_desc, allocator, static_cast<void*>(nullptr), kListIid, &list);
+  call<HRESULT>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), &fence);
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16,
+                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 1};
+  call<HRESULT>(device, 14, &heap_desc, __uuidof(ID3D12DescriptorHeap), &heap);
+  // Root arguments: a table with the texture view, then the output address.
+  D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+  D3D12_ROOT_PARAMETER1 parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable = {1, &range};
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants = {0, 0, 2};
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+  root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  root_desc.Desc_1_1.NumParameters = 2;
+  root_desc.Desc_1_1.pParameters = parameters;
+  ID3DBlob* serialized = nullptr;
+  if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&root_desc, &serialized, nullptr)) && serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &signature);
+  }
+  // s_load_dwordx4 s[4:7], s[0:1]: the root table (s4 the descriptor table's
+  // GPU address, s[5:6] the output address); s_mov_b32 s8, s4; s9 = 0;
+  // s_load_dwordx8 s[12:19], s[8:9]: the texture's descriptor;
+  // v0 = v1 = 0; image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D;
+  // s[20:23] = a buffer at s[5:6] of 64 bytes;
+  // buffer_store_dwordx4 v[2:5], off, s[20:23], 0; s_endpgm.
+  const std::vector<uint8_t> container = native_only_container(
+      {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE880304u, 0xBE890380u, 0xF40C0304u, 0xFA000000u, 0xBF8CC07Fu,
+       0x7E000280u, 0x7E020280u, 0xF0001F08u, 0x00030200u, 0xBF8C3F70u, 0xBE940305u, 0xBE950306u, 0xB0160040u,
+       0xBE970380u, 0xE0780000u, 0x80050200u, 0xBF810000u});
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+  pso.CS = {container.data(), container.size()};
+  call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
+                __uuidof(ID3D12PipelineState), &pipeline);
+  auto* memory = static_cast<volatile uint8_t*>(VirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  if (!list || !fence || !heap || !signature || !pipeline || !memory) {
+    check(false, "the objects for a compute program reading a texture view exist");
+    return;
+  }
+  for (uint32_t i = 0; i < 0x4000; ++i) memory[i] = 0x40;
+  memory[0] = 0x10;
+  memory[1] = 0x20;
+  memory[2] = 0x30;
+  memory[3] = 0xFF;
+  auto* output = reinterpret_cast<volatile float*>(memory + 0x10000);
+  const uint64_t output_address = reinterpret_cast<uint64_t>(output);
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 0x10000;
+  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  call<HRESULT>(device, 133, output_address, &buffer, static_cast<UINT>(0xFFFFFFFF), static_cast<const void*>(nullptr),
+                __uuidof(ID3D12Resource), &placed);
+
+  D3D12_RESOURCE_DESC texture{};
+  texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  texture.Width = 64;
+  texture.Height = 64;
+  texture.DepthOrArraySize = 1;
+  texture.MipLevels = 1;
+  texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture.SampleDesc.Count = 1;
+  struct {
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+    uint64_t address;
+  } view{};
+  view.srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  view.srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  view.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  view.srv.Texture2D.MipLevels = 1;
+  view.address = reinterpret_cast<uint64_t>(memory);
+  call<void>(device, 70, &texture, &view, call<uint64_t>(heap, 9));
+  const uint64_t table = call<uint64_t>(heap, 10);
+  const uint32_t constants[2] = {static_cast<uint32_t>(output_address), static_cast<uint32_t>(output_address >> 32)};
+  void* heaps[] = {heap};
+  bool recorded = call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
+  call<void>(list, 32, 1u, static_cast<void* const*>(heaps));
+  call<void>(list, 33, signature);
+  call<void>(list, 35, 0u, table);
+  call<void>(list, 39, 1u, 2u, static_cast<const void*>(constants), 0u);
+  call<void>(list, 25, pipeline);
+  call<void>(list, 14, 1u, 1u, 1u);
+  recorded = recorded && call<HRESULT>(list, 9) == S_OK;
+  void* lists[] = {list};
+  call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+  call<HRESULT>(queue, 16, fence, UINT64{1});
+  const auto* value = call<const volatile uint64_t*>(fence, 12);
+  for (int i = 0; value && *value < 1 && i < 5000; ++i) Sleep(1);
+  auto close_to = [](float a, float b) { return a > b - 0.002f && a < b + 0.002f; };
+  const float texel[4] = {output[0], output[1], output[2], output[3]};
+  std::printf("    (texel read on the GPU: %.3f %.3f %.3f %.3f)\n", texel[0], texel[1], texel[2], texel[3]);
+  check(recorded && value && *value == 1 && close_to(texel[0], 16 / 255.0f) && close_to(texel[1], 32 / 255.0f) &&
+            close_to(texel[2], 48 / 255.0f) && close_to(texel[3], 1.0f),
+        "a native compute program reads all four channels of a texture viewed in title memory");
+
+  if (placed) call<ULONG>(placed, 2);
+  call<ULONG>(pipeline, 2);
+  call<ULONG>(signature, 2);
+  call<ULONG>(heap, 2);
+  call<ULONG>(fence, 2);
+  call<ULONG>(list, 2);
+  call<ULONG>(allocator, 2);
+  VirtualFree(const_cast<uint8_t*>(memory), 0, MEM_RELEASE);
+}
+
+void test_graphics_resources(void* device, void* queue) {
   test_page_mapping_update(device);
   test_released_memory(device);
+  if (queue) test_compute_reads_a_texture_view(device, queue);
   test_allocation_hooks();
   test_placeholders();
   test_descriptor_heap(device);

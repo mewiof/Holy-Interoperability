@@ -427,6 +427,9 @@ Notes describe the platform, never a title.
   1,026 MiB charged). The runtime therefore lets go of heaps over title memory before the title's `VirtualFree`
   and `XMemFree` release it (`HolySetReleaseHook`); measured: no growth over the same rounds. Titles release memory
   once the GPU is done with it, as on the console.
+- *measured* host behaviour (development host): memory a heap was opened over (`OpenExistingHeapFromAddress`)
+  refuses protection changes (`VirtualProtect` fails with error 87), and a heap cannot be opened over read-only
+  memory (`E_INVALIDARG`): write tracking of title memory by page protection does not work where the GPU reaches it.
 - *measured* host behaviour: a buffer placed in a heap takes whole 64 KiB units of it, so title memory of less
   than 64 KiB cannot be reached by the GPU at all; `XMemAlloc` therefore takes whole 64 KiB units for page
   allocations (the title sees the size it asked for). Memory a title's own allocation hooks hand out is as the

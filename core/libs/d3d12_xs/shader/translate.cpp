@@ -2588,14 +2588,14 @@ bool Translator::emit_image(const Instruction& inst) {
         // Multisampled: x, y, then the sample index.
         const uint32_t coords = pack(0, 2, nullptr);
         const uint32_t result = fresh();
-        emit(dx::kLdMs, {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg), address(2)});
+        emit(dx::kLdMs, {dxbc::temp_dst_mask(result, 0xF), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg), address(2)});
         results(result);
         return true;
       }
       const Operand mip = op == 1 ? address(dim.coords) : I(0);
       const uint32_t coords = pack(0, dim.coords, &mip);
       const uint32_t result = fresh();
-      emit(dx::kLd, {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg)});
+      emit(dx::kLd, {dxbc::temp_dst_mask(result, 0xF), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg)});
       results(result);
       return true;
     }
@@ -2661,7 +2661,7 @@ bool Translator::emit_image(const Instruction& inst) {
     case 14: {  // image_get_resinfo: width, height, depth or layers, mip levels of the given level
       if (d16) return fail("image_get_resinfo with 16-bit data");
       const uint32_t result = fresh();
-      emit(dx::kResinfo, {D(result), address(0), dxbc::texture_indexed(texture_id, index_reg)}, 2u << 11);
+      emit(dx::kResinfo, {dxbc::temp_dst_mask(result, 0xF), address(0), dxbc::texture_indexed(texture_id, index_reg)}, 2u << 11);
       // resinfo_uint gives width, height, depth/elements, levels.
       uint32_t k = 0;
       for (uint32_t c = 0; c < 4; ++c) {
@@ -2681,7 +2681,7 @@ bool Translator::emit_image(const Instruction& inst) {
   uint32_t size_reg = kNoRegister;
   if (unnormalised) {
     size_reg = fresh();
-    emit(dx::kResinfo, {D(size_reg), I(0), dxbc::texture_indexed(texture_id, index_reg)});
+    emit(dx::kResinfo, {dxbc::temp_dst_mask(size_reg, 0xF), I(0), dxbc::texture_indexed(texture_id, index_reg)});
   }
   const uint32_t scaled = dim.slot == kImage1D || dim.slot == kImage1DArray ? 1 : dim.slot == kImage3D ? 3 : 2;
   // Coordinates from address `first` on, as a vector: cube face coordinates
@@ -2716,7 +2716,7 @@ bool Translator::emit_image(const Instruction& inst) {
     const uint32_t at = (offsets ? 1 : 0) + (compare ? 1 : 0);
     const uint32_t coords = coordinates(at);
     const uint32_t result = fresh();
-    std::vector<Operand> operands = {D(result), dxbc::temp_xyzw(coords)};
+    std::vector<Operand> operands = {dxbc::temp_dst_mask(result, 0xF), dxbc::temp_xyzw(coords)};
     if (offsets) {
       const uint32_t offset = fresh();
       emit(dx::kIbfe, {dxbc::temp_dst_mask(offset, 1), I(6), I(0), address(0)});
@@ -2765,10 +2765,10 @@ bool Translator::emit_image(const Instruction& inst) {
       const uint32_t coords = coordinates(at + 2 * grads);
       const uint32_t result = fresh();
       if (op <= 35) {
-        emit(dx::kSampleD, {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
+        emit(dx::kSampleD, {dxbc::temp_dst_mask(result, 0xF), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
                             dxbc::sampler_indexed(0, sampler_reg), dxbc::temp_xyzw(dx_reg), dxbc::temp_xyzw(dy_reg)});
       } else {
-        emit(dx::kSampleCLz, {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
+        emit(dx::kSampleCLz, {dxbc::temp_dst_mask(result, 0xF), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
                               dxbc::sampler_indexed(0, sampler_reg), address(0)});
       }
       results(result);
@@ -2779,7 +2779,7 @@ bool Translator::emit_image(const Instruction& inst) {
       if (!pixel) return fail("image_get_lod outside a pixel shader");
       const uint32_t coords = coordinates(0);
       const uint32_t result = fresh();
-      emit(dx::kLod, {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
+      emit(dx::kLod, {dxbc::temp_dst_mask(result, 0xF), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
                       dxbc::sampler_indexed(0, sampler_reg)});
       results(result);
       return true;
@@ -2788,7 +2788,7 @@ bool Translator::emit_image(const Instruction& inst) {
   }
   const uint32_t coords = coordinates(first);
   const uint32_t result = fresh();
-  std::vector<Operand> operands = {D(result), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
+  std::vector<Operand> operands = {dxbc::temp_dst_mask(result, 0xF), dxbc::temp_xyzw(coords), dxbc::texture_indexed(texture_id, index_reg),
                                    dxbc::sampler_indexed(0, sampler_reg)};
   if (opcode == dx::kSampleL) {
     // Explicit level: the last address (image_sample_l), the bias as a level

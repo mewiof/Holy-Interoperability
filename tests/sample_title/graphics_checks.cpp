@@ -145,5 +145,5 @@ void test_graphics() {
   reinterpret_cast<InfoFn>((*static_cast<void***>(device))[108])(&info, device, 1, 1, &buffer, &info1);
   check(info.SizeInBytes >= 100000 && info1.SizeInBytes == info.SizeInBytes,
         "GetResourceAllocationInfo1 reports sizes for each description and in total");
-  test_graphics_resources(device);
+  test_graphics_resources(device, queue);
 }

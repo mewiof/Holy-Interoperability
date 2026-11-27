@@ -132,9 +132,14 @@ Notes describe the platform, never a title.
 - *observed*: `HRESULT D3D12XboxCreateDevice(adapter, const parameters*, REFIID, void** device)` is called once,
   after the title has created its window, with a null adapter, a 0x40-byte parameter block starting with the
   version `0x20004`, and the device interface id `5405c344-d457-444e-b4dd-2366e45aee39`.
-- *observed*: methods that return a structure are called C-style: the result pointer is the first argument and
-  the object the second (device slot 26, called with node mask 1 and heap types 1-3, is the desktop
-  `GetCustomHeapProperties`). All other methods take the object first.
+- *observed*: methods that return a structure are called both ways: with the result pointer first and the
+  object second (device slot 26, called with node mask 1 and heap types 1-3, is the desktop
+  `GetCustomHeapProperties`), and with the object first and the result pointer second, the compiler's order for
+  member functions (`ID3D12Resource::GetDesc`, slot 10, from titles' C++ code). Implementation: such methods tell
+  the object from the result buffer by the object's identity (`lib::struct_return_arguments`). Taking one order
+  for the other made `GetDesc` copy the title's uninitialised result buffer over the resource object, which the
+  title then called through (a jump through garbage) and gave its unfilled description to device slot 70. All
+  other methods take the object first.
 - *observed*: the device's vtable follows the desktop `ID3D12Device` order only in places: slot 8
   `CreateCommandQueue` (desktop `D3D12_COMMAND_QUEUE_DESC`, desktop `ID3D12CommandQueue` id), 9
   `CreateCommandAllocator`, 26 `GetCustomHeapProperties`, 36 `CreateFence` (desktop `ID3D12Fence` id). Slot 48
@@ -220,9 +225,16 @@ Notes describe the platform, never a title.
   shaders with native code, and pipelines mixing native and desktop shaders, report themselves.
 - Implementation:
   - GPU addresses are title addresses, as on the console. Each piece of title memory resources are placed in
-    gets a host heap opened over the same memory (from the physical-page section, or from the committed
-    address) and a buffer spanning it; title GPU addresses translate into it, placed buffers are placed in it,
-    and a placed buffer's `Map` yields the title's memory.
+    gets a host heap opened over the same memory (over a view of the physical-page section kept for the heap,
+    or over the committed address) and a buffer spanning it; title GPU addresses translate into it, placed
+    buffers are placed in it, and a placed buffer's `Map` yields the title's memory.
+  - *measured* host behaviour (development host): a heap opened from a section handle
+    (`OpenExistingHeapFromFileMapping`) leaves the whole section's commit charged to the system after the
+    process ends, whether the heap was released or not (1 GiB a section here; only a restart of the host gives
+    it back); a heap opened over a mapped view of the same section (`OpenExistingHeapFromAddress`) does not.
+    The project only opens heaps over addresses.
+  - Committed textures report the memory the runtime took for them (`XMemAlloc`, as on the console) as their
+    GPU address, and views the title makes at that address find the committed texture.
   - *observed*: titles commit stretches of a reservation and leave the rest reserved. *observed* host
     behaviour: `OpenExistingHeapFromAddress` refuses an allocation that is not committed throughout, while
     `OpenExistingHeapFromAddress1` (`ID3D12Device13`) opens a heap over a committed stretch given with its size;

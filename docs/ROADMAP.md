@@ -103,8 +103,11 @@ The largest piece.
 - next: amplification and mesh pipelines in pipeline streams; ray intersection image instructions
   (`image_bvh_intersect_ray`) in compute programs; NGG pipelines with indexed draws; integer views of images for
   plain loads and stores (they are declared as float).
-- next: a crash of the reference title a minute or two in, in its own code (a texture record whose resource
-  pointer points into a stack); textures streamed into scattered pool pages are copied through the CPU.
+- done: the crash of the reference title some seconds after its first frame (a resource whose `GetDesc` was
+  called in the other argument order, which overwrote the resource object); host heaps over physical pages no
+  longer leak system commit after the process ends.
+- next: the reference title stops at a breakpoint in its own code about 18 seconds in (cause open).
+- next: textures streamed into scattered pool pages are copied through the CPU.
 - open: textures the GPU writes in title memory as seen by the CPU.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed
   resources at title-chosen addresses, console-specific command list and descriptor behaviour.

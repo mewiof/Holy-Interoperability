@@ -57,6 +57,17 @@ commit and working set, the system's commit, and named counters with their chang
 that only grows while the title does the same thing over and over is a leak. `--profile` adds where the
 title's threads spend their time.
 
+Debugging aids, set in the environment:
+
+| Variable | Effect |
+| --- | --- |
+| `HOLY_DUMP_TARGETS=<n>` | at present `n`, every live texture of the title is written to `<data>/frames/textures-<n>/` and its per-channel minimum and maximum logged |
+| `HOLY_WATCH=at=<offset>;if=<reg>+<off>:<value>;watch=<reg>+<off>` | hardware watchpoints: when the title executes `title+<offset>` (and the 32-bit value at `<reg>+<off>` matches), writes to the 8 bytes at the `watch` address (`*<reg>+<off>`: at the address stored there) are logged with their stacks, in every thread, for the three latest such addresses |
+
+In exploration mode (`--unimplemented continue`), a pipeline whose creation reports itself as unimplemented is
+handed out as a placeholder whose draws are dropped (counted as `d3d12.placeholder_pipelines`), so the title's
+later calls show.
+
 Exit codes: `0` the title exited with 0; `1` the title exited with a failure code; `2` usage error; `3` the
 title could not be started; `4` stopped by `--timeout`; `5` the title called an unimplemented import.
 

@@ -153,3 +153,14 @@ for finding out what a title asks for. Whatever happens after the first such cal
 
 Tracing only ever wraps imported functions (data imports are left alone), so any library can be named, but
 tracing everything (`*`) is slow and noisy.
+
+### Translating shaders offline
+
+```sh
+holy_translate_corpus <data>/shaders [--threads N] [--report <file>]
+```
+
+The runtime saves the shaders a title passes to pipeline creation in its data directory (`shaders/`). This
+tool translates every one of them the way the runtime does, on all processors, and reports how many translate
+for each kind of program, the failures grouped by reason, and the translation time: a way to find gaps in
+the translator without running the title. It only reads the directory; keep any report outside the repository.

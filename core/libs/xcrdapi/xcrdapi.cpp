@@ -210,18 +210,19 @@ constexpr uint64_t kSourceMemory = 1ull << 22;
 constexpr uint64_t kCompressed = 1ull;
 
 HRESULT read_into(File* file, uint64_t offset, void* destination, uint32_t size) {
+  // One event per thread, reused (requests come by the thousand).
+  thread_local HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   OVERLAPPED overlapped{};
   overlapped.Offset = static_cast<DWORD>(offset);
   overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
-  overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  overlapped.hEvent = event;
+  ResetEvent(event);
   HolyEnsureCommitted(destination, size);
   DWORD got = 0;
   BOOL ok = ReadFile(file->handle, destination, size, nullptr, &overlapped);
   if (!ok && GetLastError() == ERROR_IO_PENDING) ok = TRUE;
   if (ok) ok = GetOverlappedResult(file->handle, &overlapped, &got, TRUE);
-  const DWORD error = GetLastError();
-  CloseHandle(overlapped.hEvent);
-  if (!ok) return HRESULT_FROM_WIN32(error);
+  if (!ok) return HRESULT_FROM_WIN32(GetLastError());
   return got == size ? S_OK : HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
 }
 
@@ -268,24 +269,28 @@ HRESULT enqueue_request_body(const uint8_t* request) {
           reinterpret_cast<void*>(source), static_cast<unsigned long long>(offset), source_size);
   if (!destination || !source) return E_INVALIDARG;
   if (options & kCompressed) {
-    // Observed: the streams are zlib (RFC 1950) streams.
-    std::vector<uint8_t> packed(source_size);
+    // Observed: the streams are zlib (RFC 1950) streams, inflated straight
+    // into the destination.
+    thread_local std::vector<uint8_t> packed;
+    const uint8_t* stream = reinterpret_cast<const uint8_t*>(source + offset);
     HRESULT hr = S_OK;
-    if (options & kSourceMemory) {
-      std::memcpy(packed.data(), reinterpret_cast<const void*>(source + offset), source_size);
-    } else {
+    if (!(options & kSourceMemory)) {
+      if (packed.size() < source_size) packed.resize(source_size);
       hr = read_into(reinterpret_cast<File*>(source), offset, packed.data(), source_size);
+      stream = packed.data();
     }
-    std::vector<uint8_t> unpacked;
-    if (SUCCEEDED(hr) && !holy::lib::zlib_inflate(packed.data(), packed.size(), &unpacked, destination_size)) {
-      hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    if (SUCCEEDED(hr)) {
+      HolyEnsureCommitted(reinterpret_cast<void*>(destination), destination_size);
+      size_t produced = 0;
+      if (!holy::lib::zlib_inflate_into(stream, source_size, reinterpret_cast<uint8_t*>(destination), destination_size,
+                                        &produced)) {
+        hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+      }
     }
     if (FAILED(hr)) {
       LIB_LOG(holy::lib::kError, "dstorage", "compressed request failed (0x%08lX)", static_cast<unsigned long>(hr));
       return hr;
     }
-    HolyEnsureCommitted(reinterpret_cast<void*>(destination), unpacked.size());
-    std::memcpy(reinterpret_cast<void*>(destination), unpacked.data(), unpacked.size());
     return S_OK;
   }
   if (options & kSourceMemory) {

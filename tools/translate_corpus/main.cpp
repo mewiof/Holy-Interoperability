@@ -12,9 +12,9 @@
 // lists its instructions as the translator decodes them (operand codes as in
 // shader/rdna.h); --translate writes one shader's host container. --compile
 // also compiles each compute translation into a host pipeline and reports the
-// host compiler's time by translation size (the host's shader caches are
-// switched off when it allows that, developer mode; else repeated runs
-// measure cache hits, and the report says so).
+// host compiler's time by translation size (each program gets a store of a
+// unique value, so the host's shader caches, which key on the code, do not
+// answer).
 //
 //   holy_translate_corpus <directory> [--threads N] [--report <file>] [--compile]
 //   holy_translate_corpus --extract <shader file> <code file>
@@ -126,7 +126,62 @@ bool open_host(Host* host) {
   return SUCCEEDED(hr);
 }
 
-void compile_one(const Host& host, const std::vector<uint8_t>& bytecode, Result* r) {
+// The container with a store of `nonce` before the program's final ret:
+// program code the host's shader caches have not seen (they key on the code
+// as optimised: a dead instruction would not do), so compile times are of
+// compiling even with the caches on.
+std::vector<uint8_t> with_nonce(const std::vector<uint8_t>& container, uint64_t nonce) {
+  auto read32 = [&](const std::vector<uint8_t>& b, size_t at) {
+    uint32_t v;
+    std::memcpy(&v, b.data() + at, 4);
+    return v;
+  };
+  if (container.size() < 32) return container;
+  const uint32_t count = read32(container, 28);
+  if (32 + 4ull * count > container.size()) return container;
+  std::vector<std::pair<uint32_t, std::vector<uint8_t>>> parts;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t at = read32(container, 32 + 4 * i);
+    if (at + 8ull > container.size()) return container;
+    const uint32_t fourcc = read32(container, at), size = read32(container, at + 4);
+    if (at + 8ull + size > container.size()) return container;
+    parts.emplace_back(fourcc, std::vector<uint8_t>(container.begin() + at + 8, container.begin() + at + 8 + size));
+  }
+  bool changed = false;
+  for (auto& [fourcc, data] : parts) {
+    if (fourcc != 0x58454853u /* SHEX */ || data.size() < 12) continue;
+    const uint32_t ret = 0x0100003Eu;
+    if (read32(data, data.size() - 4) != ret) return container;
+    // store_raw u0[0].x, l(0), l(nonce): kept by the compiler (a store), and
+    // the program is compiled, never run.
+    const uint32_t code[8] = {0x080000A6u, 0x0021E012u, 0u, 0u, 0x00004001u, 0u, 0x00004001u,
+                              static_cast<uint32_t>(nonce ^ (nonce >> 32))};
+    const auto* bytes = reinterpret_cast<const uint8_t*>(code);
+    data.insert(data.end() - 4, bytes, bytes + sizeof(code));
+    const uint32_t length = read32(data, 4) + 8;
+    std::memcpy(data.data() + 4, &length, 4);
+    changed = true;
+  }
+  if (!changed) return container;
+  std::vector<uint8_t> out(container.begin(), container.begin() + 32 + 4 * count);
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t at = static_cast<uint32_t>(out.size());
+    std::memcpy(out.data() + 32 + 4 * i, &at, 4);
+    const uint32_t header[2] = {parts[i].first, static_cast<uint32_t>(parts[i].second.size())};
+    const auto* h = reinterpret_cast<const uint8_t*>(header);
+    out.insert(out.end(), h, h + 8);
+    out.insert(out.end(), parts[i].second.begin(), parts[i].second.end());
+  }
+  const uint32_t total = static_cast<uint32_t>(out.size());
+  std::memcpy(out.data() + 24, &total, 4);
+  dxbc_checksum(out.data(), out.size(), out.data() + 4);
+  return out;
+}
+
+void compile_one(const Host& host, const std::vector<uint8_t>& translated, Result* r) {
+  static const uint64_t run = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+  static std::atomic<uint64_t> serial{0};
+  const std::vector<uint8_t> bytecode = with_nonce(translated, run ^ (serial.fetch_add(1) << 40));
   D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
   desc.pRootSignature = host.root;
   desc.CS = {bytecode.data(), bytecode.size()};
@@ -385,8 +440,9 @@ int wmain(int argc, wchar_t** argv) {
       bytes[b] += static_cast<double>(r.bytes_out);
       total += r.compile_ms;
     }
-    std::printf("host compiler (shader caches %s): %.1f s over the compute translations, %zu refused\n",
-                host.caches_off ? "off" : "ON: times may be cache hits", total / 1000, refused);
+    std::printf("host compiler (shader caches %s; each program made unique): %.1f s over the compute "
+                "translations, %zu refused\n",
+                host.caches_off ? "off" : "on", total / 1000, refused);
     for (int b = 0; b < 5; ++b) {
       if (!counts[b]) continue;
       std::printf("  %-14s %6zu programs, %8.1f ms each, %6.1f ms per MiB\n", kNames[b], counts[b],

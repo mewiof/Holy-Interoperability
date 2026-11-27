@@ -693,6 +693,10 @@ Notes describe the platform, never a title.
   compiler) (4); `image_get_lod` in compute programs (65; partial: level 0, the level implicit samples take
   outside pixel shaders, where the console derives it from quads of lanes). Translation takes 93 ms a program on
   average (the slowest 8.8 s) and writes about 1 MB of host bytecode for each.
+- *measured* (development host): the host driver's shader cache keys on the program code as optimised, not on
+  the container: a container with an extra private part, or with a dead instruction added, is answered from the
+  cache (a tenth of the compile time); a program with one more store is compiled. Compile-time measurements
+  therefore add a store of a unique value to each program (`holy_translate_corpus --compile`).
 - *measured* (`holy_translate_corpus --compile`, 60 compute programs of the reference title, development host):
   the host's shader compiler takes 2.4-2.7 s per MiB of host bytecode for programs under 64 KiB and 6.2-6.9 s per
   MiB from 256 KiB up, so the size of what the translator writes is first-run time (hundreds of milliseconds to
@@ -709,7 +713,9 @@ Notes describe the platform, never a title.
   instead of 16 (bit field inserts and a multiply-add); results computed into a scratch temp and then moved fold
   into the computation where the temp is not read afterwards (a liveness pass over each block's ifs and elses;
   scratch temps live within one instruction's code): over all 19,305 saved programs 11,425 MiB became 10,469 MiB,
-  for 15-30% more translation time (translation is about a hundredth of the host compiler's time). Where EXEC is known to be on (from the
+  for 15-30% more translation time (translation is about a hundredth of the host compiler's time). The 60
+  programs now compile in 56 s (measured without cache answers); treating every vector load as aligned would
+  save 5% more (53 s), not enough to drop unaligned reads, which 16-bit loads can make legitimately. Where EXEC is known to be on (from the
   program's start, after an `s_cbranch_execz` not taken in a block nothing branches to, after EXEC is set to a
   constant with the lane's bit or or-ed while on, or restored from a mask an `s_*_saveexec` saved while it was
   on) results are written without the lane test: 2.7% less host bytecode over the saved programs, and in the

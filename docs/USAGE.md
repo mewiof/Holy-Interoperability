@@ -166,5 +166,6 @@ tool translates every one of them the way the runtime does, on all processors, a
 for each kind of program, the failures grouped by reason, and the translation time: a way to find gaps in
 the translator without running the title. It only reads the directory; keep any report outside the repository.
 `--compile` also compiles each compute translation with the host's shader compiler and reports its time by
-translation size (switch off the host's shader caches, which needs developer mode, or repeated runs measure
-cache hits; the report says which). `--translate` writes one shader's host container, for `fxc -dumpbin`.
+translation size; each program gets a store of a unique value first, so the host's shader caches (which key on
+the code as optimised, not on the container) never answer and repeated runs measure the same. `--translate`
+writes one shader's host container, for `fxc -dumpbin`.

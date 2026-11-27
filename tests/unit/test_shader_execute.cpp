@@ -654,6 +654,42 @@ TEST(scalar_loads_ignore_the_low_address_bits) {
   EXPECT(after[33] == 0x1002);
 }
 
+// Buffer accesses past the descriptor's records (documented): loads read
+// zero, stores are dropped.
+TEST(buffer_accesses_past_the_records_read_zero_and_write_nothing) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  // buffer_load_dword v0, off, s[0:3], 0 offset:32 (past 16 bytes);
+  // buffer_load_dword v1, off, s[0:3], 0 offset:4; s_waitcnt vmcnt(0);
+  // buffer_store_dword v1, off, s[0:3], 0 offset:20 (past);
+  // buffer_store_dwordx2 v[0:1], off, s[4:7], 0 offset:192; s_endpgm.
+  const std::vector<uint32_t> program = {0xE0300020u, 0x80000000u, 0xE0300004u, 0x80000100u, 0xBF8C3F70u,
+                                         0xE0700014u, 0x80000100u, 0xE07400C0u, 0x80010000u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  info.user_sgprs = 8;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(gpu.set_constants({0, 1, 16, 0, 0, 1, 256, 0}, true));
+  std::vector<uint32_t> contents(64);
+  for (uint32_t i = 0; i < 64; ++i) contents[i] = 0x1000 + i;
+  const std::vector<uint32_t> after = gpu.dispatch(cs, contents);
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  EXPECT(after[48] == 0);
+  EXPECT(after[49] == 0x1001);
+  EXPECT(after[5] == 0x1005);
+}
+
 // Control flow (the linear layout): nested loops closed by backward
 // branches, a branch forward out of both, uniform scalar counters.
 TEST(nested_loops_and_a_branch_out_of_both_run_as_written) {

@@ -47,7 +47,6 @@ constexpr uint32_t kEndBlock = 0xFFFFFFFFu;  // "next block" once the program ha
 constexpr uint16_t kExchangeOperand = 0x200;
 // Operand code standing for a DPP instruction's source 1 with its modifiers.
 constexpr uint16_t kModifiedOperand = 0x201;
-constexpr uint32_t kNoView = 0xFFFFFFFFu;
 // Program data reached through s_getpc_b64 (tables after the code): the
 // program's bytes appear at this address (above any title memory, inside the
 // 48 bits a buffer descriptor holds), read through kCodeView.
@@ -1851,7 +1850,8 @@ bool Translator::emit_mubuf(const Instruction& inst) {
   const auto location = find(lo, hi, writes);
   const uint32_t at = location.second;
   const uint32_t view = fresh();
-  put_select(view, inside, R(location.first), I(kNoView));
+  // Outside the records: view 0, the null view (reads zero, drops writes).
+  put_select(view, inside, R(location.first), I(0));
   auto load = [&](int count) {
     read_dwords([&](int k) { return vreg(data + static_cast<uint32_t>(k)); }, count, view, at, 0);
   };

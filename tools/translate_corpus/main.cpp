@@ -6,9 +6,14 @@
 // translated as a compute program of 64 threads (pipelines from native code
 // give the size apart; it is not saved), so blocks that are not code show as
 // failures of raw compute programs. It reads the directory only; with
-// --report it writes one line per file to the given path.
+// --report it writes one line per file to the given path. --extract writes
+// one shader's native code (for a disassembler) to the given path; --decode
+// lists its instructions as the translator decodes them (operand codes as in
+// shader/rdna.h).
 //
 //   holy_translate_corpus <directory> [--threads N] [--report <file>]
+//   holy_translate_corpus --extract <shader file> <code file>
+//   holy_translate_corpus --decode <shader file>
 #include <windows.h>
 
 #include <algorithm>
@@ -22,6 +27,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/libs/d3d12_xs/shader/rdna.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/d3d12_xs/shader_container.h"
 
@@ -133,7 +139,49 @@ std::string reason(const std::string& error) {
 
 }  // namespace
 
+// The native code of a shader file: a container's, or the file as it is.
+bool native_code(const std::wstring& in, std::vector<uint8_t>* code) {
+  std::vector<uint8_t> blob;
+  if (!read_file(in, &blob)) return false;
+  std::vector<uint8_t> rebuilt;
+  if (rebuild_desktop_container(blob.data(), blob.size(), rebuilt) != ShaderFormat::NativeOnly) {
+    *code = std::move(blob);
+    return true;
+  }
+  NativeProgram program;
+  if (!native_program(blob.data(), blob.size(), &program)) return false;
+  code->assign(program.block.begin() + static_cast<std::ptrdiff_t>(program.code_offset), program.block.end());
+  return true;
+}
+
+int decode_listing(const std::wstring& in) {
+  std::vector<uint8_t> code;
+  if (!native_code(in, &code)) return 1;
+  rdna::Instruction inst;
+  for (uint32_t pc = 0; rdna::decode(code.data(), code.size(), pc, &inst); pc += 4 * inst.words) {
+    std::printf("%5x  %-28s dst %3u  src %3u %3u %3u %3u  imm %d  raw %08x %08x\n", pc, rdna::mnemonic(inst).c_str(),
+                inst.dst, inst.src[0], inst.src[1], inst.src[2], inst.src[3], inst.imm, inst.raw[0], inst.raw[1]);
+    if (inst.encoding == rdna::Encoding::Unknown) break;
+  }
+  return 0;
+}
+
+// Writes the native code of a shader file to `out`.
+int extract(const std::wstring& in, const std::wstring& out) {
+  std::vector<uint8_t> bytes;
+  if (!native_code(in, &bytes)) return 1;
+  const uint8_t* code = bytes.data();
+  const size_t size = bytes.size();
+  FILE* file = _wfopen(out.c_str(), L"wb");
+  if (!file) return 1;
+  std::fwrite(code, 1, size, file);
+  std::fclose(file);
+  return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
+  if (argc == 4 && !std::wcscmp(argv[1], L"--extract")) return extract(argv[2], argv[3]);
+  if (argc == 3 && !std::wcscmp(argv[1], L"--decode")) return decode_listing(argv[2]);
   if (argc < 2) {
     std::fprintf(stderr, "usage: holy_translate_corpus <directory> [--threads N] [--report <file>]\n");
     return 2;

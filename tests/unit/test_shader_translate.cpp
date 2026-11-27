@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -188,6 +189,26 @@ TEST(translated_program_is_valid_bytecode) {
   // Blocks at 0, 12 and 16, selected by comparisons on the next block.
   EXPECT(text.find("loop") != std::string::npos);
   EXPECT(text.find("l(16)") != std::string::npos);
+}
+
+TEST(ngg_vertex_groups_come_from_either_shift_of_the_vertex_id) {
+  // v_lshrrev_b32 v1, 7, v5; exp prim v0 done; exp pos0 v0..v3 done; s_endpgm.
+  const std::vector<uint8_t> vector_form =
+      words({0x2C020A87u, 0xF8000941u, 0x00000000u, 0xF80008CFu, 0x03020100u, 0xBF810000u});
+  // v_readfirstlane_b32 s2, v5; s_lshr_b32 s2, s2, 7; the same exports.
+  const std::vector<uint8_t> scalar_form =
+      words({0x7E040505u, 0x90028702u, 0xF8000941u, 0x00000000u, 0xF80008CFu, 0x03020100u, 0xBF810000u});
+  for (const std::vector<uint8_t>* code : {&vector_form, &scalar_form}) {
+    EXPECT(native_ngg_program(code->data(), code->size()));
+    std::vector<uint8_t> cs;
+    ShaderInterface link;
+    NggInfo info;
+    std::string error;
+    EXPECT(translate_ngg(code->data(), code->size(), &cs, &link, &info, &error));
+    EXPECT(error.empty());
+    EXPECT(info.group == 128);
+    EXPECT(disassemble(cs).find("dcl_thread_group 128, 1, 1") != std::string::npos);
+  }
 }
 
 TEST(translated_graphics_stages_link) {

@@ -618,15 +618,25 @@ class Translator {
   }
 
   // NGG programs (see translate_ngg): the group size from the program's
-  // v_lshrrev_b32 vN, k, v5 (the group of a vertex id), and the vertex
-  // record from the parameters it exports.
+  // v_lshrrev_b32 vN, k, v5 (the group of a vertex id), or the same as
+  // v_readfirstlane_b32 sN, v5 then s_lshr_b32 sM, sN, k (observed: a third
+  // of a title's NGG programs, k 7), and the vertex record from the
+  // parameters it exports.
   bool ngg_scan() {
     uint32_t shift = 0;
     int max_param = -1;
+    uint64_t first_lane_ids[2] = {};  // SGPRs a v_readfirstlane_b32 of v5 wrote
     for (const Instruction& inst : program_) {
       if (inst.encoding == Encoding::VOP2 && inst.op == 22 && inst.src[1] == rdna::kVgpr0 + 5 &&
           inst.src[0] >= 129 && inst.src[0] <= 136) {
         shift = inst.src[0] - 128;  // inline constants 1-8
+      }
+      if (inst.encoding == Encoding::VOP1 && inst.op == 2 && inst.src[0] == rdna::kVgpr0 + 5 && inst.dst < 106) {
+        first_lane_ids[inst.dst / 64] |= 1ull << (inst.dst % 64);
+      }
+      if (inst.encoding == Encoding::SOP2 && inst.op == 32 && inst.src[0] < 106 &&
+          (first_lane_ids[inst.src[0] / 64] >> (inst.src[0] % 64) & 1) && inst.src[1] >= 129 && inst.src[1] <= 136) {
+        shift = inst.src[1] - 128;
       }
       if (inst.encoding == Encoding::EXP && inst.target >= 32 && inst.target < 64) {
         max_param = std::max(max_param, static_cast<int>(inst.target) - 32);

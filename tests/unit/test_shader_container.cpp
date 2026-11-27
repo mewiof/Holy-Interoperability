@@ -205,6 +205,17 @@ TEST(native_graphics_description_with_sparse_stage_slots) {
   EXPECT(out.render_targets == 0);
   EXPECT(out.target_mask == 0xF);
   EXPECT(out.topology_type == 3);
+  // The targets are the formats listed in bytes 16-23, whatever dword 3 says
+  // (observed 0 and 1 with any number of formats).
+  pipeline[3] = 0;
+  pipeline[4] = 28;  // one target: R8G8B8A8_UNORM
+  EXPECT(native_graphics_description(desc, &out, &error));
+  EXPECT(out.render_targets == 1 && out.formats[0] == 28);
+  pipeline[3] = 1;
+  pipeline[4] = 0x1C1C1C1Du;  // six targets
+  pipeline[5] = 0x00001C22u;
+  EXPECT(native_graphics_description(desc, &out, &error));
+  EXPECT(out.render_targets == 6 && out.formats[0] == 0x1D && out.formats[4] == 0x22 && out.formats[5] == 0x1C);
   // A state block shorter than the dwords read is refused.
   desc[2] = 0xEC;
   EXPECT(!native_graphics_description(desc, &out, &error));

@@ -431,22 +431,17 @@ bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription
     *error = "no vertex stage";
     return false;
   }
-  // Bytes 16-23: one DXGI format per render target (titles leave values in
-  // the bytes past the target count).
+  // Bytes 16-23: one DXGI format per render target from target 0 on, the
+  // list ended by a zero byte (or the eighth format). Observed, in all of a
+  // title's 11,233 pipelines: the formats are contiguous and followed by
+  // zeros, and dword 3 is 0 or 1 whatever their number (0 with one to six
+  // formats, 1 with none to six; 0x10f and 0x15f seen elsewhere with six): it
+  // is not the count (its meaning is not established). Read as a count, it
+  // left a quarter of those pipelines with no target or only the first.
   const auto* format_bytes = reinterpret_cast<const uint8_t*>(pipeline + 4);
-  out->render_targets = pipeline[3];
-  if (out->render_targets > 8) {
-    // Observed: 0x10f and 0x15f here, with six formats in bytes 16-21, in
-    // pipelines that otherwise look alike; not a count (*assumed*: the
-    // targets are the leading formats; the field's meaning is not
-    // established).
-    out->render_targets = 0;
-    while (out->render_targets < 8 && format_bytes[out->render_targets]) ++out->render_targets;
-  }
+  out->render_targets = 0;
+  while (out->render_targets < 8 && format_bytes[out->render_targets]) ++out->render_targets;
   for (uint32_t i = 0; i < out->render_targets; ++i) out->formats[i] = format_bytes[i];
-  // Observed: a pipeline without a pixel program counts one target whose
-  // format is 0 (DXGI_FORMAT_UNKNOWN); such targets are not written.
-  while (out->render_targets && !out->formats[out->render_targets - 1]) --out->render_targets;
   if (pipeline[6]) {
     char text[64];
     std::snprintf(text, sizeof(text), "a depth format (assumed in dword 6: 0x%x)", pipeline[6]);

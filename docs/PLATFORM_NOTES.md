@@ -351,6 +351,9 @@ Notes describe the platform, never a title.
 
 ### Resources
 
+- *observed*: in the pipeline block of a native graphics pipeline description, bytes 16-23 list one DXGI format per
+  render target from target 0 on, ended by a zero byte; in all 11,233 pipelines a title created, the list was
+  contiguous, and dword 3 was 0 or 1 whatever its length (not the target count; meaning not established).
 - *observed*: device slot 108 is `GetResourceAllocationInfo1`; titles retry without a small alignment when the
   alignment returned differs and treat sizes of 4 GiB or more as fatal.
 - *observed*: titles set texture layout 0x105 on 3D textures (a console swizzle mode, *assumed*); console layouts

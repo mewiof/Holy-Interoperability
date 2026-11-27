@@ -229,6 +229,12 @@ class Program {
 
   // Appends `other`'s instructions (no version/length header).
   void append(const Program& other);
+  // Folds "op rT.x, ...; mov rX.x, rT.x" into "op rX.x, ..." where rT is a
+  // temp from `first_scratch` up whose x nothing reads after the move
+  // (liveness over ifs and elses; temps from `first_scratch` are dead at the
+  // end; a program with declarations, loops, switches or returns is left as
+  // it is). Returns the number of moves folded.
+  size_t fold_moves(uint32_t first_scratch);
   size_t size() const { return tokens_.size(); }
 
   // The complete DXBC container (input/output signatures, SHEX, checksum;

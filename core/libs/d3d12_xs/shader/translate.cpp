@@ -4401,6 +4401,9 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   }
   blocks.back().second = std::move(p_);
   p_ = dxbc::Program();
+  // Scratch temps live within one instruction's code: moves of results
+  // computed into them fold into the computations.
+  for (auto& block : blocks) block.second.fold_moves(kScratch);
   dxbc::Program body;
   const bool linear = linear_layout(blocks, barrier_after, body);
   std::function<void(size_t, size_t)> tree = [&](size_t first, size_t last) {

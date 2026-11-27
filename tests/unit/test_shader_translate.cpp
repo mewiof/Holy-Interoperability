@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "core/libs/inflate.h"
+#include "core/libs/d3d12_xs/shader/dxbc.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/d3d12_xs/shader_container.h"
 #include "tests/unit/test.h"
@@ -166,6 +167,59 @@ TEST(native_compute_program_is_found) {
   container[container.size() - dxil.size() + 32] = 0x12;  // stream header byte
   NativeComputeProgram none;
   EXPECT(!native_compute_program(container.data(), container.size(), &none));
+}
+
+// Moves of results computed into scratch temps fold into the computation
+// when the temp is not read afterwards (dxbc::Program::fold_moves).
+TEST(moves_fold_into_computations_of_dead_temps) {
+  using namespace dxbc;
+  auto same = [](const Program& a, const Program& b) { return a.container() == b.container(); };
+  {
+    Program p;
+    p.emit(kIadd, {temp_dst(116), temp(1), imm(1)});
+    p.emit(kMov, {temp_dst(5), temp(116)});
+    Program expected;
+    expected.emit(kIadd, {temp_dst(5), temp(1), imm(1)});
+    EXPECT(p.fold_moves(116) == 1);
+    EXPECT(same(p, expected));
+  }
+  {
+    // The temp is read after the move: kept.
+    Program p;
+    p.emit(kIadd, {temp_dst(116), temp(1), imm(1)});
+    p.emit(kMov, {temp_dst(5), temp(116)});
+    p.emit(kIadd, {temp_dst(6), temp(116), imm(2)});
+    EXPECT(p.fold_moves(116) == 0);
+  }
+  {
+    // Written again before it is read: folded.
+    Program p;
+    p.emit(kIadd, {temp_dst(116), temp(1), imm(1)});
+    p.emit(kMov, {temp_dst(5), temp(116)});
+    p.emit(kMov, {temp_dst(116), imm(7)});
+    p.emit(kIadd, {temp_dst(6), temp(116), imm(2)});
+    EXPECT(p.fold_moves(116) == 1);
+  }
+  {
+    // A write in the other branch of an if around the move does not count:
+    // after the endif the then branch's value is read.
+    Program p;
+    p.emit(kIf, {temp(2)}, kTestNonZero);
+    p.emit(kIadd, {temp_dst(116), temp(1), imm(1)});
+    p.emit(kMov, {temp_dst(5), temp(116)});
+    p.emit(kElse);
+    p.emit(kMov, {temp_dst(116), imm(0)});
+    p.emit(kEndif);
+    p.emit(kIadd, {temp_dst(6), temp(116), imm(2)});
+    EXPECT(p.fold_moves(116) == 0);
+  }
+  {
+    // Temps below the scratch range are never folded (they hold registers).
+    Program p;
+    p.emit(kIadd, {temp_dst(50), temp(1), imm(1)});
+    p.emit(kMov, {temp_dst(5), temp(50)});
+    EXPECT(p.fold_moves(116) == 0);
+  }
 }
 
 TEST(translated_program_is_valid_bytecode) {

@@ -705,7 +705,11 @@ Notes describe the platform, never a title.
   reads zero and drops writes); the page lookup has no branches (a table of zeros, "table 0", for windows
   without a table and addresses from 2^47), and tests for cached pages only when the page cache runs; buffer
   formats come from a table in the immediate constant buffer instead of a 128-case switch at every typed access;
-  the container checksum is computed with the MD5 rounds written out. Where EXEC is known to be on (from the
+  the container checksum is computed with the MD5 rounds written out. Since: the page lookup in 12 instructions
+  instead of 16 (bit field inserts and a multiply-add); results computed into a scratch temp and then moved fold
+  into the computation where the temp is not read afterwards (a liveness pass over each block's ifs and elses;
+  scratch temps live within one instruction's code): over all 19,305 saved programs 11,425 MiB became 10,469 MiB,
+  for 15-30% more translation time (translation is about a hundredth of the host compiler's time). Where EXEC is known to be on (from the
   program's start, after an `s_cbranch_execz` not taken in a block nothing branches to, after EXEC is set to a
   constant with the lane's bit or or-ed while on, or restored from a mask an `s_*_saveexec` saved while it was
   on) results are written without the lane test: 2.7% less host bytecode over the saved programs, and in the

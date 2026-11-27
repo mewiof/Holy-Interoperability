@@ -156,6 +156,235 @@ void Program::emit(uint32_t opcode, const Operand* operands, size_t count, uint3
   for (size_t i = 0; i < count; ++i) tokens_.insert(tokens_.end(), operands[i].begin(), operands[i].end());
 }
 
+namespace {
+
+// An operand as fold_moves sees it.
+struct ParsedOperand {
+  uint32_t index_token;  // the first index's token (temps: the register number)
+  uint8_t type;
+  uint8_t mode;  // selection mode (four components): 0 mask, 1 swizzle, 2 select
+  uint8_t components;
+  uint8_t bits;  // the mask, swizzle or selected component (bits 11-4)
+  uint8_t dims;
+  bool simple;      // one immediate index, no extended token, no relative index
+  bool many_reads;  // more relative reads than `reads` holds: treated as reading every temp
+  uint8_t read_count;
+  uint32_t reads[2];  // temps read through relative indices
+  void add_read(uint32_t reg) {
+    if (read_count < 2) reads[read_count++] = reg;
+    else many_reads = true;
+  }
+};
+
+// Parses the operand at tokens[at]; returns the position after it.
+size_t parse_operand(const std::vector<uint32_t>& tokens, size_t at, size_t end, ParsedOperand* out) {
+  *out = ParsedOperand{};
+  if (at >= end) return end;
+  const uint32_t token = tokens[at];
+  out->components = static_cast<uint8_t>(token & 3);
+  out->mode = static_cast<uint8_t>((token >> 2) & 3);
+  out->bits = static_cast<uint8_t>((token >> 4) & 0xFF);
+  out->type = static_cast<uint8_t>((token >> 12) & 0xFF);
+  out->dims = static_cast<uint8_t>((token >> 20) & 3);
+  bool extended = (token >> 31) & 1;
+  out->simple = !extended;
+  size_t pos = at + 1;
+  while (extended && pos < end) extended = (tokens[pos++] >> 31) & 1;
+  if (out->type == kImmediate32 || out->type == 5) {  // immediates: values follow
+    const size_t count = out->components == 2 ? 4 : 1;
+    return pos + (out->type == 5 ? 2 * count : count);
+  }
+  for (uint32_t d = 0; d < out->dims && pos <= end; ++d) {
+    const uint32_t representation = (token >> (22 + 3 * d)) & 7;
+    if (d == 0) out->index_token = static_cast<uint32_t>(pos);
+    if (representation == 0 || representation == 3) pos += 1;
+    if (representation == 1 || representation == 4) pos += 2;
+    if (representation >= 2) {
+      out->simple = false;
+      ParsedOperand nested;
+      pos = parse_operand(tokens, pos, end, &nested);
+      if (nested.type == kTemp && nested.dims == 1) out->add_read(tokens[nested.index_token]);
+      for (uint32_t r = 0; r < nested.read_count; ++r) out->add_read(nested.reads[r]);
+      out->many_reads = out->many_reads || nested.many_reads;
+    }
+  }
+  if (out->dims != 1) out->simple = false;
+  return pos;
+}
+
+struct ParsedInstruction {
+  uint32_t start, length;
+  uint16_t opcode, controls;
+  uint32_t count;  // operands parsed; more than 8 make the program left as it is
+  ParsedOperand operands[8];
+};
+
+}  // namespace
+
+size_t Program::fold_moves(uint32_t first_scratch) {
+  std::vector<ParsedInstruction> code;
+  code.reserve(tokens_.size() / 4);
+  for (size_t at = 2; at < tokens_.size();) {  // after the version and length tokens
+    ParsedInstruction& inst = code.emplace_back();
+    inst.start = static_cast<uint32_t>(at);
+    const uint32_t token = tokens_[at];
+    inst.opcode = static_cast<uint16_t>(token & 0x7FF);
+    inst.controls = static_cast<uint16_t>((token >> 11) & 0x1FFF);
+    inst.length = (token >> 24) & 0x7F;
+    inst.count = 0;
+    if (inst.opcode == 53) return 0;  // declarations' data: not instructions only
+    if (inst.length == 0 || at + inst.length > tokens_.size()) return 0;
+    size_t pos = at + 1;
+    for (bool extended = (token >> 31) & 1; extended && pos < at + inst.length;) {
+      extended = (tokens_[pos++] >> 31) & 1;
+    }
+    while (pos < at + inst.length) {
+      if (inst.count == 8) return 0;
+      pos = parse_operand(tokens_, pos, at + inst.length, &inst.operands[inst.count++]);
+    }
+    at += inst.length;
+  }
+  auto is_temp_x_dst = [](const ParsedOperand& o) {
+    return o.type == kTemp && o.components == 2 && o.mode == 0 && o.bits == 1 && o.simple;
+  };
+  auto is_temp_x_src = [](const ParsedOperand& o) {
+    return o.type == kTemp && o.components == 2 && o.simple && (o.mode == 1 || o.mode == 2) && o.bits == 0;
+  };
+  auto destination = [](const ParsedOperand& o) { return o.type == kTemp && o.components == 2 && o.mode == 0; };
+  // A move this pass may fold: "mov rX.x, rT.x" after an instruction whose
+  // only destination is rT.x, rT a scratch temp.
+  auto candidate = [&](size_t k) {
+    const ParsedInstruction& move = code[k];
+    if (k == 0 || move.opcode != kMov || move.controls != 0 || move.count != 2) return false;
+    if (!is_temp_x_dst(move.operands[0]) || !is_temp_x_src(move.operands[1])) return false;
+    const uint32_t target = tokens_[move.operands[0].index_token];
+    const uint32_t temp = tokens_[move.operands[1].index_token];
+    if (temp < first_scratch || temp == target) return false;
+    const ParsedInstruction& def = code[k - 1];
+    if (def.count == 0 || !is_temp_x_dst(def.operands[0]) || tokens_[def.operands[0].index_token] != temp) {
+      return false;
+    }
+    for (uint32_t o = 1; o < def.count; ++o) {  // no second destination (uaddc, imul with null, ...)
+      if (destination(def.operands[o]) || def.operands[o].type == kNull) return false;
+    }
+    return true;
+  };
+
+  // Liveness of scratch temps' components, from the end back (a block's
+  // code has ifs, elses and endifs; anything else ends the pass): a move
+  // folds when its temp's x is not live after it.
+  constexpr uint32_t kTracked = 128;
+  struct Live {
+    uint64_t words[kTracked * 4 / 64] = {};
+    void merge(const Live& other) {
+      for (size_t i = 0; i < std::size(words); ++i) words[i] |= other.words[i];
+    }
+  };
+  auto slot = [&](uint32_t reg, uint32_t component, size_t* word, uint64_t* bit) {
+    if (reg < first_scratch || reg >= first_scratch + kTracked) return false;
+    const uint32_t index = (reg - first_scratch) * 4 + component;
+    *word = index / 64;
+    *bit = uint64_t{1} << (index % 64);
+    return true;
+  };
+  auto mark = [&](Live& live, uint32_t reg, uint32_t component, bool on) {
+    size_t word;
+    uint64_t bit;
+    if (!slot(reg, component, &word, &bit)) return;
+    if (on) live.words[word] |= bit;
+    else live.words[word] &= ~bit;
+  };
+  auto is_live = [&](const Live& live, uint32_t reg, uint32_t component) {
+    size_t word;
+    uint64_t bit;
+    return slot(reg, component, &word, &bit) && (live.words[word] & bit) != 0;
+  };
+  // An instruction's reads, added to `live`; false when they cannot be told.
+  auto add_reads = [&](const ParsedInstruction& inst, Live& live) {
+    for (uint32_t k = 0; k < inst.count; ++k) {
+      const ParsedOperand& o = inst.operands[k];
+      if (o.many_reads) return false;
+      for (uint32_t r = 0; r < o.read_count; ++r) {
+        for (uint32_t c = 0; c < 4; ++c) mark(live, o.reads[r], c, true);
+      }
+      if (o.type != kTemp || destination(o) || o.dims != 1) continue;
+      const uint32_t reg = tokens_[o.index_token];
+      if (o.components == 2 && o.mode == 2) {
+        mark(live, reg, o.bits & 3, true);
+      } else if (o.components == 2 && o.mode == 1) {
+        for (uint32_t c = 0; c < 4; ++c) mark(live, reg, (o.bits >> (2 * c)) & 3, true);
+      } else {
+        for (uint32_t c = 0; c < 4; ++c) mark(live, reg, c, true);
+      }
+    }
+    return true;
+  };
+  struct Frame {
+    Live after;       // live after the endif
+    Live else_entry;  // live at the else branch's start
+    bool has_else = false;
+  };
+  std::vector<Frame> frames;
+  std::vector<char> foldable(code.size(), 0);
+  Live live;  // nothing is live past the block: scratch temps live within one instruction's code
+  for (size_t k = code.size(); k-- > 0;) {
+    const ParsedInstruction& inst = code[k];
+    if (candidate(k)) foldable[k] = !is_live(live, tokens_[inst.operands[1].index_token], 0);
+    const uint32_t op = inst.opcode;
+    if (op == kEndif) {
+      frames.push_back(Frame{live, Live{}, false});
+      continue;
+    }
+    if (op == kElse) {
+      if (frames.empty()) return 0;
+      frames.back().else_entry = live;
+      frames.back().has_else = true;
+      live = frames.back().after;
+      continue;
+    }
+    if (op == kIf) {
+      if (frames.empty()) return 0;
+      const Frame frame = frames.back();
+      frames.pop_back();
+      live.merge(frame.has_else ? frame.else_entry : frame.after);
+      if (!add_reads(inst, live)) return 0;
+      continue;
+    }
+    if (op == kLoop || op == kEndloop || op == kBreak || op == kBreakc || op == kSwitch || op == kCase ||
+        op == kDefault || op == kEndswitch || op == kRet || op == 7 || op == 8 || op == 63) {
+      return 0;
+    }
+    for (uint32_t o = 0; o < inst.count; ++o) {
+      const ParsedOperand& d = inst.operands[o];
+      if (!destination(d) || !d.simple) continue;
+      for (uint32_t c = 0; c < 4; ++c) {
+        if ((d.bits >> c) & 1) mark(live, tokens_[d.index_token], c, false);
+      }
+    }
+    if (!add_reads(inst, live)) return 0;
+  }
+  if (!frames.empty()) return 0;
+
+  std::vector<char> drop(code.size(), 0);
+  size_t folded = 0;
+  for (size_t k = 1; k < code.size(); ++k) {
+    if (!foldable[k] || drop[k - 1]) continue;
+    tokens_[code[k - 1].operands[0].index_token] = tokens_[code[k].operands[0].index_token];
+    drop[k] = 1;
+    ++folded;
+  }
+  if (!folded) return 0;
+  std::vector<uint32_t> out(tokens_.begin(), tokens_.begin() + 2);
+  out.reserve(tokens_.size());
+  for (size_t k = 0; k < code.size(); ++k) {
+    if (drop[k]) continue;
+    out.insert(out.end(), tokens_.begin() + static_cast<std::ptrdiff_t>(code[k].start),
+               tokens_.begin() + static_cast<std::ptrdiff_t>(code[k].start + code[k].length));
+  }
+  tokens_ = std::move(out);
+  return folded;
+}
+
 void Program::dcl_global_flags(uint32_t flags) { tokens_.push_back(kDclGlobalFlags | (flags << 11) | (1u << 24)); }
 
 void Program::dcl_immediate_constant_buffer(const std::vector<uint32_t>& data) {

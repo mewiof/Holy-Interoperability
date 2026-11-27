@@ -107,6 +107,10 @@ bool translate_compute(const uint8_t* code, size_t size, const ComputeShaderInfo
 // Options the runtime sets once, before translating anything.
 struct TranslatorOptions {
   bool page_cache_reads = false;  // memory accesses test for cached pages (above)
+  // Tests: translate without the optimisations that change a program's
+  // structure (blocks in order, what is known of EXEC, folded moves), as
+  // the reference differential tests compare translations with.
+  bool reference = false;
 };
 void set_translator_options(const TranslatorOptions& options);
 const TranslatorOptions& translator_options();

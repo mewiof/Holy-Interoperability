@@ -742,7 +742,11 @@ Notes describe the platform, never a title.
   ranges overlap. *measured*: the host compiler's time for the same 60 compute programs fell from 136 s to 68 s at
   an unchanged size (166 s before the size work); of the reference title's 19,305 saved programs, 18 keep the
   dispatcher loop (they jump through registers: subroutines). Unit tests run nested loops with a branch out of
-  both, overlapping loops, and a group barrier between waves.
+  both, overlapping loops, and a group barrier between waves; a differential test runs 60 random programs
+  (scalar ifs, counted loops, loops entered in the middle, divergent ifs with and without execz branches, early
+  exits) on 8 lanes translated both ways, with and without the layout, what is known of EXEC and folded moves
+  (`TranslatorOptions::reference`), and requires the same results (33 of the 60 differ when the layout's guards
+  are left out, 3 when masks saved while EXEC was unknown are trusted).
 - Ray intersection (`image_bvh_intersect_ray` 230, `image_bvh64_intersect_ray` 231): *documented* (RDNA 2) the
   instruction tests one node of a bounding volume hierarchy: address operands node pointer (two registers for the
   64-bit form), ray extent, origin, direction and inverse direction (with A16 the directions as halves in three

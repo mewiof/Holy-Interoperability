@@ -15,6 +15,9 @@
 
 namespace holy::d3d12 {
 namespace {
+TranslatorOptions g_options;  // set_translator_options
+}  // namespace
+namespace {
 
 using dxbc::Operand;
 using rdna::Encoding;
@@ -4277,7 +4280,10 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       // on; where branches go back or through registers, nothing; else
       // what holds on every way in (falling in from the previous block, on
       // after an s_cbranch_execz not taken; forward branches as noted).
-      if (i == 0) {
+      if (g_options.reference) {
+        exec_on_ = false;
+        saved_on_.clear();
+      } else if (i == 0) {
         exec_on_ = true;
         saved_on_.clear();
       } else if (unknown_entry.count(inst.pc)) {
@@ -4378,7 +4384,7 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
       *error = format("at 0x%x: %s", inst.pc, error_.c_str());
       return false;
     }
-    if (exec_written_) exec_on_ = exec_on_after(inst, exec_before);
+    if (exec_written_) exec_on_ = exec_on_after(inst, exec_before) && !g_options.reference;
     if (exec_before && inst.encoding == Encoding::SOP1 &&
         ((inst.op >= 36 && inst.op <= 40) || inst.op == 55 || inst.op == 56 || (inst.op >= 60 && inst.op <= 64) ||
          inst.op == 68)) {
@@ -4403,9 +4409,11 @@ bool Translator::run(std::vector<uint8_t>* out, std::string* error) {
   p_ = dxbc::Program();
   // Scratch temps live within one instruction's code: moves of results
   // computed into them fold into the computations.
-  for (auto& block : blocks) block.second.fold_moves(kScratch);
+  if (!g_options.reference) {
+    for (auto& block : blocks) block.second.fold_moves(kScratch);
+  }
   dxbc::Program body;
-  const bool linear = linear_layout(blocks, barrier_after, body);
+  const bool linear = !g_options.reference && linear_layout(blocks, barrier_after, body);
   std::function<void(size_t, size_t)> tree = [&](size_t first, size_t last) {
     if (last - first == 1) {
       body.append(blocks[first].second);
@@ -4758,9 +4766,6 @@ namespace holy::d3d12 {
 const char* dxbc_build();
 const char* rdna_build();
 
-namespace {
-TranslatorOptions g_options;
-}  // namespace
 
 void set_translator_options(const TranslatorOptions& options) {
   g_options = options;
@@ -4772,6 +4777,6 @@ const TranslatorOptions& translator_options() {
 
 std::string translator_build() {
   return std::string(__DATE__ " " __TIME__) + "/" + dxbc_build() + "/" + rdna_build() +
-         (g_options.page_cache_reads ? "/page cache reads" : "");
+         (g_options.page_cache_reads ? "/page cache reads" : "") + (g_options.reference ? "/reference" : "");
 }
 }  // namespace holy::d3d12

@@ -949,6 +949,167 @@ TEST(ray_intersection_reads_half_boxes_and_half_directions) {
   EXPECT(after[48] == 0xA && after[49] == 0xFFFFFFFFu && after[50] == 0xC && after[51] == 0xFFFFFFFFu);
 }
 
+// Differential: random programs (fixed seed) of scalar and vector arithmetic,
+// scalar ifs, counted loops, loops entered in the middle, divergent ifs with
+// and without an execz branch and early exits; every loop runs a few times
+// at most, so every program ends. Each runs on 8 lanes translated as the
+// reference (TranslatorOptions::reference: the dispatcher, nothing known of
+// EXEC, no folded moves) and as the runtime translates it; the results must
+// be the same.
+namespace {
+
+struct Assembler {
+  std::vector<uint32_t> words;
+  std::vector<std::pair<size_t, int>> fixups;
+  std::vector<size_t> labels;
+  int label() {
+    labels.push_back(SIZE_MAX);
+    return static_cast<int>(labels.size() - 1);
+  }
+  void bind(int l) { labels[static_cast<size_t>(l)] = words.size(); }
+  void branch(uint32_t op, int l) {
+    fixups.emplace_back(words.size(), l);
+    words.push_back(0xBF800000u | (op << 16));
+  }
+  void finish() {
+    for (const auto& [at, l] : fixups) {
+      const int64_t delta = static_cast<int64_t>(labels[static_cast<size_t>(l)]) - static_cast<int64_t>(at) - 1;
+      words[at] |= static_cast<uint32_t>(delta) & 0xFFFF;
+    }
+  }
+};
+
+struct ProgramGenerator {
+  uint32_t state = 0;
+  Assembler a;
+  int out = 0;
+  int statements = 0;
+  uint32_t next() {
+    state = state * 1664525u + 1013904223u;
+    return state >> 8;
+  }
+  uint32_t s() { return 8 + next() % 8; }  // data SGPRs s8-s15
+  uint32_t v() { return 1 + next() % 3; }  // data VGPRs v1-v3
+  void literal(uint32_t sgpr, uint32_t value) {
+    a.words.push_back(0xBE8003FFu | (sgpr << 16));
+    a.words.push_back(value);
+  }
+  void block(int depth) {
+    const int count = 1 + static_cast<int>(next() % 4);
+    for (int k = 0; k < count && statements < 48; ++k, ++statements) {
+      const uint32_t choice = next() % (depth < 3 ? 11 : 5);
+      if (choice <= 1) {  // s_add_u32 / s_xor_b32 sD, sA, sB
+        const uint32_t op = choice == 0 ? 0 : 18;
+        a.words.push_back(0x80000000u | (op << 23) | (s() << 16) | (s() << 8) | s());
+      } else if (choice <= 3) {  // v_add_nc_u32 / v_xor_b32 vD, sA, vB
+        const uint32_t op = choice == 2 ? 37 : 29;
+        a.words.push_back((op << 25) | (v() << 17) | (v() << 9) | s());
+      } else if (choice == 4) {  // v_mov_b32 vD, sA
+        a.words.push_back(0x7E000200u | (v() << 17) | s());
+      } else if (choice == 5) {  // if (sA < sB) {...} else {...}
+        const int otherwise = a.label(), end = a.label();
+        a.words.push_back(0xBF0A0000u | (s() << 8) | s());  // s_cmp_lt_u32
+        a.branch(4, otherwise);                              // s_cbranch_scc0
+        block(depth + 1);
+        a.branch(2, end);
+        a.bind(otherwise);
+        block(depth + 1);
+        a.bind(end);
+      } else if (choice == 6 || choice == 7) {  // a counted loop; 7: entered in the middle
+        const uint32_t counter = 20 + static_cast<uint32_t>(depth);
+        literal(counter, 1 + next() % 3);
+        const int top = a.label(), body = a.label();
+        if (choice == 7) a.branch(2, body);
+        a.bind(top);
+        if (choice == 7) a.words.push_back(0x80800000u | (counter << 16) | (129u << 8) | counter);  // s_sub_u32 1
+        a.bind(body);
+        block(depth + 1);
+        if (choice == 6) a.words.push_back(0x80800000u | (counter << 16) | (129u << 8) | counter);
+        a.words.push_back(0xBF070000u | (128u << 8) | counter);  // s_cmp_lg_u32 counter, 0
+        a.branch(5, top);                                        // s_cbranch_scc1
+      } else if (choice == 8 || choice == 9) {  // a divergent if; 8 with an execz branch
+        const uint32_t saved = 16 + static_cast<uint32_t>(depth);
+        const int end = a.label();
+        a.words.push_back(0x7C000000u | (0xC4u << 17) | (0u << 9) | 24u);  // v_cmp_gt_u32 vcc, s24, v0
+        a.words.push_back(0xBE803C6Au | (saved << 16));                    // s_and_saveexec_b32 saved, vcc_lo
+        if (choice == 8) a.branch(8, end);                                // s_cbranch_execz
+        block(depth + 1);
+        a.bind(end);
+        a.words.push_back(0x887E007Eu | (saved << 8));  // s_or_b32 exec_lo, exec_lo, saved
+      } else {  // if (sA == sB) leave for the stores
+        a.words.push_back(0xBF060000u | (s() << 8) | s());  // s_cmp_eq_u32
+        a.branch(5, out);
+      }
+    }
+  }
+  std::vector<uint8_t> generate() {
+    out = a.label();
+    for (uint32_t r = 8; r < 16; ++r) literal(r, next() % 16);  // small values: comparisons go both ways
+    literal(24, next() % 9);                                     // the divergent ifs' lane threshold
+    for (uint32_t r = 1; r <= 3; ++r) a.words.push_back((37u << 25) | (r << 17) | (0u << 9) | (8 + r));
+    block(0);
+    a.bind(out);
+    a.words.push_back(0x34140085u);  // v_lshlrev_b32 v10, 5, v0
+    for (uint32_t r = 0; r < 4; ++r) a.words.push_back(0x7E000200u | ((4 + r) << 17) | (8 + r));  // v4-v7 = s8-s11
+    for (uint32_t r = 1; r <= 7; ++r) {
+      a.words.push_back(0xE0701000u | (4 * (r - 1)));          // buffer_store_dword vr, v10, s[4:7], 0 offen
+      a.words.push_back(10u | (r << 8) | (1u << 16) | (0x80u << 24));
+    }
+    a.words.push_back(0xBF810000u);
+    a.finish();
+    std::vector<uint8_t> code;
+    for (uint32_t w : a.words) {
+      const auto* p = reinterpret_cast<const uint8_t*>(&w);
+      code.insert(code.end(), p, p + 4);
+    }
+    return code;
+  }
+};
+
+}  // namespace
+
+TEST(random_control_flow_runs_the_same_as_the_reference_translation) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  EXPECT(gpu.set_constants({0, 0, 0, 0, 0, 1, 256, 0}, true));
+  int compared = 0, different = 0, failed = 0;
+  for (uint32_t seed = 1; seed <= 60; ++seed) {
+    ProgramGenerator generator;
+    generator.state = seed * 2654435761u;
+    const std::vector<uint8_t> code = generator.generate();
+    ComputeShaderInfo info;
+    info.threads[0] = 8;
+    info.user_sgprs = 8;
+    std::vector<uint8_t> reference, optimised;
+    std::string error;
+    TranslatorOptions options;
+    options.reference = true;
+    set_translator_options(options);
+    const bool made_reference = translate_compute(code.data(), code.size(), info, &reference, &error);
+    set_translator_options(TranslatorOptions());
+    const bool made = translate_compute(code.data(), code.size(), info, &optimised, &error);
+    if (!made_reference || !made) {
+      ++failed;
+      std::printf("      (seed %u: %s)\n", seed, error.c_str());
+      continue;
+    }
+    const std::vector<uint32_t> expected = gpu.dispatch(reference, std::vector<uint32_t>(64, 0));
+    const std::vector<uint32_t> got = gpu.dispatch(optimised, std::vector<uint32_t>(64, 0));
+    ++compared;
+    if (expected.size() != 64 || got != expected) {
+      ++different;
+      if (different <= 3) std::printf("      (seed %u: results differ)\n", seed);
+    }
+  }
+  std::printf("      (%d random programs compared, %d different, %d not translated)\n", compared, different, failed);
+  EXPECT(failed == 0);
+  EXPECT(different == 0);
+  EXPECT(compared == 60);
+}
+
 // A group barrier between local data share writes and reads of other
 // threads' values (two waves of 32: the barrier is the group's).
 TEST(group_barriers_order_local_data_share_between_waves) {

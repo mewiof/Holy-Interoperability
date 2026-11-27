@@ -642,8 +642,9 @@ double host_commit_left() {
 // the view; memory from XMemVirtualAlloc, and physical pages the title mapped,
 // both written after the view was made and the work submitted a frame later
 // (the host copy of the texture follows the write: tracked writes, writes
-// through the title's view of physical pages).
-enum class TextureMemory { Plain, Reserved, Physical };
+// through the title's view of physical pages); and a physical page the title
+// maps (and writes) only after viewing the texture there.
+enum class TextureMemory { Plain, Reserved, Physical, Unmapped };
 
 // The command list interface titles ask for.
 constexpr GUID kListIid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
@@ -696,11 +697,14 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
                 __uuidof(ID3D12PipelineState), &pipeline);
   volatile uint8_t* memory = nullptr;
   volatile float* output = nullptr;
-  if (kind == TextureMemory::Physical) {
-    ULONG_PTR page = 0, count = 1;
+  const bool physical = kind == TextureMemory::Physical || kind == TextureMemory::Unmapped;
+  ULONG_PTR page = 0;
+  if (physical) {
+    ULONG_PTR count = 1;
     XMemAllocatePhysicalPages(0x280, &count, &page);
     void* region = XMemVirtualAlloc(nullptr, 0x10000, 0x20402000, 0x23, PAGE_READWRITE);
-    if (count == 1 && region && XMemMapPhysicalPages(region, 1, &page) == region) {
+    if (count == 1 && region &&
+        (kind == TextureMemory::Unmapped || XMemMapPhysicalPages(region, 1, &page) == region)) {
       memory = static_cast<volatile uint8_t*>(region);
     }
     output = static_cast<volatile float*>(VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -714,10 +718,15 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
     check(false, "the objects for a compute program reading a texture view exist");
     return;
   }
-  for (uint32_t i = 0; i < 0x4000; ++i) memory[i] = 0x40;
+  if (kind != TextureMemory::Unmapped) {
+    for (uint32_t i = 0; i < 0x4000; ++i) memory[i] = 0x40;
+  }
   // Other texels when written after the view (the address may be the one an
   // earlier texture of the same shape had: only a fresh copy shows these).
-  const uint8_t base_byte = kind == TextureMemory::Plain ? 0x10 : kind == TextureMemory::Reserved ? 0x50 : 0x90;
+  const uint8_t base_byte = kind == TextureMemory::Plain      ? 0x10
+                            : kind == TextureMemory::Reserved ? 0x50
+                            : kind == TextureMemory::Physical ? 0x90
+                                                              : 0xC0;
   const uint8_t texel_bytes[4] = {base_byte, static_cast<uint8_t>(base_byte + 0x10),
                                   static_cast<uint8_t>(base_byte + 0x20), 0xFF};
   auto write_texel = [memory, &texel_bytes] {
@@ -753,6 +762,7 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   view.srv.Texture2D.MipLevels = 1;
   view.address = reinterpret_cast<uint64_t>(memory);
   call<void>(device, 70, &texture, &view, call<uint64_t>(heap, 9));
+  if (kind == TextureMemory::Unmapped) XMemMapPhysicalPages(const_cast<uint8_t*>(memory), 1, &page);
   if (after) {
     write_texel();
     Sleep(40);
@@ -788,8 +798,10 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
             close_to(texel[3], texel_bytes[3] / 255.0f),
         kind == TextureMemory::Plain      ? "a native compute program reads all four channels of a texture viewed in title memory"
         : kind == TextureMemory::Reserved ? "a texture written after its view shows the new texels to the GPU"
-                                          : "a texture in physical pages written through the title's view after its view "
-                                            "shows the new texels to the GPU");
+        : kind == TextureMemory::Physical ? "a texture in physical pages written through the title's view after its view "
+                                            "shows the new texels to the GPU"
+                                          : "a texture viewed before its physical page was mapped shows what the title "
+                                            "wrote there");
 
   if (placed) call<ULONG>(placed, 2);
   call<ULONG>(pipeline, 2);
@@ -798,7 +810,7 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   call<ULONG>(fence, 2);
   call<ULONG>(list, 2);
   call<ULONG>(allocator, 2);
-  if (kind == TextureMemory::Physical) {
+  if (physical) {
     VirtualFree(const_cast<float*>(output), 0, MEM_RELEASE);
   } else {
     VirtualFree(const_cast<uint8_t*>(memory), 0, MEM_RELEASE);
@@ -1263,6 +1275,7 @@ void test_graphics_resources(void* device, void* queue) {
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Plain);
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Reserved);
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Physical);
+    test_compute_reads_a_texture_view(device, queue, TextureMemory::Unmapped);
   }
   test_allocation_hooks();
   test_placeholders();

@@ -42,6 +42,7 @@ struct Record {
   uint64_t size = 0;         // bytes in title memory
   bool from_memory = false;  // filled from title memory: kept current
   bool protected_watch = false;  // its memory is watched by page protection (write_watch.h)
+  bool tracked = false;          // its allocation's writes are tracked by the host
   bool dirty = false;
 };
 
@@ -193,6 +194,27 @@ void scan() {
       last = std::max(last, record->address + record->size);
     }
     scan_range(allocation, first, last);
+  }
+}
+
+// Starts keeping a record filled from memory current (g_lock held): the host
+// tracks writes to its allocation, or its physical pages are watched through
+// the title's view. Memory neither applies to yet (physical pages not mapped
+// yet) is tried again when the record is refreshed.
+void track(Record* record) {
+  if (!tracking() || record->tracked || record->protected_watch) return;
+  uint64_t base = 0, allocation_size = 0;
+  bool watched = false, mapped = false;
+  if (!allocation_of(record->address, &base, &allocation_size, &watched, &mapped)) return;
+  if (watched) {
+    Tracked& allocation = tracked()[base];
+    allocation.size = allocation_size;
+    // Writes to its pages so far go to the textures already there.
+    scan_range(allocation, record->address, record->address + record->size);
+    allocation.records.push_back(record);
+    record->tracked = true;
+  } else if (mapped && watch_memory(record->address, record->size, reinterpret_cast<WatchToken>(record))) {
+    record->protected_watch = true;
   }
 }
 
@@ -469,22 +491,13 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   record->size = size;
   record->from_memory = true;
 
-  // Tracked from before the copy reads the memory: writes to its pages so far
-  // go to the textures already there, then this one is tracked too (a write
-  // from now on makes it dirty; the copy may already hold part of it).
-  uint64_t base = 0, allocation_size = 0;
-  bool watched = false, mapped = false;
-  const bool known = tracking() && allocation_of(address, &base, &allocation_size, &watched, &mapped);
-  if (known && watched) {
-    Tracked& allocation = tracked()[base];
-    allocation.size = allocation_size;
-    scan_range(allocation, address, address + size);
-    allocation.records.push_back(record);
-  } else if (known && mapped && watch_memory(address, size, reinterpret_cast<WatchToken>(record))) {
-    record->protected_watch = true;  // physical pages: watched through the title's views
-  } else {
-    c_untracked().add(1);
-  }
+  // Memory committed on first touch reads as zero until touched: committed
+  // now, so it can be copied (and its writes tracked).
+  if (!readable(address, size)) HolyEnsureCommitted(reinterpret_cast<void*>(address), static_cast<size_t>(size));
+  // Tracked from before the copy reads the memory (a write from now on makes
+  // it dirty; the copy may already hold part of it).
+  track(record);
+  if (!record->tracked && !record->protected_watch) c_untracked().add(1);
 
   begin_upload(up);
   D3D12_HEAP_PROPERTIES heap{};
@@ -496,11 +509,20 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
     LIB_LOG(lib::kError, "d3d12", "host texture of format %u %llux%u refused (0x%08lX)", shape.format,
             static_cast<unsigned long long>(shape.width), shape.height, static_cast<unsigned long>(hr));
   }
-  if (FAILED(hr) || !record_fill(device, up, *record, texture, true)) {
+  if (FAILED(hr)) {
     up->list->Close();
-    if (texture) texture->Release();
     drop(record);
     return nullptr;
+  }
+  if (!record_fill(device, up, *record, texture, true)) {
+    // Memory that cannot be read yet (physical pages not mapped yet): the
+    // texture starts as zeros (new host textures are) and is filled when the
+    // memory changes (the title maps or writes it).
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE};
+    up->list->ResourceBarrier(1, &barrier);
   }
   record->texture = texture;
   const uint64_t value = submit_upload(up);
@@ -536,8 +558,10 @@ void refresh_textures(Device* device, ID3D12CommandQueue* queue) {
   for (Record* record : dirty) {
     record->dirty = false;
     if (!record->texture) continue;
-    // Watched again before the copy reads the memory.
+    // Watched again before the copy reads the memory; memory that could not
+    // be tracked before (not mapped yet) is tried again.
     if (record->protected_watch) watch_memory(record->address, record->size, reinterpret_cast<WatchToken>(record));
+    track(record);
     if (record_fill(device, up, *record, record->texture, false)) ++refreshed;
   }
   const uint64_t value = submit_upload(up);

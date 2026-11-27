@@ -407,13 +407,57 @@ DXGI_FORMAT host_view_format(const void* resource, DXGI_FORMAT format) {
 // So the console runtime allocates a committed resource's memory with
 // XMemAlloc, allocator id 0x80, 64 KiB pages. This runtime makes the same
 // allocation (of the host's size for the resource) so the title's accounting
-// holds; the resource itself is a host committed resource, because textures
-// cannot be placed in a heap over plain title memory.
+// holds. Buffers the CPU reaches live in it (a host buffer placed in the heap
+// over it): their GPU address and Map's pointer are that memory, as on the
+// console. Other resources are host committed resources: textures cannot be
+// placed in a heap over plain title memory, and buffers only the GPU uses stay
+// in video memory (partial: their GPU address is the host's, which views and
+// native code do not reach).
+namespace {
+HRESULT place_buffer(Device* device, uint64_t address, const D3D12_RESOURCE_DESC& desc, ID3D12Resource** out,
+                     uint64_t* slack);
+}  // namespace
+
 HRESULT create_committed_resource(Device* device, const D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS flags,
                                   const D3D12_RESOURCE_DESC* desc, UINT state, bool layout,
                                   const D3D12_CLEAR_VALUE* clear, void** out) {
   if (!out || !desc || !properties) return E_POINTER;
   *out = nullptr;
+  // Buffers the CPU reaches (upload, readback and CPU-visible custom heaps)
+  // live in the memory taken for them, as on the console: their GPU address
+  // and the pointer Map gives are that memory, which the title's CPU and its
+  // GPU work (views, root views, native code) both reach.
+  const bool cpu_visible =
+      properties->Type == D3D12_HEAP_TYPE_UPLOAD || properties->Type == D3D12_HEAP_TYPE_READBACK ||
+      (properties->Type == D3D12_HEAP_TYPE_CUSTOM &&
+       properties->CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
+       properties->CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN);
+  if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && cpu_visible) {
+    const uint64_t bytes = (desc->Width + 0xFFFF) & ~0xFFFFull;
+    void* memory = XMemAlloc(static_cast<SIZE_T>(bytes), kResourceMemoryAttributes);
+    ID3D12Resource* host = nullptr;
+    uint64_t slack = 0;
+    const HRESULT hr = memory ? place_buffer(device, reinterpret_cast<uint64_t>(memory), *desc, &host, &slack)
+                              : E_OUTOFMEMORY;
+    LIB_LOG(lib::kDebug, "d3d12", "committed buffer of %llu bytes, heap %d, in title memory at %p -> 0x%08lX",
+            static_cast<unsigned long long>(desc->Width), properties->Type, memory, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+      if (memory) XMemFree(memory, kResourceMemoryAttributes);
+      return hr;
+    }
+    auto* resource = new Resource();
+    resource->vtable = kResourceVtable.data();
+    c_resources().add(1);
+    register_live_resource(resource);
+    resource->info = &kResourceInfo;
+    resource->host = host;
+    resource->desc = *desc;
+    resource->runtime_memory = memory;
+    resource->title_va = reinterpret_cast<uint64_t>(memory);
+    resource->host_va = host->GetGPUVirtualAddress() + slack;
+    *out = resource;
+    return S_OK;
+  }
   D3D12_HEAP_PROPERTIES host_properties = *properties;
   host_properties.CreationNodeMask = 0;
   host_properties.VisibleNodeMask = 0;
@@ -466,6 +510,41 @@ void log_object_vtables() {
   LIB_LOG(lib::kDebug, "d3d12", "vtables: resource %s, released resource %s", live, gone);
 }
 
+namespace {
+
+// A host buffer over the title memory at `address` (the heap opened over it),
+// for a buffer resource the title places there; `slack`: how far into the
+// host buffer the title's buffer starts.
+HRESULT place_buffer(Device* device, uint64_t address, const D3D12_RESOURCE_DESC& desc, ID3D12Resource** out,
+                     uint64_t* slack) {
+  Backing backing;
+  if (!locate(device, address, &backing, desc.Width) || backing.contiguous < desc.Width) {
+    LIB_LOG(lib::kError, "d3d12", "no GPU heap backs a buffer of 0x%llx bytes at %p (heap %p, 0x%llx contiguous)",
+            static_cast<unsigned long long>(desc.Width), reinterpret_cast<void*>(address),
+            static_cast<void*>(backing.heap), static_cast<unsigned long long>(backing.contiguous));
+    return E_INVALIDARG;
+  }
+  // Placed buffers need 64 KiB aligned heap offsets; a buffer that starts
+  // inside a 64 KiB block is placed from the block's start and remembers the
+  // difference.
+  *slack = backing.heap_offset & 0xFFFF;
+  D3D12_RESOURCE_DESC host_desc = desc;
+  host_desc.Width = desc.Width + *slack;
+  host_desc.Alignment = 0;
+  host_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>((desc.Flags & kDesktopFlags) |
+                                                      D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+  const HRESULT hr = device->host->CreatePlacedResource(backing.heap, backing.heap_offset - *slack, &host_desc,
+                                                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(out));
+  if (FAILED(hr)) {
+    LIB_LOG(lib::kError, "d3d12", "placed buffer of 0x%llx bytes at %p: 0x%08lX",
+            static_cast<unsigned long long>(desc.Width), reinterpret_cast<void*>(address),
+            static_cast<unsigned long>(hr));
+  }
+  return hr;
+}
+
+}  // namespace
+
 HRESULT create_placed_resource_x(Device* device, uint64_t address, const D3D12_RESOURCE_DESC* desc,
                                  D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear, void** out,
                                  const void* caller) {
@@ -491,33 +570,12 @@ HRESULT create_placed_resource_x(Device* device, uint64_t address, const D3D12_R
     *out = resource;
     return S_OK;
   }
-  Backing backing;
-  if (!locate(device, address, &backing, desc->Width) || backing.contiguous < desc->Width) {
-    LIB_LOG(lib::kError, "d3d12", "no GPU heap backs a buffer of 0x%llx bytes at %p (heap %p, 0x%llx contiguous)",
-            static_cast<unsigned long long>(desc->Width), reinterpret_cast<void*>(address),
-            static_cast<void*>(backing.heap), static_cast<unsigned long long>(backing.contiguous));
-    return E_INVALIDARG;
-  }
-  // Placed buffers need 64 KiB aligned heap offsets; a buffer that starts
-  // inside a 64 KiB block is placed from the block's start and remembers the
-  // difference.
-  const uint64_t slack = backing.heap_offset & 0xFFFF;
-  D3D12_RESOURCE_DESC host_desc = *desc;
-  host_desc.Width = desc->Width + slack;
-  host_desc.Alignment = 0;
-  host_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>((desc->Flags & kDesktopFlags) |
-                                                      D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
   (void)state;
   (void)clear;
   ID3D12Resource* host = nullptr;
-  const HRESULT hr = device->host->CreatePlacedResource(backing.heap, backing.heap_offset - slack, &host_desc,
-                                                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&host));
-  if (FAILED(hr)) {
-    LIB_LOG(lib::kError, "d3d12", "placed buffer of 0x%llx bytes at %p: 0x%08lX",
-            static_cast<unsigned long long>(desc->Width), reinterpret_cast<void*>(address),
-            static_cast<unsigned long>(hr));
-    return hr;
-  }
+  uint64_t slack = 0;
+  const HRESULT hr = place_buffer(device, address, *desc, &host, &slack);
+  if (FAILED(hr)) return hr;
   auto* resource = new Resource();
   resource->vtable = kResourceVtable.data();
   c_resources().add(1);

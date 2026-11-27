@@ -254,8 +254,16 @@ Notes describe the platform, never a title.
     has a CPU-readable shadow: descriptors are written into the shadow and copied to the visible heap, and
     copies read shadows. Heaps over committed title memory end where the page protection changes (the host
     refuses mixed protection; titles hand thread stacks, with their guard pages, to the GPU too).
-  - Committed resources are host committed resources; the matching `XMemAlloc` is made so titles' accounting
-    holds.
+  - Committed resources: the matching `XMemAlloc` is made so titles' accounting holds. Buffers in heaps the CPU
+    reaches (upload, readback, custom heaps with CPU access) live in that memory, a host buffer placed in the heap
+    over it: their GPU address and the pointer `Map` gives are that memory, as on the console, so views, root
+    views and native code reach them (an earlier implementation gave the host's GPU address, also as `Map`'s
+    pointer). Textures, and buffers only the GPU uses, are host committed resources (partial: such a buffer's GPU
+    address is the host's, which views and native code do not reach).
+  - *assumed* (slots 0-25 keep the desktop order, observed for others): command list slots 15, 16 and 17 are
+    `CopyBufferRegion`, `CopyTextureRegion` and `CopyResource`; the host resources behind the title's take the
+    copies (placed buffers at their offset into the host buffer). Partial: copies into title memory under a
+    texture the title views there do not reach its host copy.
   - Root signature flag bits above the desktop's are dropped. Compute pipelines whose shaders keep their DXIL
     run from that program; shaders with only native GPU code, and shaders whose DXIL the host refuses, run
     translated from their native code (see Graphics shaders); their draws and dispatches receive root

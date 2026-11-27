@@ -10,6 +10,7 @@
 #include <d3d12.h>
 #include <intrin.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -875,6 +876,73 @@ void STDMETHODCALLTYPE list_draw_indexed_instanced(CommandList* self, UINT indic
   self->host->DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
 }
 
+// --- copies ----------------------------------------------------------------------------
+//
+// Assumed (slots 0-25 keep the desktop order, observed for the others): slots
+// 15, 16 and 17 are CopyBufferRegion, CopyTextureRegion and CopyResource. The
+// host resources behind the title's take the copies; a buffer placed in title
+// memory starts `slack` bytes into its host buffer (resource.cpp). Partial:
+// copies into title memory under a texture the title views there do not
+// reach the texture's host copy (GPU writes under textures, as elsewhere).
+
+uint64_t buffer_slack(const Resource* resource) {
+  if (resource->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !resource->host) return 0;
+  return resource->host_va - resource->host->GetGPUVirtualAddress();
+}
+
+const Resource* copied(const void* resource, const char* what) {
+  const auto* title = static_cast<const Resource*>(resource);
+  if (title && title->host) return title;
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 8) LIB_LOG(lib::kError, "d3d12", "%s with a resource %p that has no host resource: dropped", what, resource);
+  return nullptr;
+}
+
+void STDMETHODCALLTYPE list_copy_buffer_region(CommandList* self, void* destination, UINT64 destination_offset,
+                                               void* source, UINT64 source_offset, UINT64 bytes) {
+  const Resource* to = copied(destination, "a buffer copy");
+  const Resource* from = copied(source, "a buffer copy");
+  if (!to || !from) return;
+  HOLY_TRACE("list %u copies 0x%llx bytes between buffers", self->number, static_cast<unsigned long long>(bytes));
+  self->host->CopyBufferRegion(to->host, destination_offset + buffer_slack(to), from->host,
+                               source_offset + buffer_slack(from), bytes);
+}
+
+bool host_copy_location(const D3D12_TEXTURE_COPY_LOCATION& title, D3D12_TEXTURE_COPY_LOCATION* host) {
+  const Resource* resource = copied(title.pResource, "a texture copy");
+  if (!resource) return false;
+  *host = title;
+  host->pResource = resource->host;
+  if (title.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+    host->PlacedFootprint.Offset += buffer_slack(resource);
+    host->PlacedFootprint.Footprint.Format = desktop_format(title.PlacedFootprint.Footprint.Format);
+  }
+  return true;
+}
+
+void STDMETHODCALLTYPE list_copy_texture_region(CommandList* self, const D3D12_TEXTURE_COPY_LOCATION* destination,
+                                                UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* source,
+                                                const D3D12_BOX* box) {
+  D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+  if (!destination || !source || !host_copy_location(*destination, &to) || !host_copy_location(*source, &from)) return;
+  HOLY_TRACE("list %u copies a texture region", self->number);
+  self->host->CopyTextureRegion(&to, x, y, z, &from, box);
+}
+
+void STDMETHODCALLTYPE list_copy_resource(CommandList* self, void* destination, void* source) {
+  const Resource* to = copied(destination, "a resource copy");
+  const Resource* from = copied(source, "a resource copy");
+  if (!to || !from) return;
+  HOLY_TRACE("list %u copies a resource", self->number);
+  if (to->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && from->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+    // Host buffers of placed buffers are wider than the title's.
+    self->host->CopyBufferRegion(to->host, buffer_slack(to), from->host, buffer_slack(from),
+                                 std::min(to->desc.Width, from->desc.Width));
+    return;
+  }
+  self->host->CopyResource(to->host, from->host);
+}
+
 void STDMETHODCALLTYPE list_dispatch(CommandList* self, UINT x, UINT y, UINT z) {
   if (!self->pipeline) {  // no host pipeline (reported when it was set)
     g_work.no_pipeline.fetch_add(1, std::memory_order_relaxed);
@@ -900,6 +968,9 @@ const auto kListVtable = [] {
   HOLY_D3D_SLOT(table, kCommandListObject, 12, list_draw_instanced);
   HOLY_D3D_SLOT(table, kCommandListObject, 13, list_draw_indexed_instanced);
   HOLY_D3D_SLOT(table, kCommandListObject, 14, list_dispatch);
+  HOLY_D3D_SLOT(table, kCommandListObject, 15, list_copy_buffer_region);
+  HOLY_D3D_SLOT(table, kCommandListObject, 16, list_copy_texture_region);
+  HOLY_D3D_SLOT(table, kCommandListObject, 17, list_copy_resource);
   HOLY_D3D_SLOT(table, kCommandListObject, 20, list_set_primitive_topology);
   HOLY_D3D_SLOT(table, kCommandListObject, 21, list_set_viewports);
   HOLY_D3D_SLOT(table, kCommandListObject, 22, list_set_scissors);

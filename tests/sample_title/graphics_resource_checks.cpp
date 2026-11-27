@@ -1306,6 +1306,155 @@ void test_draw_recording_cost(void* device, void* queue) {
   VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+// Committed buffers the CPU reaches, and copies: an upload buffer's GPU
+// address is the memory Map gives (as on the console); a buffer copy into a
+// readback buffer shows through Map, as does a native program's store at the
+// readback buffer's GPU address; texture region copies take an upload buffer
+// into a texture and the texture into the readback buffer.
+void test_committed_buffers_and_copies(void* device, void* queue) {
+  void* allocator = nullptr;
+  void* list = nullptr;
+  void* fence = nullptr;
+  void* root = nullptr;
+  void* pipeline = nullptr;
+  void* upload = nullptr;
+  void* readback = nullptr;
+  void* texture = nullptr;
+  const uint32_t list_desc[4] = {0, 2, 1, 0};
+  call<HRESULT>(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), &allocator);
+  if (allocator) call<HRESULT>(device, 73, list_desc, allocator, static_cast<void*>(nullptr), kListIid, &list);
+  call<HRESULT>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), &fence);
+  D3D12_ROOT_PARAMETER1 parameter{};
+  parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameter.Constants = {0, 0, 4};
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+  root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  root_desc.Desc_1_1.NumParameters = 1;
+  root_desc.Desc_1_1.pParameters = &parameter;
+  ID3DBlob* serialized = nullptr;
+  if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&root_desc, &serialized, nullptr)) && serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &root);
+  }
+  // The program of test_root_arguments_outlive_later_recording: stores the
+  // third constant at the address in the first two.
+  const std::vector<uint8_t> container = native_only_container(
+      {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE940304u, 0xBE950305u, 0xB0160040u, 0xBE970380u, 0x7E020206u,
+       0x7E000280u, 0xE0700000u, 0x80050100u, 0xBF810000u});
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+  pso.CS = {container.data(), container.size()};
+  call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
+                __uuidof(ID3D12PipelineState), &pipeline);
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 0x10000;
+  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  D3D12_HEAP_PROPERTIES upload_heap{};
+  upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+  D3D12_HEAP_PROPERTIES readback_heap{};
+  readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+  call<HRESULT>(device, 27, &upload_heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ,
+                static_cast<const D3D12_CLEAR_VALUE*>(nullptr), __uuidof(ID3D12Resource), &upload);
+  call<HRESULT>(device, 27, &readback_heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                static_cast<const D3D12_CLEAR_VALUE*>(nullptr), __uuidof(ID3D12Resource), &readback);
+  D3D12_HEAP_PROPERTIES local{};
+  local.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC image{};
+  image.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  image.Width = 16;
+  image.Height = 16;
+  image.DepthOrArraySize = 1;
+  image.MipLevels = 1;
+  image.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  image.SampleDesc.Count = 1;
+  call<HRESULT>(device, 127, &local, D3D12_HEAP_FLAG_NONE, &image, static_cast<UINT>(D3D12_BARRIER_LAYOUT_COPY_DEST),
+                static_cast<const D3D12_CLEAR_VALUE*>(nullptr), static_cast<void*>(nullptr), 0u,
+                static_cast<const void*>(nullptr), __uuidof(ID3D12Resource), &texture);
+  uint32_t* up = nullptr;
+  uint32_t* back = nullptr;
+  if (upload) call<HRESULT>(upload, 8, 0u, static_cast<const D3D12_RANGE*>(nullptr), reinterpret_cast<void**>(&up));
+  if (readback) call<HRESULT>(readback, 8, 0u, static_cast<const D3D12_RANGE*>(nullptr), reinterpret_cast<void**>(&back));
+  auto writable = [](const void* p) {
+    MEMORY_BASIC_INFORMATION info{};
+    return p && VirtualQuery(p, &info, sizeof(info)) && info.State == MEM_COMMIT && (info.Protect & PAGE_READWRITE);
+  };
+  if (!list || !fence || !root || !pipeline || !upload || !readback || !texture) {
+    check(false, "the objects for committed buffers and copies exist");
+    return;
+  }
+  const uint64_t upload_va = call<uint64_t>(upload, 11);
+  const uint64_t readback_va = call<uint64_t>(readback, 11);
+  check(writable(up) && writable(back) && upload_va == reinterpret_cast<uint64_t>(up) &&
+            readback_va == reinterpret_cast<uint64_t>(back),
+        "a CPU-visible committed buffer is memory the CPU writes, at its GPU address");
+  if (!writable(up) || !writable(back)) return;
+  for (uint32_t i = 0; i < 64; ++i) up[i] = 0xC0DE0000u + i;
+  // Rows of 16 texels (64 bytes) at a 256-byte pitch, from +0x1000.
+  for (uint32_t row = 0; row < 16; ++row) {
+    for (uint32_t x = 0; x < 16; ++x) up[(0x1000 + row * 256) / 4 + x] = (row << 8) | x | 0xFF000000u;
+  }
+  bool recorded = call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
+  call<void>(list, 15, readback, UINT64{0}, upload, UINT64{0}, UINT64{256});
+  D3D12_TEXTURE_COPY_LOCATION from_rows{};
+  from_rows.pResource = static_cast<ID3D12Resource*>(upload);
+  from_rows.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  from_rows.PlacedFootprint = {0x1000, {DXGI_FORMAT_R8G8B8A8_UNORM, 16, 16, 1, 256}};
+  D3D12_TEXTURE_COPY_LOCATION in_texture{};
+  in_texture.pResource = static_cast<ID3D12Resource*>(texture);
+  in_texture.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  call<void>(list, 16, &in_texture, 0u, 0u, 0u, &from_rows, static_cast<const D3D12_BOX*>(nullptr));
+  D3D12_TEXTURE_BARRIER barrier{};
+  barrier.SyncBefore = D3D12_BARRIER_SYNC_COPY;
+  barrier.SyncAfter = D3D12_BARRIER_SYNC_COPY;
+  barrier.AccessBefore = D3D12_BARRIER_ACCESS_COPY_DEST;
+  barrier.AccessAfter = D3D12_BARRIER_ACCESS_COPY_SOURCE;
+  barrier.LayoutBefore = D3D12_BARRIER_LAYOUT_COPY_DEST;
+  barrier.LayoutAfter = D3D12_BARRIER_LAYOUT_COPY_SOURCE;
+  barrier.pResource = static_cast<ID3D12Resource*>(texture);
+  barrier.Subresources.IndexOrFirstMipLevel = 0xFFFFFFFFu;
+  D3D12_BARRIER_GROUP group{};
+  group.Type = D3D12_BARRIER_TYPE_TEXTURE;
+  group.NumBarriers = 1;
+  group.pTextureBarriers = &barrier;
+  call<void>(list, 146, 1u, static_cast<const D3D12_BARRIER_GROUP*>(&group));
+  D3D12_TEXTURE_COPY_LOCATION to_rows = from_rows;
+  to_rows.pResource = static_cast<ID3D12Resource*>(readback);
+  call<void>(list, 16, &to_rows, 0u, 0u, 0u, &in_texture, static_cast<const D3D12_BOX*>(nullptr));
+  const uint32_t constants[4] = {static_cast<uint32_t>(readback_va + 0x800), static_cast<uint32_t>(readback_va >> 32),
+                                 0x57012Eu, 0};
+  call<void>(list, 33, root);
+  call<void>(list, 39, 0u, 4u, static_cast<const void*>(constants), 0u);
+  call<void>(list, 25, pipeline);
+  call<void>(list, 14, 1u, 1u, 1u);
+  recorded = recorded && call<HRESULT>(list, 9) == S_OK;
+  void* lists[] = {list};
+  call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+  call<HRESULT>(queue, 16, fence, UINT64{1});
+  const auto* value = call<const volatile uint64_t*>(fence, 12);
+  for (int i = 0; value && *value < 1 && i < 5000; ++i) Sleep(1);
+  bool copied = true, rows = true;
+  for (uint32_t i = 0; i < 64; ++i) copied = copied && back[i] == 0xC0DE0000u + i;
+  for (uint32_t row = 0; row < 16; ++row) {
+    for (uint32_t x = 0; x < 16; ++x) rows = rows && back[(0x1000 + row * 256) / 4 + x] == ((row << 8) | x | 0xFF000000u);
+  }
+  std::printf("    (readback: %08x %08x, a row texel %08x, stored %08x; fence %llu)\n", back[0], back[63],
+              back[(0x1000 + 5 * 256) / 4 + 7], back[0x800 / 4], static_cast<unsigned long long>(value ? *value : 0));
+  check(recorded && value && *value == 1 && copied, "a buffer copy into a readback buffer shows through Map");
+  check(rows, "texture region copies take rows into a texture and back out into a buffer");
+  check(back[0x800 / 4] == 0x57012Eu, "native code writes a committed buffer through its GPU address");
+
+  call<ULONG>(texture, 2);
+  call<ULONG>(readback, 2);
+  call<ULONG>(upload, 2);
+  call<ULONG>(pipeline, 2);
+  call<ULONG>(root, 2);
+  call<ULONG>(fence, 2);
+  call<ULONG>(list, 2);
+  call<ULONG>(allocator, 2);
+}
+
 // Title memory released while the GPU still reads it (a title's mistake the
 // console may forgive): the work finishes, later work runs, and the runtime's
 // heap over the memory goes once the GPU is done (its count of released
@@ -1931,6 +2080,7 @@ void test_graphics_resources(void* device, void* queue) {
   if (queue) test_memory_read_cost(device, queue);
   if (queue) test_root_arguments_outlive_later_recording(device, queue);
   if (queue) test_memory_released_while_read(device, queue);
+  if (queue) test_committed_buffers_and_copies(device, queue);
   if (queue) test_native_depth(device, queue, false);
   if (queue) test_native_depth(device, queue, true);
   test_page_mapping_update(device);

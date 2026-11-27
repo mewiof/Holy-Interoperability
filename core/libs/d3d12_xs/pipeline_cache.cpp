@@ -698,6 +698,17 @@ Pipeline* wrap_host_pipeline(ID3D12PipelineState* state, bool translated, const 
   return pipeline;
 }
 
+Pipeline* placeholder_pipeline(const lib::VtableInfo* info, void* const* vtable) {
+  static const lib::Counter placeholders("d3d12.placeholder_pipelines");
+  placeholders.add(1);
+  auto shared = std::make_shared<HostPipeline>();
+  shared->status = Status::Failed;
+  shared->used.store(true);
+  Pipeline* pipeline = new_pipeline(info, vtable, false);
+  pipeline->shared = std::move(shared);
+  return pipeline;
+}
+
 // Observed: device slot 55 takes (base pipeline, count, entries, interface
 // id, out) and returns an HRESULT. Entries are 0x14C bytes: a type dword and
 // a desktop description: 0 D3D12_DEPTH_STENCIL_DESC, 1 D3D12_RASTERIZER_DESC,

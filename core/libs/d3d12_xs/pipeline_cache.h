@@ -102,6 +102,10 @@ HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream, st
 Pipeline* wrap_host_pipeline(ID3D12PipelineState* state, bool translated, const lib::VtableInfo* info,
                              void* const* vtable);
 
+// A title pipeline with no host pipeline behind it: its draws and dispatches
+// are dropped. For exploration only (see device.cpp, `explored`).
+Pipeline* placeholder_pipeline(const lib::VtableInfo* info, void* const* vtable);
+
 // Device slot 55: `base` with some of its state replaced.
 HRESULT create_derived_pipeline(Device* device, const void* base, uint32_t count, const uint8_t* entries,
                                 const lib::VtableInfo* info, void* const* vtable, void** pipeline,

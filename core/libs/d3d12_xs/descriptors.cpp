@@ -79,9 +79,11 @@ ULONG STDMETHODCALLTYPE heap_release(DescriptorHeap* self) {
   return static_cast<ULONG>(left);
 }
 
-// GetDesc returns a 16-byte structure: result pointer first.
-D3D12_DESCRIPTOR_HEAP_DESC* STDMETHODCALLTYPE heap_get_desc(D3D12_DESCRIPTOR_HEAP_DESC* result,
-                                                            DescriptorHeap* self) {
+// GetDesc returns a 16-byte structure (lib::struct_return_arguments).
+D3D12_DESCRIPTOR_HEAP_DESC* STDMETHODCALLTYPE heap_get_desc(void* first, void* second) {
+  DescriptorHeap* self;
+  D3D12_DESCRIPTOR_HEAP_DESC* result;
+  lib::struct_return_arguments(first, second, &kHeapInfo, &self, &result);
   *result = self->desc;
   return result;
 }

@@ -82,10 +82,14 @@ ULONG STDMETHODCALLTYPE device_release(Device* self) {
   return static_cast<ULONG>(self->refs.fetch_sub(1) - 1);
 }
 
-// Slot 26 (observed: called with node mask 1 and heap types 1, 2 and 3, the
-// result pointer first): GetCustomHeapProperties, as on the desktop.
-D3D12_HEAP_PROPERTIES* STDMETHODCALLTYPE get_custom_heap_properties(D3D12_HEAP_PROPERTIES* result, Device* self,
-                                                                   UINT node_mask, D3D12_HEAP_TYPE type) {
+// Slot 26 (observed: called with node mask 1 and heap types 1, 2 and 3):
+// GetCustomHeapProperties, as on the desktop. Structure returns take the
+// object and the result pointer in either order (lib::struct_return_arguments).
+D3D12_HEAP_PROPERTIES* STDMETHODCALLTYPE get_custom_heap_properties(void* first, void* second, UINT node_mask,
+                                                                   D3D12_HEAP_TYPE type) {
+  Device* self;
+  D3D12_HEAP_PROPERTIES* result;
+  lib::struct_return_arguments(first, second, &kDeviceInfo, &self, &result);
   *result = self->host->GetCustomHeapProperties(node_mask, type);
   return result;
 }
@@ -298,7 +302,10 @@ HRESULT STDMETHODCALLTYPE create_descriptor_heap_x(Device* self, const D3D12_DES
 // desktop; the 16-byte result comes back through the result pointer, for the
 // description the host takes (desktop_resource_desc).
 D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE get_resource_allocation_info(
-    D3D12_RESOURCE_ALLOCATION_INFO* result, Device* self, UINT, UINT count, const D3D12_RESOURCE_DESC* descs) {
+    void* first, void* second, UINT, UINT count, const D3D12_RESOURCE_DESC* descs) {
+  Device* self;
+  D3D12_RESOURCE_ALLOCATION_INFO* result;
+  lib::struct_return_arguments(first, second, &kDeviceInfo, &self, &result);
   std::vector<D3D12_RESOURCE_DESC> host;
   for (UINT i = 0; i < count; ++i) host.push_back(desktop_resource_desc(descs[i]));
   *result = self->host->GetResourceAllocationInfo(0, count, host.data());
@@ -327,8 +334,11 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE get_resource_allocation_info(
 // it with a small-resource alignment and retry without when the alignment
 // that comes back differs; a size of 4 GiB or more is fatal to them.
 D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE get_resource_allocation_info1(
-    D3D12_RESOURCE_ALLOCATION_INFO* result, Device* self, UINT, UINT count, const D3D12_RESOURCE_DESC* descs,
+    void* first, void* second, UINT, UINT count, const D3D12_RESOURCE_DESC* descs,
     D3D12_RESOURCE_ALLOCATION_INFO1* infos) {
+  Device* self;
+  D3D12_RESOURCE_ALLOCATION_INFO* result;
+  lib::struct_return_arguments(first, second, &kDeviceInfo, &self, &result);
   std::vector<D3D12_RESOURCE_DESC> host;
   for (UINT i = 0; i < count; ++i) host.push_back(desktop_resource_desc(descs[i]));
   ID3D12Device4* device4 = nullptr;
@@ -527,8 +537,11 @@ HRESULT STDMETHODCALLTYPE title_heap_get_device(TitleHeap* self, REFIID, void** 
   *device = self->device;
   return S_OK;
 }
-// GetDesc: a 48-byte structure, result pointer first.
-D3D12_HEAP_DESC* STDMETHODCALLTYPE title_heap_get_desc(D3D12_HEAP_DESC* result, TitleHeap* self) {
+// GetDesc: a 48-byte structure (lib::struct_return_arguments).
+D3D12_HEAP_DESC* STDMETHODCALLTYPE title_heap_get_desc(void* first, void* second) {
+  TitleHeap* self;
+  D3D12_HEAP_DESC* result;
+  lib::struct_return_arguments(first, second, &kTitleHeapInfo, &self, &result);
   *result = {};
   result->SizeInBytes = self->size;
   result->Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1111,6 +1124,26 @@ HRESULT STDMETHODCALLTYPE create_derived_pipeline_x(Device* self, const void* ba
                                  _ReturnAddress());
 }
 
+// Exploration (`--unimplemented continue`): a pipeline whose creation
+// reported itself as unimplemented is handed out as a placeholder whose draws
+// and dispatches are dropped (and counted), instead of the failure titles do
+// not expect from pipeline creation on the console; the title's later calls
+// then show. When unimplemented calls trap, the report has already ended the
+// process.
+template <auto Create>
+struct explored;
+template <typename... Args, HRESULT(STDMETHODCALLTYPE* Create)(Device*, Args...)>
+struct explored<Create> {
+  static HRESULT STDMETHODCALLTYPE call(Device* self, Args... args) {
+    const HRESULT hr = Create(self, args...);
+    if (hr != E_NOTIMPL || HolyTrapsUnimplemented()) return hr;
+    void** out = std::get<sizeof...(Args) - 1>(std::forward_as_tuple(args...));
+    if (!out) return hr;
+    *out = placeholder_pipeline(&kPipelineInfo, kPipelineVtable.data());
+    return S_OK;
+  }
+};
+
 const auto kDeviceVtable = [] {
   auto table = lib::make_reporting_vtable<kDeviceSlots>();
   table[0] = reinterpret_cast<void*>(&device_query_interface);
@@ -1138,15 +1171,15 @@ const auto kDeviceVtable = [] {
   table[39] = reinterpret_cast<void*>(&create_query_heap);
   table[41] = reinterpret_cast<void*>(&create_command_signature);
   table[48] = reinterpret_cast<void*>(&create_queue_x);
-  table[55] = reinterpret_cast<void*>(&create_derived_pipeline_x);
-  table[57] = reinterpret_cast<void*>(&create_native_graphics_pipeline);
+  table[55] = reinterpret_cast<void*>(&explored<&create_derived_pipeline_x>::call);
+  table[57] = reinterpret_cast<void*>(&explored<&create_native_graphics_pipeline>::call);
   table[61] = reinterpret_cast<void*>(&create_sampler_x);
-  table[62] = reinterpret_cast<void*>(&create_compute_pipeline_state_x);
-  table[67] = reinterpret_cast<void*>(&create_native_pipeline);
+  table[62] = reinterpret_cast<void*>(&explored<&create_compute_pipeline_state_x>::call);
+  table[67] = reinterpret_cast<void*>(&explored<&create_native_pipeline>::call);
   table[70] = reinterpret_cast<void*>(&create_shader_resource_view_at);
   table[73] = reinterpret_cast<void*>(&create_command_list_x);
   table[74] = reinterpret_cast<void*>(&create_heap_over_memory);
-  table[86] = reinterpret_cast<void*>(&create_pipeline_state);
+  table[86] = reinterpret_cast<void*>(&explored<&create_pipeline_state>::call);
   table[78] = reinterpret_cast<void*>(&set_frame_interval_x);
   table[79] = reinterpret_cast<void*>(&schedule_frame_event_x);
   table[108] = reinterpret_cast<void*>(&get_resource_allocation_info1);
@@ -1197,6 +1230,7 @@ Device* create_device(const void* parameters) {
   device->host = host;
   g_device = device;
   LIB_LOG(lib::kInfo, "d3d12", "host Direct3D 12 device created");
+  log_object_vtables();
   if (HolyLogEnabled(lib::kDebug)) {
     // The debug layer's warnings and errors go to the log as they happen.
     ID3D12InfoQueue1* queue = nullptr;

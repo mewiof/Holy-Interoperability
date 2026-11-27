@@ -130,10 +130,17 @@ void test_resources(void* device) {
     check(call<HRESULT>(buffer, 8, 0u, static_cast<const void*>(nullptr), &data) == S_OK &&
               data == reinterpret_cast<void*>(address),
           "mapping a placed buffer yields the title's memory");
-    D3D12_RESOURCE_DESC back{};
-    using DescFn = D3D12_RESOURCE_DESC*(STDMETHODCALLTYPE*)(D3D12_RESOURCE_DESC*, void*);
-    reinterpret_cast<DescFn>((*static_cast<void***>(buffer))[10])(&back, buffer);
-    check(back.Width == desc.Width && back.Flags == desc.Flags, "a resource reports its description");
+    // GetDesc with the result pointer first, and in the member function order
+    // (the object first) that titles' C++ code uses; the object must survive
+    // both.
+    D3D12_RESOURCE_DESC back{}, member{};
+    using DescFn = D3D12_RESOURCE_DESC*(STDMETHODCALLTYPE*)(void*, void*);
+    const auto get_desc = reinterpret_cast<DescFn>((*static_cast<void***>(buffer))[10]);
+    get_desc(&back, buffer);
+    get_desc(buffer, &member);
+    check(back.Width == desc.Width && back.Flags == desc.Flags && member.Width == desc.Width &&
+              member.Flags == desc.Flags && call<uint64_t>(buffer, 11) == address,
+          "a resource reports its description, with the result pointer first or second");
   }
 
   // A committed texture like the display buffers titles create: render target
@@ -330,11 +337,15 @@ void test_device_objects(void* device) {
     void* heap = nullptr;
     check(call<HRESULT>(device, 74, pool, 4u, &heap) == S_OK && heap, "the device makes heaps over title memory");
     if (heap) {
-      // GetDesc: a 48-byte result, result pointer first and the object second.
-      using GetDescFn = D3D12_HEAP_DESC*(STDMETHODCALLTYPE*)(D3D12_HEAP_DESC*, void*);
-      D3D12_HEAP_DESC desc{};
-      reinterpret_cast<GetDescFn>((*static_cast<void***>(heap))[8])(&desc, heap);
-      check(desc.SizeInBytes == 0x40000, "a heap over title memory reports its size");
+      // GetDesc: a 48-byte result, with the result pointer first and the
+      // object second, and the other way round (the member function order).
+      using GetDescFn = D3D12_HEAP_DESC*(STDMETHODCALLTYPE*)(void*, void*);
+      const auto get_desc = reinterpret_cast<GetDescFn>((*static_cast<void***>(heap))[8]);
+      D3D12_HEAP_DESC desc{}, member{};
+      get_desc(&desc, heap);
+      get_desc(heap, &member);
+      check(desc.SizeInBytes == 0x40000 && member.SizeInBytes == 0x40000,
+            "a heap over title memory reports its size, with the result pointer first or second");
       call<ULONG>(heap, 2);
     }
   } else {

@@ -37,6 +37,7 @@
 
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/frame_pacing.h"
+#include "core/libs/d3d12_xs/texture_dump.h"
 #include "core/libs/d3d12_xs/texture_upload.h"
 #include "core/libs/support.h"
 
@@ -528,6 +529,7 @@ HRESULT present_x(CommandQueue* queue, uint32_t plane_count, const PresentPlane*
             static_cast<unsigned long long>(token));
   }
   if (capture_due(p->presents)) capture(p, resource, format, box);
+  if (p->presents == texture_dump_frame()) dump_textures(queue->device, p->queue, p->presents);
   if (token) {
     uint64_t seen = g_last_presented.load();
     while (token > seen && !g_last_presented.compare_exchange_weak(seen, token)) {

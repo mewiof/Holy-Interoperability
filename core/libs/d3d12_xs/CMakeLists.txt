@@ -40,6 +40,8 @@ holy_add_system_library(holy_lib_d3d12_xs
     shader_container.h
     shader_dump.cpp
     shader_dump.h
+    texture_dump.cpp
+    texture_dump.h
     texture_upload.cpp
     texture_upload.h
     translation_cache.cpp

@@ -24,6 +24,7 @@
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
 #include "core/libs/d3d12_xs/ngg.h"
+#include "core/libs/d3d12_xs/texture_dump.h"
 #include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/support.h"
 
@@ -331,6 +332,7 @@ void STDMETHODCALLTYPE list_barrier(CommandList* self, UINT32 count, const D3D12
         b.pResource = b.pResource ? static_cast<Resource*>(static_cast<void*>(b.pResource))->host : nullptr;
         b.LayoutBefore = host_layout(b.LayoutBefore);
         b.LayoutAfter = host_layout(b.LayoutAfter);
+        note_texture_layout(static_cast<Resource*>(static_cast<void*>(g.pTextureBarriers[i].pResource)), b.LayoutAfter);
         textures.push_back(b);
       }
       g.pTextureBarriers = textures.data() + first;

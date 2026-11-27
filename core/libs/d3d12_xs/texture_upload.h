@@ -35,6 +35,14 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
 ID3D12Resource* placed_texture(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address,
                                UINT initial_layout, const D3D12_CLEAR_VALUE* clear);
 
+// Registers the host texture of a title resource at `address` (committed
+// textures live in memory the runtime allocates for them, as on the console),
+// so views by address find it. The registry takes a reference.
+void register_texture(const D3D12_RESOURCE_DESC& desc, uint64_t address, ID3D12Resource* texture);
+// The title released the resource: its registration goes if it is still the
+// one for that address and shape.
+void unregister_texture(const D3D12_RESOURCE_DESC& desc, uint64_t address, ID3D12Resource* texture);
+
 // How many host textures there are and their bytes in title memory, for the log.
 void host_texture_totals(uint64_t* count, uint64_t* bytes);
 

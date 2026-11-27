@@ -62,6 +62,21 @@ uint64_t report_unimplemented_slot(void* first, uint64_t a1, uint64_t a2, uint64
   return 0;
 }
 
+// Methods that return a structure. Observed: titles pass the object first and
+// the result pointer second (the compiler's convention for member functions,
+// as the desktop C++ declarations give), and on some calls the result pointer
+// first. Both leading arguments are valid pointers either way; the object is
+// the one whose `VtableInfo` is `info` (or `other`, for objects that change
+// identity, such as released resources).
+template <typename Object, typename Result>
+void struct_return_arguments(void* first, void* second, const VtableInfo* info, Object** self, Result** result,
+                             const VtableInfo* other = nullptr) {
+  const auto* candidate = static_cast<const ReportingObject*>(first);
+  const bool first_is_object = candidate && (candidate->info == info || (other && candidate->info == other));
+  *self = static_cast<Object*>(first_is_object ? first : second);
+  *result = static_cast<Result*>(first_is_object ? second : first);
+}
+
 template <int... Slots>
 std::array<void*, sizeof...(Slots)> reporting_slots(std::integer_sequence<int, Slots...>) {
   return {reinterpret_cast<void*>(&report_unimplemented_slot<Slots>)...};

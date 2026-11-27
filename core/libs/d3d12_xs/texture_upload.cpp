@@ -152,6 +152,35 @@ ID3D12Resource* placed_texture(Device* device, const D3D12_RESOURCE_DESC& desc, 
   return texture;
 }
 
+void register_texture(const D3D12_RESOURCE_DESC& desc, uint64_t address, ID3D12Resource* texture) {
+  if (!texture || !address) return;
+  const Key key = key_of(address, shape_of(desc));
+  texture->AddRef();
+  std::lock_guard<std::mutex> guard(g_lock);
+  auto found = textures().find(key);
+  if (found != textures().end()) {
+    found->second->Release();
+    found->second = texture;
+  } else {
+    textures().emplace(key, texture);
+  }
+}
+
+void unregister_texture(const D3D12_RESOURCE_DESC& desc, uint64_t address, ID3D12Resource* texture) {
+  if (!texture || !address) return;
+  const Key key = key_of(address, shape_of(desc));
+  ID3D12Resource* gone = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(g_lock);
+    auto found = textures().find(key);
+    if (found != textures().end() && found->second == texture) {
+      gone = found->second;
+      textures().erase(found);
+    }
+  }
+  if (gone) gone->Release();
+}
+
 ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address) {
   const lib::TextureShape shape = shape_of(desc);
   const Key key = key_of(address, shape);

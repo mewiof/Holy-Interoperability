@@ -16,10 +16,16 @@
 
 #include <intrin.h>
 
+#include <atomic>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <utility>
+#include <vector>
 
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
+#include "core/libs/d3d12_xs/texture_dump.h"
 #include "core/libs/d3d12_xs/texture_upload.h"
 #include "core/libs/support.h"
 
@@ -35,6 +41,113 @@ constexpr D3D12_RESOURCE_FLAGS kDesktopFlags = static_cast<D3D12_RESOURCE_FLAGS>
 // 14-15), 64 KiB alignment (bits 24-28).
 constexpr uint64_t kResourceMemoryAttributes = (0x80ull << 16) | (2ull << 14) | (16ull << 24);
 
+const lib::Counter& c_resources() {
+  static const lib::Counter c("d3d12.resources");
+  return c;
+}
+const lib::Counter& c_released_kept() {
+  static const lib::Counter c("d3d12.resources_released_kept");
+  return c;
+}
+const lib::Counter& c_used_after_release() {
+  static const lib::Counter c("d3d12.resources_used_after_release");
+  return c;
+}
+
+// --- released resources ---------------------------------------------------------------
+//
+// A resource whose last reference goes releases its host objects at once, but
+// the object itself is kept for a while with a vtable that logs any further
+// use (with the caller) and answers as the live object did: titles may hold
+// a resource's pointer in their own records after releasing it, and freed
+// object memory reused for something else turns such a stale call into a
+// jump through garbage.
+constexpr ULONGLONG kKeepReleasedMs = 10 * 60 * 1000;
+
+std::mutex g_released_lock;
+std::deque<std::pair<ULONGLONG, Resource*>>& released() {
+  static auto* list = new std::deque<std::pair<ULONGLONG, Resource*>>();
+  return *list;
+}
+
+void note_use_after_release(const Resource* self, int slot, const void* caller) {
+  c_used_after_release().add(1);
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) >= 32) return;
+  char where[64];
+  HolyDescribeAddress(caller, where, sizeof(where));
+  LIB_LOG(lib::kWarn, "d3d12",
+          "released resource %p (%llux%u, format %u, address 0x%llx) used through slot %d from %s", static_cast<const void*>(self),
+          static_cast<unsigned long long>(self->desc.Width), self->desc.Height, static_cast<unsigned>(self->desc.Format),
+          static_cast<unsigned long long>(self->title_va), slot, where);
+}
+
+HRESULT STDMETHODCALLTYPE released_query_interface(Resource* self, REFIID, void** out) {
+  note_use_after_release(self, 0, _ReturnAddress());
+  if (out) *out = nullptr;
+  return E_NOINTERFACE;
+}
+ULONG STDMETHODCALLTYPE released_add_ref(Resource* self) {
+  note_use_after_release(self, 1, _ReturnAddress());
+  return 0;
+}
+ULONG STDMETHODCALLTYPE released_release(Resource* self) {
+  note_use_after_release(self, 2, _ReturnAddress());
+  return 0;
+}
+HRESULT STDMETHODCALLTYPE released_map(Resource* self, UINT, const D3D12_RANGE*, void** data) {
+  note_use_after_release(self, 8, _ReturnAddress());
+  if (data) *data = reinterpret_cast<void*>(self->title_va);
+  return S_OK;
+}
+void STDMETHODCALLTYPE released_unmap(Resource* self, UINT, const D3D12_RANGE*) {
+  note_use_after_release(self, 9, _ReturnAddress());
+}
+const lib::VtableInfo kReleasedResourceInfo{kLibrary, "ID3D12ResourceX (released)"};
+
+D3D12_RESOURCE_DESC* STDMETHODCALLTYPE released_get_desc(void* first, void* second) {
+  Resource* self;
+  D3D12_RESOURCE_DESC* result;
+  lib::struct_return_arguments(first, second, &kReleasedResourceInfo, &self, &result, &kResourceInfo);
+  note_use_after_release(self, 10, _ReturnAddress());
+  *result = self->desc;
+  return result;
+}
+D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE released_get_gpu_virtual_address(Resource* self) {
+  note_use_after_release(self, 11, _ReturnAddress());
+  return self->title_va;
+}
+
+const auto kReleasedVtable = [] {
+  auto table = lib::make_reporting_vtable<kResourceSlots>();
+  table[0] = reinterpret_cast<void*>(&released_query_interface);
+  table[1] = reinterpret_cast<void*>(&released_add_ref);
+  table[2] = reinterpret_cast<void*>(&released_release);
+  table[8] = reinterpret_cast<void*>(&released_map);
+  table[9] = reinterpret_cast<void*>(&released_unmap);
+  table[10] = reinterpret_cast<void*>(&released_get_desc);
+  table[11] = reinterpret_cast<void*>(&released_get_gpu_virtual_address);
+  return table;
+}();
+
+void keep_released(Resource* self) {
+  self->vtable = kReleasedVtable.data();
+  self->info = &kReleasedResourceInfo;
+  std::vector<Resource*> expired;
+  const ULONGLONG now = GetTickCount64();
+  {
+    std::lock_guard<std::mutex> guard(g_released_lock);
+    auto& list = released();
+    list.emplace_back(now, self);
+    while (!list.empty() && now - list.front().first > kKeepReleasedMs) {
+      expired.push_back(list.front().second);
+      list.pop_front();
+    }
+  }
+  c_released_kept().add(1 - static_cast<int64_t>(expired.size()));
+  for (Resource* old : expired) delete old;
+}
+
 HRESULT STDMETHODCALLTYPE resource_query_interface(Resource* self, REFIID, void** out) {
   if (!out) return E_POINTER;
   self->refs.fetch_add(1);
@@ -47,9 +160,14 @@ ULONG STDMETHODCALLTYPE resource_add_ref(Resource* self) {
 ULONG STDMETHODCALLTYPE resource_release(Resource* self) {
   const long left = self->refs.fetch_sub(1) - 1;
   if (left == 0) {
+    if (self->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) unregister_texture(self->desc, self->title_va, self->host);
     if (self->host) self->host->Release();
+    self->host = nullptr;
     if (self->runtime_memory) XMemFree(self->runtime_memory, kResourceMemoryAttributes);
-    delete self;
+    self->runtime_memory = nullptr;
+    c_resources().add(-1);
+    unregister_live_resource(self);
+    keep_released(self);
   }
   return static_cast<ULONG>(left);
 }
@@ -60,8 +178,12 @@ HRESULT STDMETHODCALLTYPE resource_map(Resource* self, UINT, const D3D12_RANGE*,
 }
 void STDMETHODCALLTYPE resource_unmap(Resource*, UINT, const D3D12_RANGE*) {}
 
-// C-style structure return (see device.cpp).
-D3D12_RESOURCE_DESC* STDMETHODCALLTYPE resource_get_desc(D3D12_RESOURCE_DESC* result, Resource* self) {
+// A structure return (lib::struct_return_arguments): observed, titles pass
+// the resource first and the result pointer second.
+D3D12_RESOURCE_DESC* STDMETHODCALLTYPE resource_get_desc(void* first, void* second) {
+  Resource* self;
+  D3D12_RESOURCE_DESC* result;
+  lib::struct_return_arguments(first, second, &kResourceInfo, &self, &result, &kReleasedResourceInfo);
   *result = self->desc;
   return result;
 }
@@ -206,16 +328,31 @@ HRESULT create_committed_resource(Device* device, const D3D12_HEAP_PROPERTIES* p
   void* memory = XMemAlloc(static_cast<SIZE_T>(size.SizeInBytes), kResourceMemoryAttributes);
   auto* resource = new Resource();
   resource->vtable = kResourceVtable.data();
+  c_resources().add(1);
+  register_live_resource(resource);
   resource->info = &kResourceInfo;
   resource->host = host;
   resource->desc = *desc;
   resource->runtime_memory = memory;
+  if (layout) resource->layout.store(static_cast<int>(state));
   if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     resource->host_va = host->GetGPUVirtualAddress();
     resource->title_va = resource->host_va;
+  } else if (memory) {
+    // As on the console, the texture's GPU address is the memory taken for
+    // it; views the title makes at that address find this host texture.
+    resource->title_va = reinterpret_cast<uint64_t>(memory);
+    register_texture(*desc, resource->title_va, host);
   }
   *out = resource;
   return S_OK;
+}
+
+void log_object_vtables() {
+  char live[64], gone[64];
+  HolyDescribeAddress(kResourceVtable.data(), live, sizeof(live));
+  HolyDescribeAddress(kReleasedVtable.data(), gone, sizeof(gone));
+  LIB_LOG(lib::kDebug, "d3d12", "vtables: resource %s, released resource %s", live, gone);
 }
 
 HRESULT create_placed_resource_x(Device* device, uint64_t address, const D3D12_RESOURCE_DESC* desc,
@@ -232,8 +369,11 @@ HRESULT create_placed_resource_x(Device* device, uint64_t address, const D3D12_R
     if (!texture) return E_OUTOFMEMORY;
     auto* resource = new Resource();
     resource->vtable = kResourceVtable.data();
+    c_resources().add(1);
+    register_live_resource(resource);
     resource->info = &kResourceInfo;
     resource->host = texture;
+    resource->layout.store(static_cast<int>(state));
     resource->title_va = address;
     resource->desc = *desc;
     *out = resource;
@@ -268,6 +408,8 @@ HRESULT create_placed_resource_x(Device* device, uint64_t address, const D3D12_R
   }
   auto* resource = new Resource();
   resource->vtable = kResourceVtable.data();
+  c_resources().add(1);
+  register_live_resource(resource);
   resource->info = &kResourceInfo;
   resource->host = host;
   resource->title_va = address;

@@ -98,9 +98,13 @@ struct Resource {
   uint64_t host_va = 0;   // the same place in the host's GPU address space
   D3D12_RESOURCE_DESC desc{};
   void* runtime_memory = nullptr;  // XMemAlloc'd as the console runtime does
+  std::atomic<int> layout{-1};      // textures: the layout last recorded (texture_dump.h), -1 unknown
 };
 
 Device* create_device(const void* parameters);
+
+// With debug logging: where the resource vtables are (for reading crash reports).
+void log_object_vtables();
 
 // Logs why the host device was removed, with the device-removed extended
 // data when it was enabled (debug logging). Nothing when it was not removed.

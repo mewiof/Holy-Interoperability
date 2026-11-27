@@ -43,6 +43,11 @@
 namespace holy::d3d12 {
 namespace {
 
+// The title's call into a device method wrapped for exploration (`explored`
+// below), so reports name the title's code rather than the wrapper.
+thread_local const void* t_api_caller = nullptr;
+#define CALLER() (t_api_caller ? t_api_caller : _ReturnAddress())
+
 const lib::VtableInfo kDeviceInfo{kLibrary, "ID3D12DeviceX"};
 
 // {5405c344-d457-444e-b4dd-2366e45aee39}, observed as the device's id.
@@ -70,7 +75,7 @@ HRESULT STDMETHODCALLTYPE device_query_interface(Device* self, REFIID iid, void*
   char symbol[96];
   std::snprintf(symbol, sizeof(symbol), "ID3D12DeviceX::QueryInterface(%08lx-%04x-%04x)", iid.Data1, iid.Data2,
                 iid.Data3);
-  HolyUnimplementedFrom(kLibrary, symbol, _ReturnAddress());
+  HolyUnimplementedFrom(kLibrary, symbol, CALLER());
   return E_NOINTERFACE;
 }
 ULONG STDMETHODCALLTYPE device_add_ref(Device* self) {
@@ -247,7 +252,7 @@ HRESULT STDMETHODCALLTYPE wait_frame_event_x(Device*, UINT type, UINT timeout_ms
                                              UINT64* token) {
   if (!token) return E_POINTER;
   if (target) {
-    HolyUnimplementedFrom(kLibrary, "WaitFrameEventX(with a target output)", _ReturnAddress());
+    HolyUnimplementedFrom(kLibrary, "WaitFrameEventX(with a target output)", CALLER());
     return E_NOTIMPL;
   }
   if (type == 0) {
@@ -262,7 +267,7 @@ HRESULT STDMETHODCALLTYPE wait_frame_event_x(Device*, UINT type, UINT timeout_ms
   }
   if (type == 2) return wait_for_presented(*token, timeout_ms);
   LIB_LOG(lib::kError, "d3d12", "WaitFrameEventX type %u flags 0x%x", type, flags);
-  HolyUnimplementedFrom(kLibrary, "WaitFrameEventX(event type)", _ReturnAddress());
+  HolyUnimplementedFrom(kLibrary, "WaitFrameEventX(event type)", CALLER());
   return E_NOTIMPL;
 }
 
@@ -296,7 +301,7 @@ UINT STDMETHODCALLTYPE get_descriptor_handle_increment_size(Device*, D3D12_DESCR
 HRESULT STDMETHODCALLTYPE create_placed_resource(Device* self, D3D12_GPU_VIRTUAL_ADDRESS address,
                                                  const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
                                                  const D3D12_CLEAR_VALUE* clear, REFIID, void** resource) {
-  return create_placed_resource_x(self, address, desc, state, clear, resource, _ReturnAddress());
+  return create_placed_resource_x(self, address, desc, state, clear, resource, CALLER());
 }
 
 HRESULT STDMETHODCALLTYPE create_descriptor_heap_x(Device* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID,
@@ -635,7 +640,7 @@ HRESULT STDMETHODCALLTYPE create_command_signature(Device* self, const D3D12_COM
       arguments[i] = {};
       arguments[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
     } else if (desc->pArgumentDescs[i].Type > D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH) {
-      HolyUnimplementedFrom(kLibrary, "command signature with a console argument type", _ReturnAddress());
+      HolyUnimplementedFrom(kLibrary, "command signature with a console argument type", CALLER());
       return E_NOTIMPL;
     }
   }
@@ -813,18 +818,18 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline_state_x(Device* self, const D3
   std::vector<uint8_t> shader;
   const ShaderFormat format = rebuild_desktop_container(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, shader);
   if (format == ShaderFormat::NativeOnly) {
-    return create_translated_compute_pipeline(self, desc, pipeline, _ReturnAddress());
+    return create_translated_compute_pipeline(self, desc, pipeline, CALLER());
   }
   if (format == ShaderFormat::Unknown) {
     dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
-    HolyUnimplementedFrom(kLibrary, "compute pipeline with an unknown shader format", _ReturnAddress());
+    HolyUnimplementedFrom(kLibrary, "compute pipeline with an unknown shader format", CALLER());
     return E_NOTIMPL;
   }
   const uint64_t hash = shader_hash(desc->CS.pShaderBytecode, desc->CS.BytecodeLength);
   if (host_refused_before(hash)) {
     NativeComputeProgram probe;
     if (native_compute_program(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, &probe)) {
-      return create_translated_compute_pipeline(self, desc, pipeline, _ReturnAddress());
+      return create_translated_compute_pipeline(self, desc, pipeline, CALLER());
     }
   }
   D3D12_COMPUTE_PIPELINE_STATE_DESC host = *desc;
@@ -844,7 +849,7 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline_state_x(Device* self, const D3
     const bool native = native_compute_program(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, &probe);
     LIB_LOG(lib::kWarn, "d3d12", "the host refused a compute pipeline (0x%08lX)%s", static_cast<unsigned long>(hr),
             native ? "; translating its native code" : "");
-    if (native) return create_translated_compute_pipeline(self, desc, pipeline, _ReturnAddress());
+    if (native) return create_translated_compute_pipeline(self, desc, pipeline, CALLER());
     dump_shader(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "compute");
     return hr;
   }
@@ -854,7 +859,7 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline_state_x(Device* self, const D3
 
 HRESULT STDMETHODCALLTYPE create_pipeline_state(Device* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID,
                                                 void** pipeline) {
-  return create_pipeline_from_stream(self, desc, &kPipelineInfo, kPipelineVtable.data(), pipeline, _ReturnAddress());
+  return create_pipeline_from_stream(self, desc, &kPipelineInfo, kPipelineVtable.data(), pipeline, CALLER());
 }
 
 // Observed: device slot 67 takes (description, pipeline interface id, out)
@@ -870,7 +875,7 @@ HRESULT STDMETHODCALLTYPE create_native_pipeline(Device* self, const uint64_t* d
   const auto* code = reinterpret_cast<const uint8_t*>(desc[5]);
   const size_t code_size = desc[6];
   if (!registers || !code || !code_size) {
-    HolyUnimplementedFrom(kLibrary, "compute pipeline from native code: unexpected description", _ReturnAddress());
+    HolyUnimplementedFrom(kLibrary, "compute pipeline from native code: unexpected description", CALLER());
     return E_NOTIMPL;
   }
   ComputeShaderInfo info;
@@ -879,12 +884,12 @@ HRESULT STDMETHODCALLTYPE create_native_pipeline(Device* self, const uint64_t* d
     LIB_LOG(lib::kError, "d3d12", "native compute registers (%s): %08x %08x %08x %08x %08x %08x %08x", error.c_str(),
             registers[0], registers[1], registers[2], registers[3], registers[4], registers[5], registers[6]);
     dump_shader(code, code_size, "native compute");
-    HolyUnimplementedFrom(kLibrary, ("compute pipeline from native code: " + error).c_str(), _ReturnAddress());
+    HolyUnimplementedFrom(kLibrary, ("compute pipeline from native code: " + error).c_str(), CALLER());
     return E_NOTIMPL;
   }
   LIB_LOG(lib::kDebug, "d3d12", "native compute pipeline: %u x %u x %u threads, %u user SGPRs, rsrc2 0x%08X",
           info.threads[0], info.threads[1], info.threads[2], info.user_sgprs, registers[6]);
-  return create_compute_pipeline_from_code(self, code, code_size, info, code, code_size, out, _ReturnAddress());
+  return create_compute_pipeline_from_code(self, code, code_size, info, code, code_size, out, CALLER());
 }
 
 // Blend factors and functions by their public RDNA encodings
@@ -968,7 +973,7 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   }
   if (!native_graphics_description(desc, &native, &error)) {
     if (desc[5] && desc[6]) dump_shader(reinterpret_cast<const void*>(desc[5]), desc[6], "native graphics");
-    HolyUnimplementedFrom(kLibrary, ("graphics pipeline from native code: " + error).c_str(), _ReturnAddress());
+    HolyUnimplementedFrom(kLibrary, ("graphics pipeline from native code: " + error).c_str(), CALLER());
     return E_NOTIMPL;
   }
   ProgramRef vs, ps;
@@ -980,7 +985,7 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
     LIB_LOG(lib::kError, "d3d12", "native %s shader %016llx not translatable: %s",
             stage == GraphicsStage::Vertex ? "vertex" : "pixel", static_cast<unsigned long long>(shader_hash(code, size)),
             error.c_str());
-    HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), _ReturnAddress());
+    HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), CALLER());
     return false;
   };
   // NGG vertex programs run as a compute pass before a draw of its records
@@ -997,7 +1002,7 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
         dump_shader(native.vertex_code, native.vertex_size, "native graphics");
         LIB_LOG(lib::kError, "d3d12", "native NGG program %016llx not translatable: %s",
                 static_cast<unsigned long long>(shader_hash(native.vertex_code, native.vertex_size)), error.c_str());
-        HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), _ReturnAddress());
+        HolyUnimplementedFrom(kLibrary, ("native shader code: " + error).c_str(), CALLER());
         return E_NOTIMPL;
       }
       on_disk = store_translation(key, cs, &vs_link, &ngg_info);
@@ -1127,7 +1132,7 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
 HRESULT STDMETHODCALLTYPE create_derived_pipeline_x(Device* self, const void* base, UINT count, const uint8_t* entries,
                                                     REFIID, void** out) {
   return create_derived_pipeline(self, base, count, entries, &kPipelineInfo, kPipelineVtable.data(), out,
-                                 _ReturnAddress());
+                                 CALLER());
 }
 
 // Exploration (`--unimplemented continue`): a pipeline whose creation
@@ -1141,7 +1146,9 @@ struct explored;
 template <typename... Args, HRESULT(STDMETHODCALLTYPE* Create)(Device*, Args...)>
 struct explored<Create> {
   static HRESULT STDMETHODCALLTYPE call(Device* self, Args... args) {
+    t_api_caller = _ReturnAddress();
     const HRESULT hr = Create(self, args...);
+    t_api_caller = nullptr;
     if (hr != E_NOTIMPL || HolyTrapsUnimplemented()) return hr;
     void** out = std::get<sizeof...(Args) - 1>(std::forward_as_tuple(args...));
     if (!out) return hr;

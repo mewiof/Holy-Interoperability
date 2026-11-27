@@ -54,7 +54,7 @@ flowchart LR
 | Graphics: shader translation | `█████░░░░░` 45% (ray-intersection instructions open) |
 | Graphics: pipelines and caches | `███████░░░` 70% |
 | Graphics: correct output | `███░░░░░░░` 28% (fence values belong to their fence; textures read with all four channels; texture copies follow the title's writes; native pipelines get their targets, depth tests and vertices right) |
-| Graphics: performance | `██░░░░░░░░` 15% (memory accesses: two page-table reads instead of a scan; no views written per draw) |
+| Graphics: performance | `██░░░░░░░░` 18% (memory accesses: two page-table reads instead of a scan; no views written per draw; recording a draw of native programs costs 0.3 us of CPU time, 0.4 us with a pipeline and table change each draw, measured over 20,000 draws) |
 | Input | `████░░░░░░` 40% |
 | Audio | `█░░░░░░░░░` 10% |
 | Measurement: statistics, profiler, leak checks, call check, frame trace | `████████░░` 75% |

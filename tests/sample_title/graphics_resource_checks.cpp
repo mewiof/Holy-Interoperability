@@ -1094,6 +1094,211 @@ void test_native_draw(void* device, void* queue) {
   VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+// What recording a draw of native programs costs the CPU, as titles record
+// them in a frame: root constants, a root constant buffer and the draw, with a
+// table of 32 buffer views bound; then with the pipeline (one of two) and the
+// table set again before each draw. Measured, printed, and held to a bound
+// well above what a frame of thousands of draws can afford (a regression
+// check); the list then runs, so every draw is one the GPU takes.
+void test_draw_recording_cost(void* device, void* queue) {
+  void* allocator = nullptr;
+  void* list = nullptr;
+  void* fence = nullptr;
+  void* heap = nullptr;
+  void* targets = nullptr;
+  void* root = nullptr;
+  void* pipeline = nullptr;
+  void* other_pipeline = nullptr;  // the same programs, another rasterizer state
+  void* target = nullptr;
+  const uint32_t list_desc[4] = {0, 2, 1, 0};
+  call<HRESULT>(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), &allocator);
+  if (allocator) call<HRESULT>(device, 73, list_desc, allocator, static_cast<void*>(nullptr), kListIid, &list);
+  call<HRESULT>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), &fence);
+  constexpr UINT kViews = 32;
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kViews,
+                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 1};
+  call<HRESULT>(device, 14, &heap_desc, __uuidof(ID3D12DescriptorHeap), &heap);
+  D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 1};
+  call<HRESULT>(device, 14, &rtv_desc, __uuidof(ID3D12DescriptorHeap), &targets);
+
+  // Root signature: a table of buffer views, a constant buffer, constants.
+  D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kViews, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+  D3D12_ROOT_PARAMETER1 parameters[3] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable = {1, &range};
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  parameters[1].Descriptor = {0, 0, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
+  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[2].Constants = {1, 0, 4};
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+  root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  root_desc.Desc_1_1.NumParameters = 3;
+  root_desc.Desc_1_1.pParameters = parameters;
+  ID3DBlob* serialized = nullptr;
+  if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&root_desc, &serialized, nullptr)) && serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &root);
+  }
+  // The programs of test_native_draw.
+  const std::vector<uint8_t> native_vs = native_only_container(
+      {0x4A000002u, 0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xE0382000u, 0x80010100u, 0xE0382010u, 0x80010500u,
+       0xBF8C3F70u, 0xF800020Fu, 0x08070605u, 0xF80008CFu, 0x04030201u, 0xBF810000u});
+  const std::vector<uint8_t> native_ps = native_only_container(
+      {0xC80A0002u, 0xC80E0102u, 0xC8120202u, 0xC8160302u, 0xF800080Fu, 0x05040302u, 0xBF810000u});
+  struct alignas(void*) RootSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+    void* value;
+  };
+  struct alignas(void*) ShaderSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+    D3D12_SHADER_BYTECODE value;
+  };
+  struct alignas(void*) TopologySubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY;
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  };
+  struct alignas(void*) FormatsSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+    D3D12_RT_FORMAT_ARRAY value{{DXGI_FORMAT_R8G8B8A8_UNORM}, 1};
+  };
+  struct Stream {
+    RootSubobject root;
+    ShaderSubobject vs;
+    ShaderSubobject ps;
+    TopologySubobject topology;
+    FormatsSubobject formats;
+  } stream{};
+  stream.root.value = root;
+  stream.vs = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {native_vs.data(), native_vs.size()}};
+  stream.ps = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {native_ps.data(), native_ps.size()}};
+  D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+  if (root) call<HRESULT>(device, 86, &stream_desc, __uuidof(ID3D12PipelineState), &pipeline);
+  struct alignas(void*) RasterizerSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+    D3D12_RASTERIZER_DESC value{D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE, FALSE, 0, 0.0f, 0.0f, TRUE, FALSE,
+                                FALSE, 0, D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF};
+  };
+  struct OtherStream {
+    Stream base;
+    RasterizerSubobject rasterizer;
+  } other{stream, {}};
+  D3D12_PIPELINE_STATE_STREAM_DESC other_desc{sizeof(other), &other};
+  if (root) call<HRESULT>(device, 86, &other_desc, __uuidof(ID3D12PipelineState), &other_pipeline);
+
+  D3D12_HEAP_PROPERTIES local{};
+  local.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC texture{};
+  texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  texture.Width = 64;
+  texture.Height = 64;
+  texture.DepthOrArraySize = 1;
+  texture.MipLevels = 1;
+  texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture.SampleDesc.Count = 1;
+  texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  call<HRESULT>(device, 127, &local, D3D12_HEAP_FLAG_NONE, &texture, static_cast<UINT>(D3D12_BARRIER_LAYOUT_RENDER_TARGET),
+                static_cast<const D3D12_CLEAR_VALUE*>(nullptr), static_cast<void*>(nullptr), 0u,
+                static_cast<const void*>(nullptr), __uuidof(ID3D12Resource), &target);
+  // Vertices, constant buffers and the viewed buffers in title memory.
+  constexpr SIZE_T kMemory = 0x100000;
+  auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, kMemory, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  if (!list || !fence || !heap || !targets || !root || !pipeline || !other_pipeline || !target || !memory) {
+    check(false, "the objects for measuring draw recording exist");
+    return;
+  }
+  const float vertices[3][8] = {{-1, -1, 0, 1, 0.25f, 0.5f, 0.75f, 1},
+                                {-1, 3, 0, 1, 0.25f, 0.5f, 0.75f, 1},
+                                {3, -1, 0, 1, 0.25f, 0.5f, 0.75f, 1}};
+  std::memcpy(memory, vertices, sizeof(vertices));
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  struct {
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+    uint64_t address;
+  } view{};
+  view.srv.Format = DXGI_FORMAT_R32_TYPELESS;
+  view.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  view.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  view.srv.Buffer.NumElements = 1024;
+  view.srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+  D3D12_RESOURCE_DESC viewed{};
+  viewed.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  viewed.Width = 4096;
+  viewed.Height = viewed.DepthOrArraySize = viewed.MipLevels = 1;
+  viewed.SampleDesc.Count = 1;
+  viewed.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  const uint64_t first_view = call<uint64_t>(heap, 9);
+  for (UINT i = 0; i < kViews; ++i) {
+    view.address = base + 0x10000 + i * 0x1000ull;
+    call<void>(device, 70, &viewed, &view, first_view + i * 32ull);
+  }
+  const uint64_t rtv = call<uint64_t>(targets, 9);
+  call<void>(device, 20, target, static_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(nullptr), rtv);
+
+  constexpr uint32_t kDraws = 20000;
+  bool recorded = call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
+  void* heaps[] = {heap};
+  call<void>(list, 32, 1u, static_cast<void* const*>(heaps));
+  call<void>(list, 25, pipeline);
+  call<void>(list, 34, root);
+  call<void>(list, 36, 0u, call<uint64_t>(heap, 10));
+  call<void>(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VERTEX_BUFFER_VIEW vertex_buffer{base, sizeof(vertices), 32};
+  call<void>(list, 48, 0u, 1u, &vertex_buffer);
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle{static_cast<SIZE_T>(rtv)};
+  call<void>(list, 50, 1u, &rtv_handle, FALSE, static_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(nullptr));
+  const D3D12_VIEWPORT viewport{0, 0, 64, 64, 0, 1};
+  const D3D12_RECT scissor{0, 0, 64, 64};
+  call<void>(list, 21, 1u, &viewport);
+  call<void>(list, 22, 1u, &scissor);
+  LARGE_INTEGER frequency{}, start{}, end{};
+  QueryPerformanceFrequency(&frequency);
+  QueryPerformanceCounter(&start);
+  for (uint32_t i = 0; i < kDraws; ++i) {
+    const uint32_t constants[4] = {i, i * 3, i * 5, i * 7};
+    call<void>(list, 40, 2u, 4u, static_cast<const void*>(constants), 0u);
+    call<void>(list, 42, 1u, base + 0x8000 + (i % 64) * 256ull);
+    call<void>(list, 12, 3u, 1u, 0u, 0u);
+  }
+  QueryPerformanceCounter(&end);
+  const double per_draw_us =
+      static_cast<double>(end.QuadPart - start.QuadPart) * 1e6 / static_cast<double>(frequency.QuadPart) / kDraws;
+  const uint64_t table = call<uint64_t>(heap, 10);
+  QueryPerformanceCounter(&start);
+  for (uint32_t i = 0; i < kDraws; ++i) {
+    call<void>(list, 25, (i & 1) ? other_pipeline : pipeline);
+    call<void>(list, 36, 0u, table);
+    const uint32_t constants[4] = {i, i * 3, i * 5, i * 7};
+    call<void>(list, 40, 2u, 4u, static_cast<const void*>(constants), 0u);
+    call<void>(list, 42, 1u, base + 0x8000 + (i % 64) * 256ull);
+    call<void>(list, 12, 3u, 1u, 0u, 0u);
+  }
+  QueryPerformanceCounter(&end);
+  recorded = recorded && call<HRESULT>(list, 9) == S_OK;
+  const double per_changing_draw_us =
+      static_cast<double>(end.QuadPart - start.QuadPart) * 1e6 / static_cast<double>(frequency.QuadPart) / kDraws;
+  void* lists[] = {list};
+  call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+  call<HRESULT>(queue, 16, fence, UINT64{1});
+  const auto* value = call<const volatile uint64_t*>(fence, 12);
+  for (int i = 0; value && *value < 1 && i < 10000; ++i) Sleep(1);
+  std::printf("    (recording a draw of native programs: %.2f us of CPU time; %.2f us with the pipeline and table set "
+              "again; over %u draws each; fence %llu)\n",
+              per_draw_us, per_changing_draw_us, kDraws, static_cast<unsigned long long>(value ? *value : 0));
+  check(recorded && value && *value == 1 && per_draw_us < 20.0 && per_changing_draw_us < 20.0,
+        "a draw of native programs with root arguments records in well under 20 us and runs");
+
+  call<ULONG>(target, 2);
+  call<ULONG>(other_pipeline, 2);
+  call<ULONG>(pipeline, 2);
+  call<ULONG>(root, 2);
+  call<ULONG>(targets, 2);
+  call<ULONG>(heap, 2);
+  call<ULONG>(fence, 2);
+  call<ULONG>(list, 2);
+  call<ULONG>(allocator, 2);
+  VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 // Pipelines from native descriptions (device slot 57). `stencil` false: the
 // render state tests and writes depth (DB_DEPTH_CONTROL: less), and a near
 // triangle drawn before a far one keeps its colour. True: a first pipeline
@@ -1327,6 +1532,7 @@ void test_native_depth(void* device, void* queue, bool stencil) {
 
 void test_graphics_resources(void* device, void* queue) {
   if (queue) test_native_draw(device, queue);
+  if (queue) test_draw_recording_cost(device, queue);
   if (queue) test_native_depth(device, queue, false);
   if (queue) test_native_depth(device, queue, true);
   test_page_mapping_update(device);

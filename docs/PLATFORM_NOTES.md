@@ -496,7 +496,10 @@ Notes describe the platform, never a title.
   CPU's and the kernel's (`ReadFile`) writes to it, heap or not (measured). xmem reserves title memory with write
   watching; host copies of textures in it are copied again before a submission when their pages were written
   (asked at most every 16 ms), and remapped physical pages, released memory and writes libraries announce mark them
-  too. *measured*: protection changes are refused on the view of a section a heap was opened over, but not on
+  too. *measured* (development host): `GetWriteWatch` with reset costs about 0.55 us per MiB of the range asked
+  about (1.2 ms over 2.25 GiB with 1 GiB touched), about 0.2 us for a small range, and the kernel touches the
+  whole output array each call (room for a million pages: 0.5 ms); so textures are asked about stretch by
+  stretch (gaps under 256 KiB joined), not over the span between the first and the last. *measured*: protection changes are refused on the view of a section a heap was opened over, but not on
   another view of the same section, and a write to a read-only view faults. The GPU reaches physical pages through
   views of its own, so textures in physical pages are watched through the title's views by page protection (the
   first write makes the page writable again and the texture dirty; kernel writes the runtime announces drop the

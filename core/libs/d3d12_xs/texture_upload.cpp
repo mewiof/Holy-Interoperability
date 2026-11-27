@@ -245,20 +245,33 @@ void apply_changes() {
 }
 
 // Applies queued changes and, at most every 16 ms (about once a frame), asks
-// the host which tracked pages were written: one query per tracked
-// allocation, over the span its textures cover (g_lock held).
+// the host which tracked pages were written: per tracked allocation, one
+// query per stretch its textures cover (g_lock held). Measured (development
+// host): a query costs about 0.55 us per MiB it covers, about 0.2 us for a
+// small one, so textures scattered over a pool of gigabytes are asked about
+// where they are, not over the span between them (about 1 ms a scan).
 void scan() {
   apply_changes();
   release_retired();
   const ULONGLONG now = GetTickCount64();
   if (now - g_last_scan < 16) return;
   g_last_scan = now;
+  std::vector<std::pair<uint64_t, uint64_t>> stretches;
   for (auto& [base, allocation] : tracked()) {
     if (allocation.records.empty()) continue;
-    uint64_t first = UINT64_MAX, last = 0;
-    for (const Record* record : allocation.records) {
-      first = std::min(first, record->address);
-      last = std::max(last, record->address + record->size);
+    stretches.clear();
+    for (const Record* record : allocation.records) stretches.emplace_back(record->address, record->address + record->size);
+    std::sort(stretches.begin(), stretches.end());
+    constexpr uint64_t kJoin = 256ull << 10;  // gaps below this cost less than another query
+    uint64_t first = stretches.front().first, last = stretches.front().second;
+    for (size_t i = 1; i < stretches.size(); ++i) {
+      if (stretches[i].first <= last + kJoin) {
+        last = std::max(last, stretches[i].second);
+        continue;
+      }
+      scan_range(allocation, first, last);
+      first = stretches[i].first;
+      last = stretches[i].second;
     }
     scan_range(allocation, first, last);
   }

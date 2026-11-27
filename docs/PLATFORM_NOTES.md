@@ -233,6 +233,11 @@ Notes describe the platform, never a title.
     process ends, whether the heap was released or not (1 GiB a section here; only a restart of the host gives
     it back); a heap opened over a mapped view of the same section (`OpenExistingHeapFromAddress`) does not.
     The project only opens heaps over addresses.
+  - *measured* host behaviour (development host): heaps opened over existing memory are cross-adapter heaps
+    (flags shared and shared cross-adapter), and mapping tiles of a reserved buffer into one
+    (`UpdateTileMappings`) removes the device (`DXGI_ERROR_INVALID_CALL`), with or without the cross-adapter flag on
+    the buffer. Title memory therefore cannot be given to the GPU as reserved buffers whose tiles follow the
+    physical pages; pages that are not contiguous in one section stay separate pieces of GPU memory.
   - Committed textures report the memory the runtime took for them (`XMemAlloc`, as on the console) as their
     GPU address, and views the title makes at that address find the committed texture.
   - *observed*: titles commit stretches of a reservation and leave the rest reserved. *observed* host

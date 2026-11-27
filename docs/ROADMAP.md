@@ -108,10 +108,11 @@ The largest piece.
   longer leak system commit after the process ends.
 - done: packed 16-bit render targets and depth textures that ask for unordered access are made as the host
   supports them (the reference title stopped at its own checks on both).
-- next: title memory as tiled host resources: a reserved buffer per placeholder region whose 64 KiB tiles map to
-  the physical pages' storage (UpdateTileMappings, in queue order like the console's page mapping updates), so
-  buffers over pages that are not contiguous in one section can be placed (the reference title stops at its own
-  check when one cannot).
+- next: buffers over physical pages that are not contiguous in one section (the reference title stops at its own
+  check when one cannot be placed; seen with the host's commit exhausted, when sections can only be reserved).
+  Tiled host buffers over the pages are not possible (the host refuses tile mappings into heaps over existing
+  memory, measured); the direction is a page table translated programs consult (title page to section heap and
+  slot), which also replaces the per-access scan of the region table.
 - next: textures streamed into scattered pool pages are copied through the CPU.
 - open: textures the GPU writes in title memory as seen by the CPU.
 - open: console extensions: presentation and frame pacing, title-managed graphics memory and placed

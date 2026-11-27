@@ -179,7 +179,7 @@ struct Gpu {
       const D3D12_HEAP_PROPERTIES upload = heap_of(D3D12_HEAP_TYPE_UPLOAD);
       D3D12_RESOURCE_DESC buffer{};
       buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      buffer.Width = kPageTableLevel1Bytes + kPageTableTableBytes;
+      buffer.Width = kPageTableLevel2Base + kPageTableTableBytes;
       buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
       buffer.SampleDesc.Count = 1;
       buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -192,12 +192,12 @@ struct Gpu {
       if (FAILED(page_table->Map(0, nullptr, reinterpret_cast<void**>(&table)))) return false;
       std::memset(table, 0, static_cast<size_t>(buffer.Width));
       table[4] = 1;
-      table[kPageTableLevel1Bytes / 4] = 1;
-      table[kPageTableLevel1Bytes / 4 + 1] = 0;
-      table[kPageTableLevel1Bytes / 4 + 2] = 1;
-      table[kPageTableLevel1Bytes / 4 + 3] = 0x40;
-      table[kPageTableLevel1Bytes / 4 + 4] = 1;
-      table[kPageTableLevel1Bytes / 4 + 5] = 0xFFFFFFC0u;
+      table[kPageTableLevel2Base / 4] = 1;
+      table[kPageTableLevel2Base / 4 + 1] = 0;
+      table[kPageTableLevel2Base / 4 + 2] = 1;
+      table[kPageTableLevel2Base / 4 + 3] = 0x40;
+      table[kPageTableLevel2Base / 4 + 4] = 1;
+      table[kPageTableLevel2Base / 4 + 5] = 0xFFFFFFC0u;
       page_table->Unmap(0, nullptr);
     }
     D3D12_DESCRIPTOR_HEAP_DESC rtv_heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -615,6 +615,101 @@ TEST(page_table_entries_place_pages_at_their_view_offsets) {
   EXPECT(after[32] == 0x1010);  // word 16, through the second page
   EXPECT(after[33] == 0x1010);  // word 16, through the third page
   EXPECT(after[34] == 0);       // before the view
+}
+
+// Cached pages (shader/translate.h): the fourth page of the window is cache
+// line 0, whose copy is slot 2 (a buffer holding 0x2000 + i) and whose page
+// itself is slot 1 from view offset 0x80. Reads take the copy until a write;
+// the write goes to the page and sets the line's flag; reads after it take
+// the page.
+TEST(cached_pages_read_their_copy_until_written) {
+  Gpu gpu;
+  if (!gpu.open()) {
+    std::printf("      (no Direct3D 12 device: not run)\n");
+    return;
+  }
+  D3D12_HEAP_PROPERTIES write_back{};
+  write_back.Type = D3D12_HEAP_TYPE_CUSTOM;
+  write_back.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+  write_back.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 256;
+  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  ID3D12Resource* copy = nullptr;
+  ID3D12Resource* flags = nullptr;
+  EXPECT(SUCCEEDED(gpu.device->CreateCommittedResource(&write_back, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                       D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
+                                                       reinterpret_cast<void**>(&copy))));
+  EXPECT(SUCCEEDED(gpu.device->CreateCommittedResource(&write_back, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                       D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
+                                                       reinterpret_cast<void**>(&flags))));
+  if (!copy || !flags) return;
+  uint32_t* words = nullptr;
+  copy->Map(0, nullptr, reinterpret_cast<void**>(&words));
+  for (uint32_t i = 0; i < 64; ++i) words[i] = 0x2000 + i;
+  copy->Unmap(0, nullptr);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+  raw.Format = DXGI_FORMAT_R32_TYPELESS;
+  raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  raw.Buffer.NumElements = 64;
+  const UINT increment = gpu.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  D3D12_CPU_DESCRIPTOR_HANDLE at = gpu.views->GetCPUDescriptorHandleForHeapStart();
+  at.ptr += 2ull * increment;
+  gpu.device->CreateUnorderedAccessView(copy, nullptr, &raw, at);
+  at = gpu.views->GetCPUDescriptorHandleForHeapStart();
+  at.ptr += static_cast<SIZE_T>(kFlagsView) * increment;
+  gpu.device->CreateUnorderedAccessView(flags, nullptr, &raw, at);
+  uint32_t* table = nullptr;
+  gpu.page_table->Map(0, nullptr, reinterpret_cast<void**>(&table));
+  table[kPageTableLevel2Base / 4 + 6] = kCachedPageBit | 0;
+  table[kPageTableLevel1Bytes / 4 + 0] = 2;     // the copy: slot 2, view offset 0
+  table[kPageTableLevel1Bytes / 4 + 1] = 0;
+  table[kPageTableLevel1Bytes / 4 + 2] = 1;     // the page: slot 1, view offset 0x80
+  table[kPageTableLevel1Bytes / 4 + 3] = 0x80;
+  gpu.page_table->Unmap(0, nullptr);
+  // buffer_load_dword v0, off, s[0:3], 0; v1 = 0x5555; buffer_store_dword
+  // v1, off, s[0:3], 0 offset:4; buffer_load_dword v2, off, s[0:3], 0
+  // offset:8; s_waitcnt vmcnt(0); buffer_store_dword v0 and v2, off,
+  // s[4:7], 0 offset:192 and 196; s_endpgm.
+  const std::vector<uint32_t> program = {0xE0300000u, 0x80000000u, 0x7E0202FFu, 0x00005555u, 0xE0700004u,
+                                         0x80000100u, 0xE0300008u, 0x80000200u, 0xBF8C3F70u, 0xE07000C0u,
+                                         0x80010000u, 0xE07000C4u, 0x80010200u, 0xBF810000u};
+  std::vector<uint8_t> code;
+  for (uint32_t v : program) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    code.insert(code.end(), p, p + 4);
+  }
+  ComputeShaderInfo info;
+  info.threads[0] = 1;
+  info.user_sgprs = 8;
+  std::vector<uint8_t> cs;
+  std::string error;
+  EXPECT(translate_compute(code.data(), code.size(), info, &cs, &error));
+  EXPECT(gpu.set_constants({0x30000, 1, 256, 0, 0, 1, 256, 0}, true));
+  std::vector<uint32_t> contents(64);
+  for (uint32_t i = 0; i < 64; ++i) contents[i] = 0x1000 + i;
+  const std::vector<uint32_t> after = gpu.dispatch(cs, contents);
+  EXPECT(after.size() == 64);
+  if (after.size() != 64) return;
+  uint32_t* flag = nullptr;
+  flags->Map(0, nullptr, reinterpret_cast<void**>(&flag));
+  const uint32_t line_flag = flag ? flag[0] : 0;
+  flags->Unmap(0, nullptr);
+  copy->Map(0, nullptr, reinterpret_cast<void**>(&words));
+  const uint32_t copy_word = words ? words[1] : 0;
+  copy->Unmap(0, nullptr);
+  EXPECT(after[48] == 0x2000);       // read before the write: the copy
+  EXPECT(after[33] == 0x5555);       // the write: the page itself (0x80 + 4)
+  EXPECT(after[49] == 0x1000 + 34);  // read after the write: the page (0x80 + 8)
+  EXPECT(line_flag == 1);            // the line's flag, set by the write
+  EXPECT(copy_word == 0x2001);       // the copy kept
+  copy->Release();
+  flags->Release();
 }
 
 TEST(format_loads_take_format_and_selects_from_the_descriptor) {

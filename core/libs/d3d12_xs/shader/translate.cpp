@@ -334,7 +334,9 @@ class Translator {
   // ---- memory ----
   // Resolves a title GPU address to (view, offset) through the page table
   // (translate.h): view 0, the null view, when no page is mapped there.
-  std::pair<uint32_t, uint32_t> find(const Operand& lo, const Operand& hi) {
+  // `write`: for a store or an atomic (cached pages: the page itself, and its
+  // flag set), else for a read (cached pages: the copy unless flagged).
+  std::pair<uint32_t, uint32_t> find(const Operand& lo, const Operand& hi, bool write = false) {
     const uint32_t view = fresh(), offset = fresh();
     const Operand alo = in_temp(lo), ahi = in_temp(hi);
     put(view, I(0));
@@ -345,11 +347,31 @@ class Translator {
     emit(dx::kLdRaw, {D(table), shl(bor(shl(ahi, I(2)), shr(alo, I(30))), I(2)), dxbc::srv_xyzw(kPageTableId, 0)});
     if_nz(R(table));
     const uint32_t entry = fresh();
-    const Operand at = add(add(I(kPageTableLevel1Bytes - kPageTableTableBytes), shl(R(table), I(17))),
+    const Operand at = add(add(I(kPageTableLevel2Base - kPageTableTableBytes), shl(R(table), I(17))),
                            shl(ubfe(I(14), I(16), alo), I(3)));
     emit(dx::kLdRaw, {dxbc::temp_dst_mask(entry, 0x3), at, dxbc::srv_xyzw(kPageTableId, 0)});
     put(view, R(entry));
-    put(offset, add(dxbc::temp(entry, 1), band(alo, I(0xFFFF))));
+    put(offset, dxbc::temp(entry, 1));
+    if_nz(band(R(view), I(kCachedPageBit)));
+    {
+      const uint32_t line = fresh(), line_at = fresh(), flags = fresh();
+      put(line_at, shl(band(R(view), I(~kCachedPageBit)), I(2)));  // the flag's byte offset
+      put(flags, I(kFlagsView));
+      emit(dx::kLdRaw, {dxbc::temp_dst_mask(line, 0xF), add(I(kPageTableLevel1Bytes), shl(R(line_at), I(2))),
+                        dxbc::srv_xyzw(kPageTableId, 0)});
+      if (write) {
+        emit(dx::kStoreRaw, {dxbc::uav_indexed(0, flags, dxbc::Access::Store), R(line_at), I(1)});
+        put(view, dxbc::temp(line, 2));
+        put(offset, dxbc::temp(line, 3));
+      } else {
+        const uint32_t flag = fresh();
+        emit(dx::kLdRaw, {D(flag), R(line_at), dxbc::uav_indexed(0, flags, dxbc::Access::Load)});
+        put(view, select(R(flag), dxbc::temp(line, 2), dxbc::temp(line, 0)));
+        put(offset, select(R(flag), dxbc::temp(line, 3), dxbc::temp(line, 1)));
+      }
+    }
+    end_if();
+    put(offset, add(R(offset), band(alo, I(0xFFFF))));
     end_if();
     end_if();
     if (code_data_) {
@@ -1244,7 +1266,7 @@ bool Translator::emit_flat(const Instruction& inst) {
     std::tie(lo, hi) = add64(R(vreg(vaddr - rdna::kVgpr0)), R(vreg(vaddr - rdna::kVgpr0 + 1u)),
                              I(static_cast<uint32_t>(inst.imm)), true);
   }
-  const auto location = find(lo, hi);
+  const auto location = find(lo, hi, inst.op >= 24);  // stores and atomics from 24 on
   const uint32_t view = location.first, at = location.second;
   auto load = [&](int count) {
     for (int i = 0; i < count; ++i) read_to(vreg(dst + static_cast<uint32_t>(i)), view, at, 4u * i);
@@ -1580,7 +1602,12 @@ bool Translator::emit_mubuf(const Instruction& inst) {
   const Operand inside = select(eq(stride, I(0)), ult(offset, R(r + 2)), ult(index, R(r + 2)));
   const Operand byte_offset = add(mul_lo(index, stride), offset);
   auto [lo, hi] = add64(R(r), band(R(r + 1), I(0xFFFF)), byte_offset, false);
-  const auto location = find(lo, hi);
+  // Stores: typed 4-7 (both encodings), 24-31; atomics 48-59.
+  const bool writes = inst.encoding == Encoding::MTBUF
+                          ? inst.op >= 4 && inst.op <= 7
+                          : (inst.op >= 4 && inst.op <= 7) || (inst.op >= 24 && inst.op <= 31) ||
+                                (inst.op >= 48 && inst.op <= 59);
+  const auto location = find(lo, hi, writes);
   const uint32_t at = location.second;
   const uint32_t view = fresh();
   put(view, select(inside, R(location.first), I(kNoView)));

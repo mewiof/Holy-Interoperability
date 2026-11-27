@@ -36,7 +36,7 @@ std::mutex g_lock;
 
 // Level 2 tables: 1 GiB windows of title addresses holding mapped pages.
 constexpr uint32_t kPageTables = 256;
-constexpr size_t kPageTableBytes = kPageTableLevel1Bytes + static_cast<size_t>(kPageTables) * kPageTableTableBytes;
+constexpr size_t kPageTableBytes = kPageTableLevel2Base + static_cast<size_t>(kPageTables) * kPageTableTableBytes;
 
 struct Slot {
   ID3D12Resource* buffer = nullptr;
@@ -98,13 +98,13 @@ uint32_t add_slots(Device* device, const HeapRecord& record) {
     return slot;
   }
   const uint32_t first = static_cast<uint32_t>(g_map.slots.size());
-  if (first + count > kMemoryViews) {
+  if (first + count > kFlagsView) {
     static bool logged = false;
     if (!logged) {
       logged = true;
       LIB_LOG(lib::kError, "d3d12",
               "more than %u memory slots: further title memory is not reachable by translated programs",
-              kMemoryViews - 1);
+              kFlagsView - 1);
     }
     return 0;
   }
@@ -141,7 +141,7 @@ volatile uint32_t* page_entry(uint64_t title_va, bool make) {
     c_page_tables().add(1);
     level1[window] = table;  // the table is zero (no page mapped) until entries are written
   }
-  return reinterpret_cast<volatile uint32_t*>(g_map.table + kPageTableLevel1Bytes +
+  return reinterpret_cast<volatile uint32_t*>(g_map.table + kPageTableLevel2Base +
                                               static_cast<uint64_t>(table - 1) * kPageTableTableBytes +
                                               ((title_va >> 16) & 0x3FFF) * 8);
 }
@@ -680,7 +680,7 @@ bool page_mapped(uint64_t title_va) {
   const uint32_t number = reinterpret_cast<const volatile uint32_t*>(table)[title_va >> 30];
   if (!number) return false;
   const auto* entry = reinterpret_cast<const volatile uint32_t*>(
-      table + kPageTableLevel1Bytes + static_cast<uint64_t>(number - 1) * kPageTableTableBytes +
+      table + kPageTableLevel2Base + static_cast<uint64_t>(number - 1) * kPageTableTableBytes +
       ((title_va >> 16) & 0x3FFF) * 8);
   return entry[0] != 0;
 }

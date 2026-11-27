@@ -430,7 +430,8 @@ D3D12_RESOURCE_ALLOCATION_INFO title_allocation_info(Device* self, UINT count, c
       shape.depth_or_array = d.DepthOrArraySize ? d.DepthOrArraySize : 1;
       shape.mips = d.MipLevels ? d.MipLevels : 1;
       shape.format = static_cast<uint32_t>(d.Format);
-      const uint64_t console = lib::console_texture_size(shape, d.Alignment == 4096, d.SampleDesc.Count);
+      const uint64_t console = lib::console_texture_size(
+          shape, lib::console_block_log2(static_cast<uint32_t>(d.Layout), d.Alignment), d.SampleDesc.Count);
       static const bool trace = GetEnvironmentVariableW(L"HOLY_XG_TRACE", nullptr, 0) > 0;
       if (trace && console && console != size) {
         LIB_LOG(lib::kInfo, "d3d12", "texture %llux%ux%u, %u mips, format %d, alignment 0x%llx: host 0x%llx, console 0x%llx",
@@ -438,12 +439,20 @@ D3D12_RESOURCE_ALLOCATION_INFO title_allocation_info(Device* self, UINT count, c
                 static_cast<unsigned long long>(d.Alignment), static_cast<unsigned long long>(size),
                 static_cast<unsigned long long>(console));
       }
-      // Only for small-resource placement (4 KiB blocks). With 64 KiB blocks
-      // the console's driver also picks other layouts (smaller blocks where
-      // those waste less, not modelled), and larger sizes for 64 KiB-aligned
-      // textures made a title fail at startup in most runs (a write into
-      // memory it had reserved but not committed).
-      if (d.Alignment == 4096 && console > size) size = lib::align_up(console, align);
+      // Only where the estimate is known to hold: 2D textures only shaders
+      // read (what titles stream), placed small (alignment 4 KiB), whose
+      // layout takes at most twice the host's size. Elsewhere the console's
+      // driver picks layouts not modelled (smaller blocks where blocks would
+      // waste more, other 3D and 1D layouts, others for written textures),
+      // and larger sizes made a title overrun its pools: 64 KiB-aligned
+      // textures failed its start-up, small 3D, 1D and array textures its
+      // loading (a write past memory it had committed).
+      constexpr D3D12_RESOURCE_FLAGS kWritten = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+      const bool modelled = d.Alignment == 4096 && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                            (d.Flags & kWritten) == 0 && console <= 2 * size;
+      if (modelled && console > size) size = lib::align_up(console, align);
     }
     offset = lib::align_up(offset, align);
     if (infos) infos[i] = {offset, align, size};

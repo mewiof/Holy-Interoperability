@@ -454,7 +454,20 @@ void test_texture_layout() {
   const auto offset = reinterpret_cast<OffsetFn>((*static_cast<void***>(computer))[6]);
   check(offset(computer, 0, 0, 3, 1, 0, 0, nullptr) == 259 && offset(computer, 0, 0, 0, 0, 0, 0, nullptr) == 0,
         "texture computers give texel offsets in the layout they copy into");
-  reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(computer))[2])(computer);
+  // Slot 2: the layout, as titles read it (a header of 0x18 bytes, plane
+  // records of 0x6c8, level records of 0x70 from 0x38 in a plane: bytes,
+  // offset, 2D slice bytes, row pitch at 0x1c; array pitch at 0x10).
+  std::vector<uint8_t> layout(0x1b38, 0xCC);
+  reinterpret_cast<void(STDMETHODCALLTYPE*)(void*, void*)>((*static_cast<void***>(computer))[2])(computer,
+                                                                                                layout.data());
+  uint64_t level_bytes = 0, array_pitch = 0;
+  uint32_t row_pitch = 0;
+  std::memcpy(&level_bytes, layout.data() + 0x18 + 0x38, 8);
+  std::memcpy(&row_pitch, layout.data() + 0x18 + 0x38 + 0x1c, 4);
+  std::memcpy(&array_pitch, layout.data() + 0x18 + 0x10, 8);
+  check(level_bytes == 512 && row_pitch == 256 && array_pitch == 512 && layout[0x1b37] == 0,
+        "texture computers describe their layout (slot 2)");
+  reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(computer))[1])(computer);
 
   // Slot 10, resource tiling, in the console's order: a 512x512 BC7 texture
   // of 10 levels in 2 array slices takes 6 tiles a slice (level 0: 4, level
@@ -501,7 +514,7 @@ void test_texture_layout() {
             tilings[2].StartTileIndexInOverallResource == kPackedTile &&
             tilings[10].StartTileIndexInOverallResource == 6 + 2,
         "resource tiling places the mip tail first and level 0 last in each slice");
-  reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(computer))[2])(computer);
+  reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(computer))[1])(computer);
 }
 
 void test_physical_pages() {

@@ -42,15 +42,10 @@ struct Computer {
 
 const holy::lib::VtableInfo kComputerInfo{kLibrary, "XGTextureAddressComputer"};
 
-HRESULT STDMETHODCALLTYPE computer_query_interface(Computer* self, REFIID, void** out) {
-  if (!out) return E_POINTER;
-  self->refs.fetch_add(1);
-  *out = self;
-  return S_OK;
-}
-ULONG STDMETHODCALLTYPE computer_add_ref(Computer* self) {
-  return static_cast<ULONG>(self->refs.fetch_add(1) + 1);
-}
+// Observed: titles release a computer through slot 1 (their wrappers'
+// destructors, and after one-off queries), and call slot 2 with a structure
+// to fill (resource_layout): the computer is not a COM object in the
+// desktop's slot order. Slot 0 reports itself.
 ULONG STDMETHODCALLTYPE computer_release(Computer* self) {
   const long left = self->refs.fetch_sub(1) - 1;
   if (left == 0) delete self;
@@ -69,6 +64,70 @@ holy::lib::TextureShape shape_of(const uint8_t* desc) {
   shape.depth_or_array = depth ? depth : 1;
   shape.mips = mips ? mips : 1;
   return shape;
+}
+
+// The structure slot 2 fills, as titles read it (observed: they pass room
+// for 0x1b38 bytes, copy one 0x6c8-byte plane record out of it by plane
+// index, and read the fields named here; the rest is left zero).
+struct LevelRecord {     // 0x70 bytes, one per mip level (15)
+  uint64_t bytes;        // 0x00: the level in one array slice
+  uint64_t offset;       // 0x08: from the start of the array slice
+  uint64_t slice_bytes;  // 0x10: one 2D slice of the level (depth pitch)
+  uint32_t unused_18;
+  uint32_t row_pitch;    // 0x1c: bytes between rows of elements
+  uint8_t unused_20[0x50];
+};
+static_assert(sizeof(LevelRecord) == 0x70);
+struct PlaneRecord {     // 0x6c8 bytes
+  uint64_t unused_00;
+  uint64_t bytes;        // 0x08: the plane, all array slices (assumed)
+  uint64_t array_pitch;  // 0x10: bytes between array slices
+  uint8_t unused_18[0x20];
+  LevelRecord levels[15];
+};
+static_assert(sizeof(PlaneRecord) == 0x6c8);
+struct ResourceLayout {  // 0x1b38 bytes
+  uint64_t bytes;        // 0x00 (assumed)
+  uint64_t alignment;    // 0x08 (assumed)
+  uint32_t mips;         // 0x10 (assumed)
+  uint32_t planes;       // 0x14 (assumed)
+  PlaneRecord planes_[4];
+};
+static_assert(sizeof(ResourceLayout) == 0x1b38);
+
+// Slot 2: the layout copy_into_subresource and get_texel_element_offset
+// follow (lib::subresource_layout), one plane.
+void STDMETHODCALLTYPE resource_layout(Computer* self, ResourceLayout* out) {
+  if (!out) return;
+  std::memset(out, 0, sizeof(*out));
+  const holy::lib::TextureShape shape = shape_of(self->desc);
+  const uint32_t mips = shape.mips < 15 ? shape.mips : 15;
+  const uint32_t slices = shape.dimension == 4 ? 1 : shape.depth_or_array;
+  holy::lib::SubresourceLayout level;
+  if (!holy::lib::subresource_layout(shape, 0, &level)) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) LIB_LOG(holy::lib::kError, "xg", "layout of format %u: not supported", shape.format);
+    return;
+  }
+  PlaneRecord& plane = out->planes_[0];
+  uint64_t slice_end = 0;
+  for (uint32_t mip = 0; mip < mips && holy::lib::subresource_layout(shape, mip, &level); ++mip) {
+    LevelRecord& record = plane.levels[mip];
+    record.bytes = level.size;
+    record.offset = level.offset;
+    record.slice_bytes = static_cast<uint64_t>(level.row_pitch) * level.rows;
+    record.row_pitch = level.row_pitch;
+    slice_end = level.offset + level.size;
+  }
+  holy::lib::SubresourceLayout next_slice;
+  plane.array_pitch = slices > 1 && holy::lib::subresource_layout(shape, shape.mips, &next_slice)
+                          ? next_slice.offset
+                          : holy::lib::align_up(slice_end, 512);
+  plane.bytes = holy::lib::texture_size(shape);
+  out->bytes = plane.bytes;
+  out->alignment = 512;
+  out->mips = shape.mips;
+  out->planes = 1;
 }
 
 HRESULT STDMETHODCALLTYPE copy_into_subresource(Computer* self, void* destination, uint32_t plane,
@@ -227,9 +286,8 @@ HRESULT STDMETHODCALLTYPE get_resource_tiling(Computer* self, UINT* tiles, D3D12
 
 const auto kComputerVtable = [] {
   auto table = holy::lib::make_reporting_vtable<kComputerSlots>();
-  table[0] = reinterpret_cast<void*>(&computer_query_interface);
-  table[1] = reinterpret_cast<void*>(&computer_add_ref);
-  table[2] = reinterpret_cast<void*>(&computer_release);
+  table[1] = reinterpret_cast<void*>(&computer_release);
+  table[2] = reinterpret_cast<void*>(&resource_layout);
   table[6] = reinterpret_cast<void*>(&get_texel_element_offset);
   table[8] = reinterpret_cast<void*>(&copy_into_subresource);
   table[10] = reinterpret_cast<void*>(&get_resource_tiling);

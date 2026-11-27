@@ -400,6 +400,16 @@ Notes describe the platform, never a title.
   indices pass the first vertex there (indexed draws: the base vertex).
 - *observed*: device slot 108 is `GetResourceAllocationInfo1`; titles retry without a small alignment when the
   alignment returned differs and treat sizes of 4 GiB or more as fatal.
+- *observed*: the description's layout field is 0x100 plus a console swizzle mode when the title names one (the
+  mode the texture layout library suggested, or its own: 0x102 and 0x105 seen), 0 when the driver chooses, 1 for
+  row-major buffers. Titles size memory by the allocation sizes reported and stream textures in the console's
+  layout: a 128x4 texture of 8-byte texels (layout 0, 4 KiB alignment) streams 16 KiB, twice the host's size, and
+  a smaller size made a title read part of a compressed chunk and stop. Sizes above the console's made a title
+  overrun its pools. Implementation (`console_block_log2`, `console_texture_size` in core/libs/texture_layout.h):
+  the console layout's size for the swizzle mode (linear rows 256-byte aligned; 256-byte, 4 KiB or 64 KiB blocks
+  of the documented shapes with the mip tail) reported where it is larger than the host's, only for 2D textures
+  without render-target, depth or unordered-access usage at 4 KiB alignment whose layout takes at most twice the
+  host's size (beyond that the console's driver picks smaller blocks, not modelled). Elsewhere the host's size.
 - *observed*: titles set texture layout 0x105 on 3D textures (a console swizzle mode, *assumed*); console layouts
   and flag bits above the desktop's are dropped for the host. Depth textures may ask for unordered access, and
   packed 16-bit formats (`B5G6R5`, `B5G5R5A1`, `B4G4R4A4`) for typed unordered access; the desktop allows neither,
@@ -992,8 +1002,18 @@ Notes describe the platform, never a title.
   checked.
 - Implementation: the layout a title follows is the one this library reports, so it is chosen to be the
   desktop's copyable footprint layout (subresources in order, each at a multiple of 512 bytes, rows 256 bytes
-  apart; core/libs/texture_layout.h); the swizzle mode reported is 0 (*assumed* linear). Other computer slots
-  report themselves.
+  apart; core/libs/texture_layout.h); the swizzle mode reported is 0 (*assumed* linear; titles then create the
+  texture with layout 0x100, linear). Other computer slots report themselves.
+- *observed*: computers are not COM objects in the desktop's slot order. Titles release them through slot 1 (their
+  wrappers' destructors, and after one-off queries) and call slot 2 with a structure to fill: room for 0x1b38
+  bytes, a header of 0x18, then plane records of 0x6c8 bytes; titles copy one plane record out by plane index and
+  read, from 0x38 in it, 15 level records of 0x70 bytes: the level's bytes in one array slice at 0, its offset in
+  the slice at 8, one 2D slice's bytes at 0x10, the row pitch at 0x1c; and the bytes between array slices at 0x10
+  of the plane. They use these to address the texture's memory on the CPU. Implementation: slot 1 releases, slot 2
+  describes the copyable footprint layout in those fields (one plane; the rest zero); slot 0 reports itself.
+  Before: slot 2 was a COM release, which freed the computer while the title kept it and left the structure as
+  stack contents, so titles wrote through garbage pitches (an intermittent crash in the C runtime's copy, writing
+  far past committed memory) and called freed computers.
 - *observed*: computer slot 10 takes `(tile count*, packed mip info*, tile shape*, subresource tiling count*
   (in/out, 16 seen), first subresource tiling, subresource tilings*)`, the arguments of the desktop
   `ID3D12Device::GetResourceTiling` after its resource; titles stream tiled textures in 64 KiB pages.

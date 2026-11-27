@@ -141,41 +141,78 @@ inline uint64_t texture_size(const TextureShape& shape) {
   return last.offset + last.size;
 }
 
-// The memory the console GPU's tiled layout of a texture takes (an estimate:
-// the console's own computation is not available). Observed: titles size the
-// memory they stream textures into by the allocation sizes the graphics
-// library reports, and stream them in the console's layout; a size below it
-// made a title read part of a compressed chunk and stop at its own check (a
-// 128x4 texture of 8-byte texels: 8 KiB on the host, 16 KiB of stream), and
-// sizes above it overran a title's fixed pools.
-// Layout (documented in the public descriptions of the GPU's tiled
-// surfaces): levels are whole blocks, 4 KiB blocks when the title asks for
-// small-resource placement (alignment 4 KiB), 64 KiB otherwise. A block of B
-// bytes holds B / e elements of e bytes (texels, or 4x4 blocks of compressed
-// formats) as 2^ceil(n/2) by 2^floor(n/2) of them, n = log2(B / e) (the
-// documented standard 64 KiB tile shapes follow the same rule: 128x128 at 4
-// bytes, 128x64 at 8, 64x64 compressed blocks at 16). The levels that fit in
-// half a block (half its width, its height) share one block, the mip tail.
-// 3D textures count each depth slice as a 2D level; zero for formats of
-// unknown or odd element size.
-inline uint64_t console_texture_size(const TextureShape& shape, bool small_blocks, uint32_t samples = 1) {
+// The block size, as log2 of its bytes (0: linear), of the console layout a
+// texture gets from its description. Observed: the console description's
+// layout field is 0x100 plus a swizzle mode when the title names one (titles
+// pass the mode the texture layout library suggested, or one of their own:
+// 0x102 and 0x105 seen), 0 when the driver chooses, 1 for row-major buffers.
+// Swizzle modes (the public numbering of the GPU's surface modes): 0 linear;
+// 1-3 256-byte blocks; 4-7 and 20-23 4 KiB blocks; 8-11, 16-19 and 24-27
+// 64 KiB blocks; 28-31 variable blocks (taken as 64 KiB). When the driver
+// chooses: 4 KiB blocks for small-resource placement (alignment 4 KiB),
+// 64 KiB otherwise.
+inline uint32_t console_block_log2(uint32_t layout, uint64_t alignment) {
+  if (layout == 1) return 0;
+  if (layout >= 0x100 && layout < 0x120) {
+    const uint32_t mode = layout - 0x100;
+    if (mode == 0) return 0;
+    if (mode <= 3) return 8;
+    if ((mode >= 4 && mode <= 7) || (mode >= 20 && mode <= 23)) return 12;
+    return 16;
+  }
+  return alignment == 4096 ? 12 : 16;
+}
+
+// The memory the console GPU's layout of a texture takes, for blocks of
+// 2^block_log2 bytes (0: linear); an estimate, the console's own computation
+// is not available. Observed: titles size the memory they stream textures
+// into by the allocation sizes the graphics library reports, and stream them
+// in the console's layout; a size below it made a title read part of a
+// compressed chunk and stop at its own check (a 128x4 texture of 8-byte
+// texels, the driver's choice of layout at 4 KiB alignment: 8 KiB on the
+// host, 16 KiB of stream), and sizes above it overran a title's pools (a
+// 256x1 texture of 16-byte texels the title asked to be linear, estimated in
+// 4 KiB blocks: 64 KiB).
+// Layout (documented in the public descriptions of the GPU's surfaces):
+// linear levels are rows 256-byte aligned; tiled levels are whole blocks. A
+// block of B bytes holds B / e elements of e bytes (texels, or 4x4 blocks of
+// compressed formats) as 2^ceil(n/2) by 2^floor(n/2) of them, n = log2(B / e)
+// (the documented standard 64 KiB tile shapes follow the same rule: 128x128
+// at 4 bytes, 128x64 at 8, 64x64 compressed blocks at 16). With blocks of
+// 4 KiB or more, the levels that fit in half a block (half its width, its
+// height; at most 9 levels with 4 KiB blocks, 12 with 64 KiB) share one
+// block, the mip tail. 3D textures count each depth slice as a 2D level; zero
+// for formats of unknown or odd element size.
+inline uint64_t console_texture_size(const TextureShape& shape, uint32_t block_log2, uint32_t samples = 1) {
   const FormatInfo f = format_info(shape.format);
   if (!f.block_bytes || (f.block_bytes & (f.block_bytes - 1)) != 0) return 0;  // 12-byte texels: not modelled
-  const uint32_t block_log2 = small_blocks ? 12 : 16;
   uint32_t element_log2 = 0;
   while ((1u << element_log2) < f.block_bytes) ++element_log2;
+  const bool is3d = shape.dimension == 4;
+  const uint32_t slices = is3d ? 1 : shape.depth_or_array;
+  const uint32_t mips = shape.mips ? shape.mips : 1;
+  uint64_t bytes = 0;
+  if (block_log2 == 0) {
+    for (uint32_t mip = 0; mip < mips; ++mip) {
+      const uint64_t w = std::max<uint64_t>(1, shape.width >> mip), h = std::max<uint64_t>(1, shape.height >> mip);
+      const uint64_t d = is3d ? std::max<uint32_t>(1, shape.depth_or_array >> mip) : 1;
+      const uint64_t ew = (w + f.block_size - 1) / f.block_size, eh = (h + f.block_size - 1) / f.block_size;
+      bytes += align_up(ew << element_log2, 256) * eh * d;
+    }
+    return align_up(bytes, 256) * slices * (samples ? samples : 1);
+  }
+  if (block_log2 <= element_log2) return 0;
   const uint32_t n = block_log2 - element_log2;
   const uint64_t block_w = 1ull << ((n + 1) / 2), block_h = 1ull << (n / 2);
   const uint64_t tail_w = block_w / 2, tail_h = block_h;
-  const bool is3d = shape.dimension == 4;
-  const uint32_t slices = is3d ? 1 : shape.depth_or_array;
+  const uint32_t max_in_tail = block_log2 >= 16 ? 12 : 9;
   uint64_t blocks = 0;
   bool tail = false;
-  for (uint32_t mip = 0; mip < shape.mips; ++mip) {
+  for (uint32_t mip = 0; mip < mips; ++mip) {
     const uint64_t w = std::max<uint64_t>(1, shape.width >> mip), h = std::max<uint64_t>(1, shape.height >> mip);
     const uint64_t d = is3d ? std::max<uint32_t>(1, shape.depth_or_array >> mip) : 1;
     const uint64_t ew = (w + f.block_size - 1) / f.block_size, eh = (h + f.block_size - 1) / f.block_size;
-    if (shape.mips > 1 && ew <= tail_w && eh <= tail_h) {
+    if (block_log2 >= 12 && mips > 1 && ew <= tail_w && eh <= tail_h && mips - mip <= max_in_tail) {
       tail = true;  // this level and the smaller ones share the tail block
       break;
     }

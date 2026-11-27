@@ -94,6 +94,32 @@ void log_exception(const char* kind, const EXCEPTION_POINTERS* info) {
     if (VirtualQuery(reinterpret_cast<const void*>(record->ExceptionInformation[1]), &memory, sizeof(memory))) {
       LOG_ERROR(kComponent, "  memory there: state 0x%lx, protection 0x%lx, type 0x%lx, allocation %p (protection 0x%lx)",
                 memory.State, memory.Protect, memory.Type, memory.AllocationBase, memory.AllocationProtect);
+      // The allocation's regions around the address (a write past what was
+      // committed, or into a hole), and its size.
+      if (memory.AllocationBase && memory.State != MEM_FREE) {
+        const auto* base = static_cast<const uint8_t*>(memory.AllocationBase);
+        const auto* at = base;
+        MEMORY_BASIC_INFORMATION region{}, before{};
+        uint64_t committed = 0;
+        int regions = 0;
+        while (VirtualQuery(at, &region, sizeof(region)) && region.AllocationBase == memory.AllocationBase &&
+               regions < 100000) {
+          if (region.State == MEM_COMMIT) committed += region.RegionSize;
+          if (static_cast<const uint8_t*>(region.BaseAddress) + region.RegionSize <=
+              static_cast<const uint8_t*>(memory.BaseAddress)) {
+            before = region;
+          }
+          at = static_cast<const uint8_t*>(region.BaseAddress) + region.RegionSize;
+          ++regions;
+        }
+        LOG_ERROR(kComponent, "  the allocation: 0x%llx bytes in %d regions, 0x%llx committed; the address is 0x%llx in, "
+                  "0x%llx bytes from its page to the end of its region; the region before: state 0x%lx, 0x%llx bytes from 0x%llx",
+                  static_cast<unsigned long long>(at - base), regions, static_cast<unsigned long long>(committed),
+                  static_cast<unsigned long long>(record->ExceptionInformation[1] - reinterpret_cast<uintptr_t>(base)),
+                  static_cast<unsigned long long>(memory.RegionSize), before.State,
+                  static_cast<unsigned long long>(before.RegionSize),
+                  static_cast<unsigned long long>(static_cast<const uint8_t*>(before.BaseAddress) - base));
+      }
     }
   }
 }

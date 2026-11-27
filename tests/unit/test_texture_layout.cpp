@@ -67,6 +67,22 @@ TEST(console_tiling_agrees_with_console_size) {
   for (const TextureShape& s : shapes) {
     ConsoleTiling t;
     EXPECT(console_tiling(s, &t));
-    EXPECT(static_cast<uint64_t>(t.slice_tiles) * t.slices * 65536 == console_texture_size(s, false));
+    EXPECT(static_cast<uint64_t>(t.slice_tiles) * t.slices * 65536 == console_texture_size(s, 16));
   }
+}
+
+// Block sizes from the description's layout: the swizzle mode a title names
+// (0x100 plus the mode), or the driver's choice by alignment.
+TEST(console_block_size_follows_the_swizzle_mode) {
+  using holy::lib::console_block_log2;
+  EXPECT(console_block_log2(0, 4096) == 12 && console_block_log2(0, 0) == 16);
+  EXPECT(console_block_log2(0x100, 4096) == 0 && console_block_log2(1, 0) == 0);  // linear
+  EXPECT(console_block_log2(0x102, 0) == 8 && console_block_log2(0x105, 0) == 12);
+  EXPECT(console_block_log2(0x100 + 27, 4096) == 16);
+  // Observed sizes: a 128x4 texture of 8-byte texels in 4 KiB blocks (the
+  // driver's choice) takes 16 KiB; a linear 256x1 one of 16-byte texels 4 KiB.
+  EXPECT(console_texture_size(shape(3, 128, 4, 1, 1, 11), 12) == 0x4000);
+  EXPECT(console_texture_size(shape(3, 256, 1, 1, 1, 2), 0) == 0x1000);
+  // 256-byte blocks: no mip tail, each level whole blocks (4x4 of 16 bytes).
+  EXPECT(console_texture_size(shape(3, 8, 8, 1, 2, 2), 8) == (4 + 1) * 256);
 }

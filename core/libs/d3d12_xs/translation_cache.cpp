@@ -8,13 +8,14 @@
 #include <string>
 #include <vector>
 
+#include "core/libs/lz.h"
 #include "core/libs/support.h"
 
 namespace holy::d3d12 {
 namespace {
 
 constexpr uint32_t kMagic = 0x544C5848;  // "HXLT"
-constexpr uint32_t kVersion = 3;
+constexpr uint32_t kVersion = 4;           // 4: the bytecode is stored compressed (core/libs/lz.h)
 
 struct Header {
   uint32_t magic;
@@ -24,8 +25,10 @@ struct Header {
   uint32_t has_link;
   uint32_t link[6];  // params, flat_params, targets, position, depth, half_params
   uint32_t ngg[2];   // group, stride
+  uint32_t stored_size;  // the compressed bytecode's size, after the header
+  uint32_t reserved;
 };
-static_assert(sizeof(Header) == 56);
+static_assert(sizeof(Header) == 64);
 
 // The translator build the translations come from.
 uint64_t library_stamp() {
@@ -176,10 +179,13 @@ bool load_translation(uint64_t key, std::vector<uint8_t>* bytecode, ShaderInterf
   DWORD read = 0;
   bool ok = ReadFile(file, &header, sizeof(header), &read, nullptr) && read == sizeof(header) &&
             header.magic == kMagic && header.version == kVersion && header.key == key &&
-            header.bytecode_size > 0 && header.bytecode_size < (64u << 20);
+            header.bytecode_size > 0 && header.bytecode_size < (64u << 20) && header.stored_size > 0 &&
+            header.stored_size <= header.bytecode_size + header.bytecode_size / 8 + 64;
   if (ok) {
+    std::vector<uint8_t> stored(header.stored_size);
+    ok = ReadFile(file, stored.data(), header.stored_size, &read, nullptr) && read == header.stored_size;
     bytecode->resize(header.bytecode_size);
-    ok = ReadFile(file, bytecode->data(), header.bytecode_size, &read, nullptr) && read == header.bytecode_size;
+    ok = ok && lib::lz_decompress(stored.data(), stored.size(), bytecode->data(), bytecode->size());
   }
   CloseHandle(file);
   if (!ok) {
@@ -213,7 +219,9 @@ bool store_translation(uint64_t key, const std::vector<uint8_t>& bytecode, const
                        const NggInfo* ngg) {
   const std::wstring dir = directory();
   if (dir.empty() || bytecode.empty()) return false;
-  Header header{kMagic, kVersion, key, static_cast<uint32_t>(bytecode.size()), link ? 1u : 0u, {}, {}};
+  const std::vector<uint8_t> stored = lib::lz_compress(bytecode.data(), bytecode.size());
+  Header header{kMagic, kVersion, key, static_cast<uint32_t>(bytecode.size()), link ? 1u : 0u, {}, {},
+                static_cast<uint32_t>(stored.size()), 0};
   if (ngg) {
     header.ngg[0] = ngg->group;
     header.ngg[1] = ngg->stride;
@@ -234,8 +242,8 @@ bool store_translation(uint64_t key, const std::vector<uint8_t>& bytecode, const
   if (file == INVALID_HANDLE_VALUE) return false;
   DWORD written = 0;
   const bool ok = WriteFile(file, &header, sizeof(header), &written, nullptr) && written == sizeof(header) &&
-                  WriteFile(file, bytecode.data(), static_cast<DWORD>(bytecode.size()), &written, nullptr) &&
-                  written == bytecode.size();
+                  WriteFile(file, stored.data(), static_cast<DWORD>(stored.size()), &written, nullptr) &&
+                  written == stored.size();
   CloseHandle(file);
   if (!ok || !MoveFileExW(temporary.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
     DeleteFileW(temporary.c_str());

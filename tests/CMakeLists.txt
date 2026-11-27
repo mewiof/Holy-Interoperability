@@ -13,6 +13,8 @@ add_executable(holy_unit_tests
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader_container.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader/dxbc.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/inflate.cpp
+  ${PROJECT_SOURCE_DIR}/core/libs/lz.cpp
+  unit/test_lz.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader/rdna.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader/translate.cpp
   unit/test_strings.cpp

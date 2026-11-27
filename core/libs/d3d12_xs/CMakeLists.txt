@@ -38,6 +38,8 @@ holy_add_system_library(holy_lib_d3d12_xs
     shader/dxbc.h
     ../inflate.cpp
     ../inflate.h
+    ../lz.cpp
+    ../lz.h
     shader/rdna.cpp
     shader/rdna.h
     shader/translate.cpp

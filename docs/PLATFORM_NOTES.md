@@ -916,7 +916,10 @@ Notes describe the platform, never a title.
   output modifiers (clamp, omod), the 16-bit pack conversions (`v_cvt_pknorm_*`, `v_cvt_pk_*16_*32`) and
   `v_pk_fmac_f16`.
 - Implementation, translation cache: translations are stored in `<data>/translated/<translator build>` under a
-  hash of the native code and the parameters that shape the translation, and reused by later runs; directories
+  hash of the native code and the parameters that shape the translation, compressed (`core/libs/lz.h`: 8.7 times
+  smaller on translated programs, about 440 MB/s to compress and 3.7 GB/s to decompress, measured; titles create
+  pipelines for all their programs while loading, so every start reads the whole cache, which would be about
+  11 GB uncompressed for the reference title), and reused by later runs; directories
   of other translator builds are deleted in the background when a run first uses the cache (they are never hit
   again). Translations of more than 256 KiB are compiled one at a time (*observed* host behaviour: the driver
   refuses some such programs with `E_OUTOFMEMORY` when several compile at once, and accepts them alone), with

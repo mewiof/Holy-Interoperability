@@ -122,6 +122,16 @@ Notes describe the platform, never a title.
 - Implementation: commits of 64 MiB or more are always reserved and committed on first touch, not only when
   the host refuses them: titles commit pools of several GiB up front and otherwise take the host's spare
   commit charge before anything else can.
+- *measured* host behaviour (development host, an 8 GiB reservation with 16,386 committed and reserved runs):
+  `VirtualQuery` computes the extent of the run of pages in the queried state from page-table entries, so a
+  query costs 0.6 us on a small run but 10 ms at the start of a touched, committed 1 GiB run (5 ms in its
+  middle), and walking an allocation run by run 19 ms. `QueryVirtualMemoryInformation(MemoryRegionInfo)`
+  answers from the allocation's own record in 0.15 us wherever the address lies: its base, size, committed
+  bytes and whether it is a view. *Observed*: with the per-call queries of the graphics library (is the heap's
+  allocation still the one it was opened over, how far does an allocation reach), a loading thread spent 89 s
+  of 100 in the kernel in some runs, depending on where the title's large commits fell. The runtime and the
+  libraries ask the allocation record (`core/common/memory_query.h`) and keep `VirtualQuery` for the state and
+  protection of particular pages.
 - Open: `XMemVirtualQuery`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable` signatures.
 
 ## Graphics (`d3d12_xs.dll`)
@@ -409,8 +419,12 @@ Notes describe the platform, never a title.
 - *documented* (format numbers public in open-source texture tooling): the console adds DXGI formats 116 and 117
   (10:10:10:2 float, 7e3 and 6e4), 118 (16-bit depth with 8-bit stencil) with its depth (119) and stencil (120)
   views, and 190 (R4G4). Implementation: host resources, views and clear values use the nearest desktop format
-  (16-bit float RGBA, the 24/8 depth family, R8G8); host textures never live in title memory, so only precision
-  and size differ.
+  (16-bit float RGBA, the 32/8/24 depth family, R8G8); host textures never live in title memory, so only precision
+  and size differ. *Observed*: titles make unordered-access views of 118 depth textures; the host allows unordered
+  access to no depth texture, and a twin texture kept in step by copies exists only for 32-bit (or 16-bit) depth:
+  *measured*, the depth plane (plane 0) of a 32/8/24 texture copies to and from an R32 texture, while the 24/8
+  family's depth plane has no format with unordered access. Normalised 16-bit depth and 32-bit float depth hold the
+  same values in [0, 1].
 - *observed*: device slot 55 derives a pipeline from a base pipeline and 0x14C-byte entries: a type dword and a
   desktop `D3D12_DEPTH_STENCIL_DESC` (0), `D3D12_RASTERIZER_DESC` (1) or `D3D12_BLEND_DESC` (2). Type 5 (written
   next to depth-stencil entries with zero depth fields) is not established and not applied. Implementation:

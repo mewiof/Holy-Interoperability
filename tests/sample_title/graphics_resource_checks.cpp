@@ -1390,6 +1390,35 @@ void test_committed_buffers_and_copies(void* device, void* queue) {
             readback_va == reinterpret_cast<uint64_t>(back),
         "a CPU-visible committed buffer is memory the CPU writes, at its GPU address");
   if (!writable(up) || !writable(back)) return;
+  // Views that reach past the end of their buffer, as titles make them (the
+  // console allows it; the host removes the device for one unless the view
+  // is fitted to the buffer): the copies checked below run on a device that
+  // is still there.
+  {
+    D3D12_DESCRIPTOR_HEAP_DESC views_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 1};
+    void* views = nullptr;
+    call<HRESULT>(device, 14, &views_desc, __uuidof(ID3D12DescriptorHeap), &views);
+    check(views != nullptr, "a descriptor heap for views past a buffer's end");
+    if (views) {
+      const uint64_t first = call<uint64_t>(views, 9);
+      const UINT increment = call<UINT>(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format = DXGI_FORMAT_R32_TYPELESS;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srv.Buffer.NumElements = 0x8000;  // 128 KiB of a 64 KiB buffer
+      srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+      call<void>(device, 18, upload, &srv, first);
+      D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+      uav.Format = DXGI_FORMAT_R32_TYPELESS;
+      uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+      uav.Buffer.FirstElement = 0x2000;
+      uav.Buffer.NumElements = 0x4000;
+      uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+      call<void>(device, 19, readback, static_cast<void*>(nullptr), &uav, first + increment);
+      call<ULONG>(views, 2);
+    }
+  }
   for (uint32_t i = 0; i < 64; ++i) up[i] = 0xC0DE0000u + i;
   // Rows of 16 texels (64 bytes) at a 256-byte pitch, from +0x1000.
   for (uint32_t row = 0; row < 16; ++row) {
@@ -1397,6 +1426,9 @@ void test_committed_buffers_and_copies(void* device, void* queue) {
   }
   bool recorded = call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
   call<void>(list, 15, readback, UINT64{0}, upload, UINT64{0}, UINT64{256});
+  // A copy past the end of its destination (kept inside it; the host removes
+  // the device for one that is not).
+  call<void>(list, 15, readback, UINT64{0xF000}, upload, UINT64{0x4000}, UINT64{0x2000});
   D3D12_TEXTURE_COPY_LOCATION from_rows{};
   from_rows.pResource = static_cast<ID3D12Resource*>(upload);
   from_rows.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;

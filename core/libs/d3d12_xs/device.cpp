@@ -379,6 +379,26 @@ HRESULT STDMETHODCALLTYPE create_descriptor_heap_x(Device* self, const D3D12_DES
   return create_descriptor_heap(self, desc, heap);
 }
 
+// Logs descriptions the host would refuse (host_desc_problem) before they
+// reach a call that cannot report the error.
+void check_host_descs(const char* what, UINT count, const D3D12_RESOURCE_DESC* titles,
+                      const std::vector<D3D12_RESOURCE_DESC>& host) {
+  for (UINT i = 0; i < count; ++i) {
+    const char* problem = host_desc_problem(host[i]);
+    if (!problem) continue;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) >= 32) return;
+    const D3D12_RESOURCE_DESC& d = titles[i];
+    const D3D12_RESOURCE_DESC& h = host[i];
+    LIB_LOG(lib::kError, "d3d12",
+            "%s: description %u of %u has %s: dim %d align 0x%llx %llux%ux%u mips %u fmt %d (host %d) samples %u "
+            "layout %d (host %d) flags 0x%x (host 0x%x)",
+            what, i, count, problem, d.Dimension, static_cast<unsigned long long>(d.Alignment),
+            static_cast<unsigned long long>(d.Width), d.Height, d.DepthOrArraySize, d.MipLevels, d.Format, h.Format,
+            d.SampleDesc.Count, d.Layout, h.Layout, d.Flags, h.Flags);
+  }
+}
+
 // Slot 25: GetResourceAllocationInfo(visible_mask, count, descs), as on the
 // desktop; the 16-byte result comes back through the result pointer, for the
 // description the host takes (desktop_resource_desc).
@@ -388,7 +408,8 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE get_resource_allocation_info(
   D3D12_RESOURCE_ALLOCATION_INFO* result;
   lib::struct_return_arguments(first, second, &kDeviceInfo, &self, &result);
   std::vector<D3D12_RESOURCE_DESC> host;
-  for (UINT i = 0; i < count; ++i) host.push_back(desktop_resource_desc(descs[i]));
+  for (UINT i = 0; i < count; ++i) host.push_back(sizing_resource_desc(descs[i]));
+  check_host_descs("allocation info (slot 25)", count, descs, host);
   *result = self->host->GetResourceAllocationInfo(0, count, host.data());
   if (result->SizeInBytes == UINT64_MAX) {
     for (UINT i = 0; i < count; ++i) {
@@ -421,15 +442,32 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE get_resource_allocation_info1(
   D3D12_RESOURCE_ALLOCATION_INFO* result;
   lib::struct_return_arguments(first, second, &kDeviceInfo, &self, &result);
   std::vector<D3D12_RESOURCE_DESC> host;
-  for (UINT i = 0; i < count; ++i) host.push_back(desktop_resource_desc(descs[i]));
+  for (UINT i = 0; i < count; ++i) host.push_back(sizing_resource_desc(descs[i]));
+  check_host_descs("allocation info (slot 108)", count, descs, host);
   ID3D12Device4* device4 = nullptr;
   if (FAILED(self->host->QueryInterface(IID_PPV_ARGS(&device4)))) {
     *result = {UINT64_MAX, 0};
     LIB_LOG(lib::kError, "d3d12", "the host device has no GetResourceAllocationInfo1");
     return result;
   }
+  const bool removed_before = call_check_enabled() && self->host->GetDeviceRemovedReason() != S_OK;
   *result = device4->GetResourceAllocationInfo1(0, count, host.data(), infos);
   device4->Release();
+  if (call_check_enabled() && !removed_before && self->host->GetDeviceRemovedReason() != S_OK) {
+    LIB_LOG(lib::kError, "d3d12", "allocation info (slot 108) removed the host device: %u descriptions, infos %p", count,
+            static_cast<void*>(infos));
+    for (UINT i = 0; i < count; ++i) {
+      const D3D12_RESOURCE_DESC& d = descs[i];
+      const D3D12_RESOURCE_DESC& h = host[i];
+      LIB_LOG(lib::kError, "d3d12",
+              "  %u: dim %d align 0x%llx (host 0x%llx) %llux%ux%u mips %u fmt %d (host %d) samples %u/%u layout %d "
+              "(host %d) flags 0x%x (host 0x%x)",
+              i, d.Dimension, static_cast<unsigned long long>(d.Alignment),
+              static_cast<unsigned long long>(h.Alignment), static_cast<unsigned long long>(d.Width), d.Height,
+              d.DepthOrArraySize, d.MipLevels, d.Format, h.Format, d.SampleDesc.Count, d.SampleDesc.Quality, d.Layout,
+              h.Layout, d.Flags, h.Flags);
+    }
+  }
   if (result->SizeInBytes == UINT64_MAX) {
     LIB_LOG(lib::kError, "d3d12", "allocation info (slot 108) refused for %u descriptions, first dim %d fmt %d",
             count, count ? descs[0].Dimension : 0, count ? descs[0].Format : 0);

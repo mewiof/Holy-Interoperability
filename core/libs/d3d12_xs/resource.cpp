@@ -41,6 +41,12 @@ constexpr D3D12_RESOURCE_FLAGS kDesktopFlags = static_cast<D3D12_RESOURCE_FLAGS>
 // 14-15), 64 KiB alignment (bits 24-28).
 constexpr uint64_t kResourceMemoryAttributes = (0x80ull << 16) | (2ull << 14) | (16ull << 24);
 
+// Buffers whose host buffer covers only the start of their memory.
+const lib::Counter& c_partial_buffers() {
+  static const lib::Counter c("d3d12.partial_buffers");
+  return c;
+}
+
 const lib::Counter& c_resources() {
   static const lib::Counter c("d3d12.resources");
   return c;
@@ -211,15 +217,18 @@ const auto kResourceVtable = [] {
 // Formats the console adds to DXGI (documented: their numbers are public in
 // open-source texture tooling), with the nearest desktop format: depth 16 /
 // stencil 8 (118) and its depth (119) and stencil (120) views become the
-// 24/8 family; the 10:10:10:2 float formats (116 7e3, 117 6e4) 16-bit float
+// 32/8/24 family; the 10:10:10:2 float formats (116 7e3, 117 6e4) 16-bit float
 // RGBA; R4G4 (190) R8G8. Host textures never live in title memory, so only
-// precision and size differ.
+// precision and size differ. 32-bit float depth rather than 24-bit: titles
+// view such depth with unordered access (observed), which only a 32-bit depth
+// plane can have on the host (a twin it copies to and from, make_depth_twin);
+// normalised 16-bit depth and float depth hold the same values in [0, 1].
 DXGI_FORMAT desktop_format(DXGI_FORMAT format) {
   switch (static_cast<uint32_t>(format)) {
     case 116: case 117: return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case 118: return DXGI_FORMAT_D24_UNORM_S8_UINT;
-    case 119: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    case 120: return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    case 118: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    case 119: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case 120: return DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
     case 190: return DXGI_FORMAT_R8G8_UNORM;
     default: return format;
   }
@@ -242,7 +251,7 @@ bool host_supports(DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags) {
   const auto index = static_cast<uint32_t>(format);
   if (!usage || index >= 256) return true;
   static std::atomic<int8_t> known[256][8] = {};  // 0 unknown, 1 supported, -1 not
-  const uint32_t slot = (usage & 1) | ((usage >> 1) & 2) | ((usage >> 1) & 4);  // RT, DS, UAV bits
+  const uint32_t slot = usage;  // the RT, DS and UAV flags are bits 0, 1 and 2
   if (const int8_t answer = known[index][slot].load(std::memory_order_relaxed)) return answer > 0;
   ID3D12Device* host = host_device();
   if (!host) return true;
@@ -292,6 +301,95 @@ D3D12_RESOURCE_DESC desktop_resource_desc(const D3D12_RESOURCE_DESC& desc) {
   // desktop does not allow; the host texture is made without it.
   if ((host.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && (host.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
     host.Flags = static_cast<D3D12_RESOURCE_FLAGS>(host.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  }
+  return host;
+}
+
+bool is_typeless(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32_TYPELESS:
+    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+    case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R8_TYPELESS:
+    case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC7_TYPELESS:
+      return true;
+    default:
+      return false;
+  }
+}
+
+const char* host_desc_problem(const D3D12_RESOURCE_DESC& d) {
+  if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+    if (d.Height != 1 || d.DepthOrArraySize != 1 || d.MipLevels != 1 || d.Format != DXGI_FORMAT_UNKNOWN ||
+        d.SampleDesc.Count != 1 || d.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) {
+      return "buffer fields";
+    }
+    if (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
+      return "a buffer as a render target";
+    }
+    return nullptr;
+  }
+  if (d.Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE1D || d.Dimension > D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+    return "dimension";
+  }
+  if (!d.Width || !d.Height || !d.DepthOrArraySize) return "a zero size";
+  const bool is3d = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  const uint64_t limit = is3d ? 2048 : 16384;
+  if (d.Width > limit || d.Height > limit || (is3d && d.DepthOrArraySize > 2048) ||
+      (!is3d && d.DepthOrArraySize > 2048) || (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && d.Height != 1)) {
+    return "a size over the host's limits";
+  }
+  uint64_t largest = std::max<uint64_t>(d.Width, d.Height);
+  if (is3d) largest = std::max<uint64_t>(largest, d.DepthOrArraySize);
+  uint32_t mips = 1;
+  while (largest > 1) largest >>= 1, ++mips;
+  if (d.MipLevels > mips) return "more mip levels than the size has";
+  if (d.SampleDesc.Count != 1 && (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.MipLevels != 1)) {
+    return "multisampling of a texture that is not a single-level 2D texture";
+  }
+  if (d.Format == DXGI_FORMAT_UNKNOWN) return "no format";
+  if (d.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return "a row-major texture";
+  ID3D12Device* host = host_device();
+  if (!host) return nullptr;
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT support{d.Format, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+  if (FAILED(host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))) {
+    return "a format the host does not know";
+  }
+  const UINT dimension_bit = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D   ? D3D12_FORMAT_SUPPORT1_TEXTURE1D
+                             : d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ? D3D12_FORMAT_SUPPORT1_TEXTURE2D
+                                                                                 : D3D12_FORMAT_SUPPORT1_TEXTURE3D;
+  if (support.Support1 && !(support.Support1 & dimension_bit)) return "a format the host lacks in this dimension";
+  // Typeless formats report no target usages of their own (measured: the
+  // 32/8/24 depth format lists no depth usage); their typed members are
+  // checked when views are made.
+  if (!is_typeless(d.Format) && !host_supports(d.Format, d.Flags)) return "a usage the format does not have on the host";
+  // Block-compressed formats: the top level's size in whole blocks.
+  const auto f = static_cast<uint32_t>(d.Format);
+  const bool block = (f >= DXGI_FORMAT_BC1_TYPELESS && f <= DXGI_FORMAT_BC5_SNORM) ||
+                     (f >= DXGI_FORMAT_BC6H_TYPELESS && f <= DXGI_FORMAT_BC7_UNORM_SRGB);
+  static const bool unaligned_blocks = [host] {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS8 options{};
+    return SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options, sizeof(options))) &&
+           options.UnalignedBlockTexturesSupported;
+  }();
+  if (block && !unaligned_blocks && ((d.Width & 3) || (d.Height & 3))) {
+    return "a block-compressed size that is not whole blocks";
+  }
+  return nullptr;
+}
+
+D3D12_RESOURCE_DESC sizing_resource_desc(const D3D12_RESOURCE_DESC& desc) {
+  D3D12_RESOURCE_DESC host = desktop_resource_desc(desc);
+  switch (static_cast<uint32_t>(desc.Format)) {
+    case 118: host.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; break;
+    case 119: host.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+    case 120: host.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT; break;
+    default: break;
   }
   return host;
 }
@@ -364,15 +462,19 @@ void make_depth_twin(Device* device, Resource* resource) {
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   // The same format family as the depth texture, so copies go both ways.
-  // Only the depth-only families have formats with unordered access: depth
-  // with stencil gets no twin. Measured: creating one anyway (the 32/8/24
-  // family with unordered access) is an invalid call for which the host
-  // removes the device.
+  // Only the depth-only families have formats with unordered access.
+  // Measured: a 32/8/24 twin with unordered access is an invalid call for
+  // which the host removes the device; copying the depth plane (plane 0) of
+  // a 32/8/24 texture to an R32 texture and back is valid (the debug layer
+  // has nothing to say, local/experiments). Such textures get an R32 twin of
+  // their depth plane (titles' unordered access views of them view depth).
   switch (desc.Format) {
     case DXGI_FORMAT_D16_UNORM:
     case DXGI_FORMAT_R16_TYPELESS: desc.Format = DXGI_FORMAT_R16_TYPELESS; break;
     case DXGI_FORMAT_D32_FLOAT:
-    case DXGI_FORMAT_R32_TYPELESS: desc.Format = DXGI_FORMAT_R32_TYPELESS; break;
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32G8X24_TYPELESS: desc.Format = DXGI_FORMAT_R32_TYPELESS; break;
     default:
       LIB_LOG(lib::kWarn, "d3d12", "depth texture of format %u asks for unordered access: no twin (not supported)",
               static_cast<unsigned>(desc.Format));
@@ -386,6 +488,11 @@ void make_depth_twin(Device* device, Resource* resource) {
           "unordered-access twin of a depth texture %llux%ux%u format %u -> 0x%08lX",
           static_cast<unsigned long long>(desc.Width), desc.Height, desc.DepthOrArraySize,
           static_cast<unsigned>(desc.Format), static_cast<unsigned long>(hr));
+}
+
+bool planar_depth(DXGI_FORMAT format) {
+  return format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || format == DXGI_FORMAT_R32G8X24_TYPELESS ||
+         format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_R24G8_TYPELESS;
 }
 
 DXGI_FORMAT host_view_format(const void* resource, DXGI_FORMAT format) {
@@ -478,7 +585,8 @@ HRESULT create_committed_resource(Device* device, const D3D12_HEAP_PROPERTIES* p
           desc->Dimension, static_cast<unsigned long long>(desc->Width), desc->Height, desc->Format,
           properties->Type, desc->Flags, state, static_cast<unsigned long>(hr));
   if (FAILED(hr)) return hr;
-  const D3D12_RESOURCE_ALLOCATION_INFO size = device->host->GetResourceAllocationInfo(0, 1, &host_desc);
+  const D3D12_RESOURCE_DESC sizing = sizing_resource_desc(*desc);
+  const D3D12_RESOURCE_ALLOCATION_INFO size = device->host->GetResourceAllocationInfo(0, 1, &sizing);
   void* memory = XMemAlloc(static_cast<SIZE_T>(size.SizeInBytes), kResourceMemoryAttributes);
   auto* resource = new Resource();
   resource->vtable = kResourceVtable.data();
@@ -518,18 +626,38 @@ namespace {
 HRESULT place_buffer(Device* device, uint64_t address, const D3D12_RESOURCE_DESC& desc, ID3D12Resource** out,
                      uint64_t* slack) {
   Backing backing;
-  if (!locate(device, address, &backing, desc.Width) || backing.contiguous < desc.Width) {
-    LIB_LOG(lib::kError, "d3d12", "no GPU heap backs a buffer of 0x%llx bytes at %p (heap %p, 0x%llx contiguous)",
+  if (!locate(device, address, &backing, desc.Width) || !backing.contiguous) {
+    LIB_LOG(lib::kError, "d3d12", "no GPU heap backs a buffer of 0x%llx bytes at %p (heap %p)",
             static_cast<unsigned long long>(desc.Width), reinterpret_cast<void*>(address),
-            static_cast<void*>(backing.heap), static_cast<unsigned long long>(backing.contiguous));
+            static_cast<void*>(backing.heap));
     return E_INVALIDARG;
+  }
+  // Observed: titles place buffers over physical pages whose storage is not
+  // in order in one section (pages that got their storage while mapped
+  // elsewhere, or a section chunk's end), and stop at their own check when
+  // the placement fails. Measured: the host opens no heap over several views
+  // (0x80070057), so no host buffer spans such pages. The host buffer covers
+  // the pages in order from the start; translated programs reach every page
+  // through the page table, and host views and copies stay inside the host
+  // buffer (fit_buffer_view, copies clamped to it).
+  uint64_t width = desc.Width;
+  if (backing.contiguous < desc.Width) {
+    width = backing.contiguous;
+    c_partial_buffers().add(1);
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) {
+      LIB_LOG(lib::kWarn, "d3d12",
+              "buffer of 0x%llx bytes at %p: its memory is in order for 0x%llx bytes; the host buffer covers those",
+              static_cast<unsigned long long>(desc.Width), reinterpret_cast<void*>(address),
+              static_cast<unsigned long long>(backing.contiguous));
+    }
   }
   // Placed buffers need 64 KiB aligned heap offsets; a buffer that starts
   // inside a 64 KiB block is placed from the block's start and remembers the
   // difference.
   *slack = backing.heap_offset & 0xFFFF;
   D3D12_RESOURCE_DESC host_desc = desc;
-  host_desc.Width = desc.Width + *slack;
+  host_desc.Width = width + *slack;
   host_desc.Alignment = 0;
   host_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>((desc.Flags & kDesktopFlags) |
                                                       D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);

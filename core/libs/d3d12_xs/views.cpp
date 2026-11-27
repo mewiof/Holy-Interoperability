@@ -81,6 +81,63 @@ UINT64 slack_elements(uint64_t slack, UINT stride) {
   return slack / stride;
 }
 
+// Fits a buffer view of `stride`-byte elements into its host buffer; false
+// when none of it lies in the buffer. Observed: titles make views that reach
+// past the end of their buffers (a 64 KiB buffer viewed as 29,515 four-byte
+// elements), which the console allows (a view is an address and a size).
+// Measured (the host's debug layer): the host removes the device for such a
+// view ("invalid call": view creation cannot report the error). Translated
+// programs read views through the title's descriptor memory, which keeps the
+// title's range; desktop programs see the part inside the buffer.
+bool fit_buffer_view(ID3D12Resource* buffer, UINT64* first, UINT* count, UINT stride) {
+  if (!buffer || !stride) return true;
+  const UINT64 elements = buffer->GetDesc().Width / stride;
+  if (*first >= elements || !*count) return false;
+  if (*count > elements - *first) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 4) {
+      LIB_LOG(lib::kWarn, "d3d12", "buffer view of %u %u-byte elements from %llu reaches past its buffer of %llu: "
+              "the host view stops at the buffer's end", *count, stride, static_cast<unsigned long long>(*first),
+              static_cast<unsigned long long>(elements));
+    }
+    *count = static_cast<UINT>(elements - *first);
+  }
+  return true;
+}
+
+// A shader resource view of `buffer` fitted into it (fit_buffer_view), or a
+// null view when nothing of it lies in the buffer.
+void create_buffer_srv(ID3D12Device* host, ID3D12Resource* buffer, D3D12_SHADER_RESOURCE_VIEW_DESC desc, UINT stride,
+                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+  if (!fit_buffer_view(buffer, &desc.Buffer.FirstElement, &desc.Buffer.NumElements, stride)) {
+    buffer = nullptr;
+    desc.Buffer.FirstElement = 0;
+    desc.Buffer.NumElements = 1;
+  }
+  host->CreateShaderResourceView(buffer, &desc, dest);
+}
+
+void create_buffer_uav(ID3D12Device* host, ID3D12Resource* buffer, ID3D12Resource* counter,
+                       D3D12_UNORDERED_ACCESS_VIEW_DESC desc, UINT stride, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+  // A host buffer without unordered access (upload and readback buffers
+  // cannot have it) takes no such view: the host removes the device for one.
+  const bool allowed = buffer && (buffer->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  if (buffer && !allowed) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 4) {
+      LIB_LOG(lib::kWarn, "d3d12", "unordered access view of a buffer without unordered access: a null view");
+    }
+  }
+  if (!allowed || !fit_buffer_view(buffer, &desc.Buffer.FirstElement, &desc.Buffer.NumElements, stride)) {
+    buffer = nullptr;
+    counter = nullptr;
+    desc.Buffer.FirstElement = 0;
+    desc.Buffer.NumElements = 1;
+    desc.Buffer.CounterOffsetInBytes = 0;
+  }
+  host->CreateUnorderedAccessView(buffer, counter, &desc, dest);
+}
+
 // Render-target and depth-stencil descriptors and what they view, kept only
 // while calls are wrapped (call_check.h), for traces.
 struct TargetView {
@@ -193,7 +250,7 @@ void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_
                       : (host.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 4
                                                                          : format_bytes(host.Format);
   host.Buffer.FirstElement += slack_elements(backing.heap_offset, stride);
-  self->host->CreateShaderResourceView(backing.whole, &host, host_cpu_handle(dest));
+  create_buffer_srv(self->host, backing.whole, host, stride, host_cpu_handle(dest));
   publish_descriptors(dest);
   const bool raw = (view->srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0;
   const uint32_t element = view->srv.Buffer.StructureByteStride;
@@ -247,21 +304,18 @@ void STDMETHODCALLTYPE create_shader_resource_view(Device* self, void* resource,
                           : (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 4
                                                                               : format_bytes(desc->Format);
       host.Buffer.FirstElement += slack_elements(slack_of(object), stride);
+      create_buffer_srv(self->host, host_resource(resource), host, stride, host_cpu_handle(dest));
+      publish_descriptors(dest);
+      const bool raw = (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0 || !desc->Buffer.StructureByteStride;
+      write_buffer_descriptor(dest, object->title_va + desc->Buffer.FirstElement * stride,
+                              raw ? 0 : desc->Buffer.StructureByteStride,
+                              raw ? static_cast<uint32_t>(desc->Buffer.NumElements * stride) : desc->Buffer.NumElements);
+      return;
     }
   }
   self->host->CreateShaderResourceView(host_resource(resource), desc ? &host : nullptr, host_cpu_handle(dest));
   publish_descriptors(dest);
-  if (object && desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-    const UINT stride = desc->Buffer.StructureByteStride ? desc->Buffer.StructureByteStride
-                        : (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 4
-                                                                            : format_bytes(desc->Format);
-    const bool raw = (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0 || !desc->Buffer.StructureByteStride;
-    write_buffer_descriptor(dest, object->title_va + desc->Buffer.FirstElement * stride,
-                            raw ? 0 : desc->Buffer.StructureByteStride,
-                            raw ? static_cast<uint32_t>(desc->Buffer.NumElements * stride) : desc->Buffer.NumElements);
-  } else {
-    write_indexed_descriptor(dest, kKindShaderResource);
-  }
+  write_indexed_descriptor(dest, kKindShaderResource);
 }
 
 void STDMETHODCALLTYPE create_unordered_access_view(Device* self, void* resource, void* counter,
@@ -278,11 +332,19 @@ void STDMETHODCALLTYPE create_unordered_access_view(Device* self, void* resource
     }
     D3D12_UNORDERED_ACCESS_VIEW_DESC host = desc ? *desc : D3D12_UNORDERED_ACCESS_VIEW_DESC{};
     if (desc) {
-      switch (desc->Format) {
-        case DXGI_FORMAT_D16_UNORM: host.Format = DXGI_FORMAT_R16_UNORM; break;
-        case DXGI_FORMAT_D32_FLOAT: host.Format = DXGI_FORMAT_R32_FLOAT; break;
-        default: break;
+      // The twin's typed format: unsigned integer views stay so, others are
+      // the twin's normalised or float format (a 16-bit depth texture of the
+      // console's 118 family has a 32-bit float twin: desktop_format).
+      const DXGI_FORMAT twin = object->twin->GetDesc().Format;
+      const bool integer = desc->Format == DXGI_FORMAT_R16_UINT || desc->Format == DXGI_FORMAT_R32_UINT;
+      if (twin == DXGI_FORMAT_R16_TYPELESS) {
+        host.Format = integer ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R16_UNORM;
+      } else if (twin == DXGI_FORMAT_R32_TYPELESS) {
+        host.Format = desc->Format == DXGI_FORMAT_R32_UINT ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R32_FLOAT;
       }
+      // The twin has one plane (the depth plane of a texture with stencil).
+      if (desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) host.Texture2D.PlaneSlice = 0;
+      if (desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY) host.Texture2DArray.PlaneSlice = 0;
     }
     self->host->CreateUnorderedAccessView(object->twin, nullptr, desc ? &host : nullptr, host_cpu_handle(dest));
     publish_descriptors(dest);
@@ -300,8 +362,15 @@ void STDMETHODCALLTYPE create_unordered_access_view(Device* self, void* resource
       host.Buffer.FirstElement += slack_elements(slack_of(object), stride);
     }
   }
-  self->host->CreateUnorderedAccessView(host_resource(resource), host_resource(counter), desc ? &host : nullptr,
-                                        host_cpu_handle(dest));
+  if (object && desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+    const UINT stride = desc->Buffer.StructureByteStride ? desc->Buffer.StructureByteStride
+                        : (desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) ? 4
+                                                                            : format_bytes(desc->Format);
+    create_buffer_uav(self->host, host_resource(resource), host_resource(counter), host, stride, host_cpu_handle(dest));
+  } else {
+    self->host->CreateUnorderedAccessView(host_resource(resource), host_resource(counter), desc ? &host : nullptr,
+                                          host_cpu_handle(dest));
+  }
   publish_descriptors(dest);
   if (object && desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
     const UINT stride = desc->Buffer.StructureByteStride ? desc->Buffer.StructureByteStride

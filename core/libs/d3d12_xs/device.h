@@ -155,6 +155,18 @@ ID3D12RootSignature* translated_root_signature(Device* device);
 // title memory, so only precision differs; views of such textures use the
 // replacement (host_view_format).
 D3D12_RESOURCE_DESC desktop_resource_desc(const D3D12_RESOURCE_DESC& desc);
+// The description sizes and alignments reported to titles are asked for:
+// the desktop one, with formats the host stands in for with wider ones sized
+// as the console's nearest (observed: titles size fixed pools by what they
+// are told, and the console's 16/8 depth made as 32/8/24 (desktop_format)
+// overran one). Host textures never live in title memory.
+D3D12_RESOURCE_DESC sizing_resource_desc(const D3D12_RESOURCE_DESC& desc);
+// Why the host would refuse a desktop description (a reason to log), or null.
+// Calls that cannot report an error (GetResourceAllocationInfo*) remove the
+// host device ("invalid call") when given such a description.
+const char* host_desc_problem(const D3D12_RESOURCE_DESC& desc);
+// Depth formats with a stencil plane (their twins hold the depth plane).
+bool planar_depth(DXGI_FORMAT format);
 DXGI_FORMAT host_view_format(const void* resource, DXGI_FORMAT format);
 // A barrier layout for a texture's host texture: layouts of usages it does not
 // have (see desktop_resource_desc) become the common layout.

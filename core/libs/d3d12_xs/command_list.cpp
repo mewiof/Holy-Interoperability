@@ -346,7 +346,22 @@ void copy_with_twin(CommandList* self, const Resource* title, D3D12_BARRIER_LAYO
   group.NumBarriers = 2;
   group.pTextureBarriers = barriers;
   self->host7->Barrier(1, &group);
-  self->host->CopyResource(to, from);
+  const D3D12_RESOURCE_DESC depth = title->host->GetDesc();
+  if (planar_depth(depth.Format)) {
+    // The twin holds the depth plane: plane 0's subresources, one by one.
+    const UINT slices = depth.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : depth.DepthOrArraySize;
+    for (UINT index = 0; index < static_cast<UINT>(depth.MipLevels) * slices; ++index) {
+      D3D12_TEXTURE_COPY_LOCATION target{}, source{};
+      target.pResource = to;
+      source.pResource = from;
+      target.Type = source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      target.SubresourceIndex = index;
+      source.SubresourceIndex = index;
+      self->host->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+    }
+  } else {
+    self->host->CopyResource(to, from);
+  }
   for (auto& b : barriers) {
     std::swap(b.SyncBefore, b.SyncAfter);
     std::swap(b.AccessBefore, b.AccessAfter);
@@ -901,6 +916,30 @@ const Resource* copied(const void* resource, const char* what) {
   return nullptr;
 }
 
+// A buffer copy of `bytes` between host buffers at host offsets, kept inside
+// both. Copies cannot report errors: one past a host buffer's end removes
+// the host device ("invalid call"). Host buffers may be shorter than the
+// title's (place_buffer: memory not in order), and titles' ranges are not
+// checked on the console.
+void copy_inside(CommandList* self, ID3D12Resource* to, UINT64 to_offset, ID3D12Resource* from, UINT64 from_offset,
+                 UINT64 bytes) {
+  const UINT64 to_width = to->GetDesc().Width, from_width = from->GetDesc().Width;
+  const UINT64 room = std::min(to_offset < to_width ? to_width - to_offset : 0,
+                               from_offset < from_width ? from_width - from_offset : 0);
+  if (bytes > room) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) {
+      LIB_LOG(lib::kWarn, "d3d12", "buffer copy of 0x%llx bytes (0x%llx -> 0x%llx) reaches past a host buffer "
+              "(0x%llx, 0x%llx bytes): 0x%llx copied", static_cast<unsigned long long>(bytes),
+              static_cast<unsigned long long>(from_offset), static_cast<unsigned long long>(to_offset),
+              static_cast<unsigned long long>(from_width), static_cast<unsigned long long>(to_width),
+              static_cast<unsigned long long>(room));
+    }
+    bytes = room;
+  }
+  if (bytes) self->host->CopyBufferRegion(to, to_offset, from, from_offset, bytes);
+}
+
 void STDMETHODCALLTYPE list_copy_buffer_region(CommandList* self, void* destination, UINT64 destination_offset,
                                                void* source, UINT64 source_offset, UINT64 bytes) {
   const Resource* to = copied(destination, "a buffer copy");
@@ -908,8 +947,8 @@ void STDMETHODCALLTYPE list_copy_buffer_region(CommandList* self, void* destinat
   if (!to || !from) return;
   HOLY_TRACE("list %u copies 0x%llx bytes between buffers", self->number, static_cast<unsigned long long>(bytes));
   page_cache_gpu_writes(to->title_va + destination_offset, bytes);
-  self->host->CopyBufferRegion(to->host, destination_offset + buffer_slack(to), from->host,
-                               source_offset + buffer_slack(from), bytes);
+  copy_inside(self, to->host, destination_offset + buffer_slack(to), from->host, source_offset + buffer_slack(from),
+              bytes);
 }
 
 bool host_copy_location(const D3D12_TEXTURE_COPY_LOCATION& title, D3D12_TEXTURE_COPY_LOCATION* host) {
@@ -946,9 +985,9 @@ void STDMETHODCALLTYPE list_copy_resource(CommandList* self, void* destination, 
   HOLY_TRACE("list %u copies a resource", self->number);
   if (to->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) page_cache_gpu_writes(to->title_va, to->desc.Width);
   if (to->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && from->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-    // Host buffers of placed buffers are wider than the title's.
-    self->host->CopyBufferRegion(to->host, buffer_slack(to), from->host, buffer_slack(from),
-                                 std::min(to->desc.Width, from->desc.Width));
+    // Host buffers of placed buffers are wider than the title's (or shorter).
+    copy_inside(self, to->host, buffer_slack(to), from->host, buffer_slack(from),
+                std::min(to->desc.Width, from->desc.Width));
     return;
   }
   self->host->CopyResource(to->host, from->host);

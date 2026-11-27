@@ -13,6 +13,7 @@
 
 #include <dxgiformat.h>
 
+#include <algorithm>
 #include <cstdint>
 
 namespace holy::lib {
@@ -138,6 +139,137 @@ inline uint64_t texture_size(const TextureShape& shape) {
   SubresourceLayout last;
   if (!count || !subresource_layout(shape, count - 1, &last)) return 0;
   return last.offset + last.size;
+}
+
+// The memory the console GPU's tiled layout of a texture takes (an estimate:
+// the console's own computation is not available). Observed: titles size the
+// memory they stream textures into by the allocation sizes the graphics
+// library reports, and stream them in the console's layout; a size below it
+// made a title read part of a compressed chunk and stop at its own check (a
+// 128x4 texture of 8-byte texels: 8 KiB on the host, 16 KiB of stream), and
+// sizes above it overran a title's fixed pools.
+// Layout (documented in the public descriptions of the GPU's tiled
+// surfaces): levels are whole blocks, 4 KiB blocks when the title asks for
+// small-resource placement (alignment 4 KiB), 64 KiB otherwise. A block of B
+// bytes holds B / e elements of e bytes (texels, or 4x4 blocks of compressed
+// formats) as 2^ceil(n/2) by 2^floor(n/2) of them, n = log2(B / e) (the
+// documented standard 64 KiB tile shapes follow the same rule: 128x128 at 4
+// bytes, 128x64 at 8, 64x64 compressed blocks at 16). The levels that fit in
+// half a block (half its width, its height) share one block, the mip tail.
+// 3D textures count each depth slice as a 2D level; zero for formats of
+// unknown or odd element size.
+inline uint64_t console_texture_size(const TextureShape& shape, bool small_blocks, uint32_t samples = 1) {
+  const FormatInfo f = format_info(shape.format);
+  if (!f.block_bytes || (f.block_bytes & (f.block_bytes - 1)) != 0) return 0;  // 12-byte texels: not modelled
+  const uint32_t block_log2 = small_blocks ? 12 : 16;
+  uint32_t element_log2 = 0;
+  while ((1u << element_log2) < f.block_bytes) ++element_log2;
+  const uint32_t n = block_log2 - element_log2;
+  const uint64_t block_w = 1ull << ((n + 1) / 2), block_h = 1ull << (n / 2);
+  const uint64_t tail_w = block_w / 2, tail_h = block_h;
+  const bool is3d = shape.dimension == 4;
+  const uint32_t slices = is3d ? 1 : shape.depth_or_array;
+  uint64_t blocks = 0;
+  bool tail = false;
+  for (uint32_t mip = 0; mip < shape.mips; ++mip) {
+    const uint64_t w = std::max<uint64_t>(1, shape.width >> mip), h = std::max<uint64_t>(1, shape.height >> mip);
+    const uint64_t d = is3d ? std::max<uint32_t>(1, shape.depth_or_array >> mip) : 1;
+    const uint64_t ew = (w + f.block_size - 1) / f.block_size, eh = (h + f.block_size - 1) / f.block_size;
+    if (shape.mips > 1 && ew <= tail_w && eh <= tail_h) {
+      tail = true;  // this level and the smaller ones share the tail block
+      break;
+    }
+    blocks += ((ew + block_w - 1) / block_w) * ((eh + block_h - 1) / block_h) * d;
+  }
+  if (tail) blocks += 1;
+  return (blocks << block_log2) * slices * (samples ? samples : 1);
+}
+
+// The console GPU's tiled layout of a texture in 64 KiB tiles (blocks), as
+// the console layout library reports it to titles in a resource tiling
+// query (the desktop ID3D12Device::GetResourceTiling outputs).
+// Layout (documented in the public descriptions of the GPU's tiled
+// surfaces), and how it differs from the desktop's answer:
+//  - Tile shapes follow the rule of console_texture_size (2D: 2^ceil(n/2) by
+//    2^floor(n/2) elements of e bytes, n = log2(65536 / e)); 3D tiles are
+//    thick, 2^ceil(n/3) by 2^round(n/3) by 2^floor(n/3) (the documented
+//    standard 3D tile shapes: 64x32x32 at 1 byte down to 16x16x16 at 16).
+//  - The levels that fit in the mip tail (half a tile's width, its height;
+//    for 3D, its depth too; at most 12 levels, 10 for thick tiles; only for
+//    textures with more than one level) share one tile: the packed mips.
+//  - Each array slice holds its levels smallest first: the mip tail at the
+//    slice's first tile, then the other levels from the smallest to level 0
+//    (the desktop answer starts with level 0). Observed: a title placed
+//    levels in memory, and found them in its archives, at the tile offsets
+//    this reports; archives hold each texture's levels smallest first, and
+//    the desktop order made a title read level 1 from the middle of level 0.
+struct ConsoleMipTiling {
+  uint32_t width_tiles = 0, height_tiles = 0, depth_tiles = 0;
+  uint32_t start = 0;  // first tile, within an array slice
+};
+
+struct ConsoleTiling {
+  uint32_t tile_width = 0, tile_height = 0, tile_depth = 0;  // texels
+  uint32_t standard_mips = 0, packed_mips = 0, packed_tiles = 0;
+  uint32_t slice_tiles = 0;  // tiles per array slice
+  uint32_t slices = 1;
+  ConsoleMipTiling mips[16];
+};
+
+// False for shapes not modelled: unknown or 12-byte formats, more than 16
+// levels, planar formats.
+inline bool console_tiling(const TextureShape& shape, ConsoleTiling* out) {
+  const FormatInfo f = format_info(shape.format);
+  if (!f.block_bytes || (f.block_bytes & (f.block_bytes - 1)) != 0) return false;
+  const uint32_t mips = shape.mips ? shape.mips : 1;
+  if (mips > 16) return false;
+  uint32_t element_log2 = 0;
+  while ((1u << element_log2) < f.block_bytes) ++element_log2;
+  const uint32_t n = 16 - element_log2;
+  const bool is3d = shape.dimension == 4;
+  uint64_t tw, th, td;
+  if (is3d) {
+    tw = 1ull << ((n + 2) / 3);
+    th = 1ull << ((n + 1) / 3);
+    td = 1ull << (n / 3);
+  } else {
+    tw = 1ull << ((n + 1) / 2);
+    th = 1ull << (n / 2);
+    td = 1;
+  }
+  const uint64_t tail_w = tw / 2, tail_h = th, tail_d = td;
+  const uint32_t max_in_tail = is3d ? 10 : 12;
+  ConsoleTiling t;
+  t.tile_width = static_cast<uint32_t>(tw * f.block_size);
+  t.tile_height = static_cast<uint32_t>(th * f.block_size);
+  t.tile_depth = static_cast<uint32_t>(td);
+  t.slices = is3d ? 1 : (shape.depth_or_array ? shape.depth_or_array : 1);
+  t.standard_mips = mips;
+  for (uint32_t mip = 0; mip < mips; ++mip) {
+    const uint64_t w = std::max<uint64_t>(1, shape.width >> mip);
+    const uint64_t h = std::max<uint64_t>(1, (shape.height ? shape.height : 1) >> mip);
+    const uint64_t d = is3d ? std::max<uint64_t>(1, shape.depth_or_array >> mip) : 1;
+    const uint64_t ew = (w + f.block_size - 1) / f.block_size, eh = (h + f.block_size - 1) / f.block_size;
+    if (mips > 1 && ew <= tail_w && eh <= tail_h && d <= tail_d && mips - mip <= max_in_tail) {
+      t.standard_mips = mip;
+      break;
+    }
+    ConsoleMipTiling& m = t.mips[mip];
+    m.width_tiles = static_cast<uint32_t>((ew + tw - 1) / tw);
+    m.height_tiles = static_cast<uint32_t>((eh + th - 1) / th);
+    m.depth_tiles = static_cast<uint32_t>((d + td - 1) / td);
+  }
+  t.packed_mips = mips - t.standard_mips;
+  t.packed_tiles = t.packed_mips ? 1 : 0;
+  uint32_t next = t.packed_tiles;
+  for (uint32_t mip = t.standard_mips; mip-- > 0;) {
+    ConsoleMipTiling& m = t.mips[mip];
+    m.start = next;
+    next += m.width_tiles * m.height_tiles * m.depth_tiles;
+  }
+  t.slice_tiles = next;
+  *out = t;
+  return true;
 }
 
 }  // namespace holy::lib

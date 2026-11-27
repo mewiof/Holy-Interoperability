@@ -951,6 +951,40 @@ void STDMETHODCALLTYPE list_copy_buffer_region(CommandList* self, void* destinat
               bytes);
 }
 
+// Observed: slot 62 takes (address, address, byte count, 0). A title locks
+// a texture for the CPU with it: it allocates a staging buffer, passes the
+// staging buffer first and the texture memory's GPU address second, waits for
+// the list's work, then reads the staging buffer. Taken as a copy of memory
+// on the GPU timeline from the second address to the first (the staging
+// buffer is fresh when it is called: a copy the other way would only spread
+// what it held). Host: copies between the buffers spanning the heaps over the
+// two ranges, a piece per heap. Memory the GPU wrote into host textures of
+// its own (render targets) is not in title memory, so it is not copied.
+void STDMETHODCALLTYPE list_copy_memory_x(CommandList* self, uint64_t destination, uint64_t source, uint64_t bytes,
+                                          uint32_t flags) {
+  if (flags) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 4) LIB_LOG(lib::kWarn, "d3d12", "memory copy with flags 0x%x (taken as none)", flags);
+  }
+  HOLY_TRACE("list %u copies 0x%llx bytes of memory %p -> %p", self->number, static_cast<unsigned long long>(bytes),
+             reinterpret_cast<void*>(source), reinterpret_cast<void*>(destination));
+  page_cache_gpu_writes(destination, bytes);
+  for (uint64_t done = 0; done < bytes;) {
+    Backing to, from;
+    if (!locate_range(self->device, destination + done, bytes - done, &to) ||
+        !locate_range(self->device, source + done, bytes - done, &from) || !to.whole || !from.whole) {
+      LIB_LOG(lib::kError, "d3d12", "memory copy of 0x%llx bytes %p -> %p: no GPU memory at 0x%llx of it",
+              static_cast<unsigned long long>(bytes), reinterpret_cast<void*>(source),
+              reinterpret_cast<void*>(destination), static_cast<unsigned long long>(done));
+      return;
+    }
+    const uint64_t piece = std::min({bytes - done, to.contiguous, from.contiguous});
+    if (!piece) return;
+    self->host->CopyBufferRegion(to.whole, to.heap_offset, from.whole, from.heap_offset, piece);
+    done += piece;
+  }
+}
+
 bool host_copy_location(const D3D12_TEXTURE_COPY_LOCATION& title, D3D12_TEXTURE_COPY_LOCATION* host) {
   const Resource* resource = copied(title.pResource, "a texture copy");
   if (!resource) return false;
@@ -1050,6 +1084,7 @@ const auto kListVtable = [] {
   HOLY_D3D_SLOT(table, kCommandListObject, 142, list_set_sample_mask);
   HOLY_D3D_SLOT(table, kCommandListObject, 32, list_set_descriptor_heaps);
   HOLY_D3D_SLOT(table, kCommandListObject, 52, list_clear_render_target_view);
+  HOLY_D3D_SLOT(table, kCommandListObject, 62, list_copy_memory_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 71, list_write_value_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 72, list_write_timestamp_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 74, list_write_fence_value_x);
@@ -1096,6 +1131,11 @@ HRESULT create_command_list(Device* device, const uint32_t* desc, void* allocato
   const uint32_t number = lists.fetch_add(1) + 1;
   auto* list = new CommandList();
   list->number = number;
+  static const bool named = [] {
+    lib::name_vtable(const_cast<void* const*>(kListVtable.data()), &kListInfo);  // its info is not after the vtable
+    return true;
+  }();
+  (void)named;
   list->vtable = kListVtable.data();
   list->info = &kListInfo;
   list->device = device;

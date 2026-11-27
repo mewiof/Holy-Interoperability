@@ -36,6 +36,7 @@
 #include "core/libs/d3d12_xs/page_cache.h"
 #include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
+#include "core/libs/texture_layout.h"
 #include "core/libs/d3d12_xs/shader_container.h"
 #include "core/libs/d3d12_xs/shader_dump.h"
 #include "core/libs/d3d12_xs/translation_cache.h"
@@ -399,6 +400,61 @@ void check_host_descs(const char* what, UINT count, const D3D12_RESOURCE_DESC* t
   }
 }
 
+// Sizes and alignments reported to titles for `count` descriptions: the
+// host's answer for the sizing descriptions, each texture taking at least
+// the console layout's size (lib::console_texture_size: titles stream
+// textures in that layout into memory of the size reported), and the
+// resources' offsets in turn when `infos` is given.
+D3D12_RESOURCE_ALLOCATION_INFO title_allocation_info(Device* self, UINT count, const D3D12_RESOURCE_DESC* titles,
+                                                     const std::vector<D3D12_RESOURCE_DESC>& hosts,
+                                                     D3D12_RESOURCE_ALLOCATION_INFO1* infos) {
+  ID3D12Device4* device4 = nullptr;
+  if (FAILED(self->host->QueryInterface(IID_PPV_ARGS(&device4)))) {
+    LIB_LOG(lib::kError, "d3d12", "the host device has no GetResourceAllocationInfo1");
+    return {UINT64_MAX, 0};
+  }
+  std::vector<D3D12_RESOURCE_ALLOCATION_INFO1> each(count);
+  D3D12_RESOURCE_ALLOCATION_INFO total = device4->GetResourceAllocationInfo1(0, count, hosts.data(), each.data());
+  device4->Release();
+  if (total.SizeInBytes == UINT64_MAX) return total;
+  uint64_t offset = 0, alignment = total.Alignment;
+  for (UINT i = 0; i < count; ++i) {
+    uint64_t size = each[i].SizeInBytes;
+    const uint64_t align = each[i].Alignment ? each[i].Alignment : 1;
+    const D3D12_RESOURCE_DESC& d = titles[i];
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+      lib::TextureShape shape;
+      shape.dimension = static_cast<uint32_t>(d.Dimension);
+      shape.width = d.Width;
+      shape.height = d.Height;
+      shape.depth_or_array = d.DepthOrArraySize ? d.DepthOrArraySize : 1;
+      shape.mips = d.MipLevels ? d.MipLevels : 1;
+      shape.format = static_cast<uint32_t>(d.Format);
+      const uint64_t console = lib::console_texture_size(shape, d.Alignment == 4096, d.SampleDesc.Count);
+      static const bool trace = GetEnvironmentVariableW(L"HOLY_XG_TRACE", nullptr, 0) > 0;
+      if (trace && console && console != size) {
+        LIB_LOG(lib::kInfo, "d3d12", "texture %llux%ux%u, %u mips, format %d, alignment 0x%llx: host 0x%llx, console 0x%llx",
+                static_cast<unsigned long long>(d.Width), d.Height, d.DepthOrArraySize, d.MipLevels, d.Format,
+                static_cast<unsigned long long>(d.Alignment), static_cast<unsigned long long>(size),
+                static_cast<unsigned long long>(console));
+      }
+      // Only for small-resource placement (4 KiB blocks). With 64 KiB blocks
+      // the console's driver also picks other layouts (smaller blocks where
+      // those waste less, not modelled), and larger sizes for 64 KiB-aligned
+      // textures made a title fail at startup in most runs (a write into
+      // memory it had reserved but not committed).
+      if (d.Alignment == 4096 && console > size) size = lib::align_up(console, align);
+    }
+    offset = lib::align_up(offset, align);
+    if (infos) infos[i] = {offset, align, size};
+    offset += size;
+    alignment = std::max(alignment, align);
+  }
+  total.SizeInBytes = offset;
+  total.Alignment = alignment;
+  return total;
+}
+
 // Slot 25: GetResourceAllocationInfo(visible_mask, count, descs), as on the
 // desktop; the 16-byte result comes back through the result pointer, for the
 // description the host takes (desktop_resource_desc).
@@ -410,7 +466,7 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE get_resource_allocation_info(
   std::vector<D3D12_RESOURCE_DESC> host;
   for (UINT i = 0; i < count; ++i) host.push_back(sizing_resource_desc(descs[i]));
   check_host_descs("allocation info (slot 25)", count, descs, host);
-  *result = self->host->GetResourceAllocationInfo(0, count, host.data());
+  *result = title_allocation_info(self, count, descs, host, nullptr);
   if (result->SizeInBytes == UINT64_MAX) {
     for (UINT i = 0; i < count; ++i) {
       const D3D12_RESOURCE_DESC& d = descs[i];
@@ -447,15 +503,8 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE get_resource_allocation_info1(
   std::vector<D3D12_RESOURCE_DESC> host;
   for (UINT i = 0; i < count; ++i) host.push_back(sizing_resource_desc(descs[i]));
   check_host_descs("allocation info (slot 108)", count, descs, host);
-  ID3D12Device4* device4 = nullptr;
-  if (FAILED(self->host->QueryInterface(IID_PPV_ARGS(&device4)))) {
-    *result = {UINT64_MAX, 0};
-    LIB_LOG(lib::kError, "d3d12", "the host device has no GetResourceAllocationInfo1");
-    return result;
-  }
   const bool removed_before = call_check_enabled() && self->host->GetDeviceRemovedReason() != S_OK;
-  *result = device4->GetResourceAllocationInfo1(0, count, host.data(), infos);
-  device4->Release();
+  *result = title_allocation_info(self, count, descs, host, infos);
   if (call_check_enabled() && !removed_before && self->host->GetDeviceRemovedReason() != S_OK) {
     LIB_LOG(lib::kError, "d3d12", "allocation info (slot 108) removed the host device: %u descriptions, infos %p", count,
             static_cast<void*>(infos));

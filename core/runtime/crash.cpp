@@ -29,10 +29,30 @@ void log_frame(int index, DWORD64 address) {
             describe_address(reinterpret_cast<const void*>(address)).c_str());
 }
 
-// May fault on a corrupted stack; only call through walk_stack().
-void walk_stack_unguarded(CONTEXT context) {
+// May fault on a corrupted stack; only call through walk_stack(). With
+// `registers`, each caller's frame also shows the callee-saved registers as
+// they were when it made its call (what it was working on).
+void walk_stack_unguarded(CONTEXT context, bool registers) {
   for (int index = 0; index < 40 && context.Rip != 0; ++index) {
     log_frame(index, context.Rip);
+    if (registers && index > 0) {
+      LOG_ERROR(kComponent, "      rbx=%016llx rbp=%016llx rsi=%016llx rdi=%016llx", context.Rbx, context.Rbp,
+                context.Rsi, context.Rdi);
+      LOG_ERROR(kComponent, "      r12=%016llx r13=%016llx r14=%016llx r15=%016llx rsp=%016llx", context.R12,
+                context.R13, context.R14, context.R15, context.Rsp);
+      // The first 64 bytes of what they point at, for the nearest callers.
+      const struct {
+        const char* name;
+        DWORD64 value;
+      } saved[] = {{"rbx", context.Rbx}, {"rbp", context.Rbp}, {"rsi", context.Rsi}, {"rdi", context.Rdi},
+                   {"r12", context.R12}, {"r13", context.R13}, {"r14", context.R14}, {"r15", context.R15}};
+      for (const auto& r : saved) {
+        uint64_t w[8];
+        if (index > 8 || r.value < 0x10000 || !read_memory(r.value, w, sizeof(w))) continue;
+        LOG_ERROR(kComponent, "      [%s] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx", r.name, w[0],
+                  w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+      }
+    }
     DWORD64 image_base = 0;
     PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
     if (!function) {
@@ -50,9 +70,9 @@ void walk_stack_unguarded(CONTEXT context) {
 
 }  // namespace
 
-void walk_stack(const CONTEXT* context) {
+void walk_stack(const CONTEXT* context, bool registers) {
   __try {
-    walk_stack_unguarded(*context);
+    walk_stack_unguarded(*context, registers);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
   }
 }
@@ -141,7 +161,7 @@ LONG CALLBACK first_chance_handler(EXCEPTION_POINTERS* info) {
 LONG WINAPI unhandled_filter(EXCEPTION_POINTERS* info) {
   log_exception("unhandled", info);
   log_registers(info->ContextRecord);
-  walk_stack(info->ContextRecord);
+  walk_stack(info->ContextRecord, true);
   log_stats("at the unhandled exception");
   if (const LPTOP_LEVEL_EXCEPTION_FILTER title_filter = g_title_filter.load()) {
     LOG_ERROR(kComponent, "passing the exception to the title's own filter");

@@ -137,12 +137,15 @@ void test_graphics() {
     auto* marker = static_cast<volatile uint32_t*>(
         VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     const auto address = reinterpret_cast<uint64_t>(marker);
+    for (uint32_t i = 0; marker && i < 0x2000 / 4; ++i) marker[0x40 + i] = 0x40000000u + i;
     void* lists[] = {list};
     bool recorded = true;
     for (uint32_t round = 0; round < 2 && marker; ++round) {
       recorded = recorded && call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
       call<void>(list, 20, static_cast<D3D12_PRIMITIVE_TOPOLOGY>(17));
       call<void>(list, 71, address + 4 * round, 0x1234u + round, UINT64{0}, 0u);
+      // Slot 62: a memory copy on the GPU (destination, source, bytes, 0).
+      if (round == 1) call<void>(list, 62, address + 0x8000, address + 0x100, UINT64{0x2000}, 0u);
       recorded = recorded && call<HRESULT>(list, 9) == S_OK;
       call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
     }
@@ -151,6 +154,9 @@ void test_graphics() {
     for (int i = 0; value && *value < 20 && i < 5000; ++i) Sleep(1);
     check(recorded && marker && value && *value == 20 && marker[0] == 0x1234 && marker[1] == 0x1235,
           "a list reset and submitted again, with a rectangle-list topology set, runs on the GPU");
+    bool copied = marker != nullptr;
+    for (uint32_t i = 0; copied && i < 0x2000 / 4; ++i) copied = marker[0x2000 + i] == 0x40000000u + i;
+    check(copied && marker[0x2000 + 0x800] == 0, "a list copies memory on the GPU (slot 62)");
   }
   // Frame tokens: the current frame's without waiting (flag 2), and a wait for
   // a frame no present has reached yet returns at once.

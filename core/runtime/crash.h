@@ -12,7 +12,7 @@ void install_crash_handlers();
 LPTOP_LEVEL_EXCEPTION_FILTER exchange_title_filter(LPTOP_LEVEL_EXCEPTION_FILTER filter);
 
 // Logs the stack of `context`, frame by frame (module + offset).
-void walk_stack(const CONTEXT* context);
+void walk_stack(const CONTEXT* context, bool registers = false);
 
 // Logs that the title is ending its process, with the calling stack.
 void log_title_exit(const char* how, unsigned code);

@@ -5,13 +5,15 @@
 // a call reports the interface, the slot and the caller in the title, then
 // applies the unimplemented-import policy. Implemented methods replace their
 // slots. An object passed to a title must start with the vtable pointer
-// followed by a pointer to its `VtableInfo`.
+// followed by a pointer to its `VtableInfo`, or have its vtable named with
+// name_vtable (objects that keep something else there).
 #pragma once
 
 #include <windows.h>
 #include <intrin.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <utility>
@@ -29,6 +31,34 @@ struct ReportingObject {
   void* const* vtable;
   const VtableInfo* info;
 };
+
+// Vtables named for the reports of objects that do not keep their
+// `VtableInfo` after the vtable (a few per library, named once).
+struct NamedVtable {
+  void* const* vtable;
+  const VtableInfo* info;
+};
+inline NamedVtable g_named_vtables[8] = {};
+inline std::atomic<int> g_named_vtable_count{0};
+
+inline void name_vtable(void* const* vtable, const VtableInfo* info) {
+  const int index = g_named_vtable_count.fetch_add(1);
+  if (index < 8) g_named_vtables[index] = {vtable, info};
+}
+
+// The named `VtableInfo` of `candidate`'s vtable, or null. Guarded: the
+// candidate may be any value.
+inline const VtableInfo* named_vtable_info(const void* candidate) {
+  __try {
+    void* const* vtable = candidate ? *static_cast<void* const* const*>(candidate) : nullptr;
+    const int count = g_named_vtable_count.load() < 8 ? g_named_vtable_count.load() : 8;
+    for (int i = 0; vtable && i < count; ++i) {
+      if (g_named_vtables[i].vtable == vtable) return g_named_vtables[i].info;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return nullptr;
+}
 
 // True if `candidate` is an object whose vtable has `stub` in `slot`. Guarded:
 // the candidate may be any value.
@@ -55,10 +85,20 @@ uint64_t report_unimplemented_slot(void* first, uint64_t a1, uint64_t a2, uint64
     self = reinterpret_cast<const ReportingObject*>(a1);
     convention = " (result pointer first)";
   }
+  const VtableInfo* info = self ? self->info : named_vtable_info(first);
   char symbol[160];
-  std::snprintf(symbol, sizeof(symbol), "%s#%d", self ? self->info->name : "unknown-interface", Slot);
+  std::snprintf(symbol, sizeof(symbol), "%s#%d", info ? info->name : "unknown-interface", Slot);
   HolyLog(kError, "import", "%s(%p, %llx, %llx, %llx)%s", symbol, first, a1, a2, a3, convention);
-  HolyUnimplementedFrom(self ? self->info->library : "?", symbol, _ReturnAddress());
+  if (!info) {
+    // What the object looks like (its vtable and the word after it), to
+    // tell whose it is.
+    uint64_t words[2] = {};
+    SIZE_T read = 0;
+    ReadProcessMemory(GetCurrentProcess(), first, words, sizeof(words), &read);
+    HolyLog(kError, "import", "  the object starts with %016llx %016llx", static_cast<unsigned long long>(words[0]),
+            static_cast<unsigned long long>(words[1]));
+  }
+  HolyUnimplementedFrom(info ? info->library : "?", symbol, _ReturnAddress());
   return 0;
 }
 

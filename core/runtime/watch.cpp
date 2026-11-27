@@ -27,6 +27,7 @@ struct Spec {
   int watch_reg = -1;
   int64_t watch_offset = 0;
   bool watch_indirect = false;  // watch the address stored there instead
+  uint64_t fixed = 0;           // watch=title+<offset>: watched from the start, no trigger needed
 };
 
 Spec g_spec;
@@ -83,6 +84,8 @@ bool parse(const std::string& text) {
       }
       g_spec.if_value = static_cast<uint32_t>(std::strtoull(value.c_str() + colon + 1, nullptr, 16));
       g_spec.has_if = true;
+    } else if (key == "watch" && value.rfind("title+", 0) == 0) {
+      g_spec.fixed = reinterpret_cast<uint64_t>(state().title_base) + std::strtoull(value.c_str() + 6, nullptr, 16);
     } else if (key == "watch") {
       g_spec.watch_indirect = !value.empty() && value[0] == '*';
       if (!parse_operand(value.substr(g_spec.watch_indirect ? 1 : 0), &g_spec.watch_reg, &g_spec.watch_offset)) {
@@ -92,13 +95,13 @@ bool parse(const std::string& text) {
       return false;
     }
   }
-  return g_spec.at && g_spec.watch_reg >= 0;
+  return (g_spec.at && g_spec.watch_reg >= 0) || (g_spec.fixed && !g_spec.at);
 }
 
 // DR0: execution breakpoint at the trigger; DR1-DR3: 8-byte write watches.
 void apply(CONTEXT* c) {
   c->Dr0 = g_spec.at;
-  DWORD64 dr7 = 1;  // L0, execute, length 1
+  DWORD64 dr7 = g_spec.at ? 1 : 0;  // L0, execute, length 1
   DWORD64* slots[3] = {&c->Dr1, &c->Dr2, &c->Dr3};
   for (int i = 0; i < 3; ++i) {
     const uint64_t watched = g_watched[i].load();
@@ -220,11 +223,16 @@ void start_watch() {
     return;
   }
   g_active = true;
+  if (g_spec.fixed) g_watched[g_next.fetch_add(1)].store(g_spec.fixed);
   g_rearm = CreateEventW(nullptr, FALSE, TRUE, nullptr);
   AddVectoredExceptionHandler(1, &on_single_step);
   HANDLE thread = CreateThread(nullptr, 64 * 1024, &watch_thread, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
   if (thread) CloseHandle(thread);
-  LOG_WARN(kComponent, "hardware watch armed at %s", describe_address(reinterpret_cast<void*>(g_spec.at)).c_str());
+  if (g_spec.at) {
+    LOG_WARN(kComponent, "hardware watch armed at %s", describe_address(reinterpret_cast<void*>(g_spec.at)).c_str());
+  } else {
+    LOG_WARN(kComponent, "hardware watch on writes to %s", describe_address(reinterpret_cast<void*>(g_spec.fixed)).c_str());
+  }
 }
 
 void watch_thread_started() {

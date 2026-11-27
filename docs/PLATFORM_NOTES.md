@@ -300,6 +300,12 @@ Notes describe the platform, never a title.
   `(address, 7, value, 1)` a frame counter the CPU polls, slot 72 `(address, 0, 0, 1)` an 8-byte GPU timestamp
   (*assumed* meanings). Implementation: `WriteBufferImmediate` (marker-out for slot 74) and timestamp queries
   resolved into title memory.
+- *observed*: slot 62 takes `(address, address, byte count, 0)`. A title locks a texture for the CPU with it: it
+  allocates a staging buffer, passes it first and the texture memory's GPU address second, waits for the list's
+  work, then reads the staging buffer. *Assumed*: a copy of memory on the GPU timeline from the second address to
+  the first (the staging buffer is fresh at the call, so the other direction would make no sense).
+  Implementation: copies between the buffers spanning the heaps over both ranges, a piece per heap. Not covered:
+  memory the GPU wrote into the runtime's own host textures (render targets) is not in title memory.
 - *observed*: slot 142 is called with all ones before draws (*assumed*: the sample mask; other values report
   themselves); slot 75 takes one byte titles derive from a pipeline property (meaning not established; recorded,
   not applied).
@@ -991,8 +997,25 @@ Notes describe the platform, never a title.
 - *observed*: computer slot 10 takes `(tile count*, packed mip info*, tile shape*, subresource tiling count*
   (in/out, 16 seen), first subresource tiling, subresource tilings*)`, the arguments of the desktop
   `ID3D12Device::GetResourceTiling` after its resource; titles stream tiled textures in 64 KiB pages.
-  Implementation: the host's answer for a reserved resource of the same description (console flag bits
-  dropped).
+- *observed*: titles place each level of a streamed texture in memory at the tiles slot 10 reports (each standard
+  level's first tile in slice 0; the mip tail after them in what is left of a slice), and use the same offsets,
+  times the array size, to find the level in their archives. Archives hold the levels smallest first: a 512x512
+  BC7 texture of 10 levels in 32 slices has its mip tails (64 KiB each), then level 1 (64 KiB each), then level 0
+  (256 KiB each), compressed in chunks that never straddle a slice's level. With the desktop order (level 0 at
+  tile 0) a title read level 1 from the middle of level 0's chunks and stopped at its own check.
+- Implementation (core/libs/texture_layout.h, `console_tiling`): the console GPU's tiled layout as publicly
+  documented for its surfaces. 64 KiB tiles of the documented standard shapes (2D: 2^ceil(n/2) by 2^floor(n/2)
+  elements of e bytes, n = log2(65536 / e); 3D: thick, 2^ceil(n/3) by 2^round(n/3) by 2^floor(n/3)); the levels
+  that fit in half a tile's width and its height (and its depth, for 3D; at most 12 levels, 10 thick; only with
+  more than one level) share one tile, the mip tail; each array slice holds the mip tail first, then the levels
+  from the smallest to level 0. Packed levels report the desktop's packed-tile marker; the packed information
+  gives the first slice's tail at tile 0. Shapes not modelled (12-byte texels, more than 16 levels,
+  multisampling) get the host's answer for a reserved resource of the same description.
+- *observed*: computer slot 6 takes `(plane, mip level, x, y, z or array slice, sample, 0)` and returns a 64-bit
+  byte offset titles add to a texture's address to reach a texel's element on the CPU (*assumed*: the last
+  argument a bit offset out). Implementation: the offset in the layout slot 8 copies into (the bit offset, when
+  given, is zero). Not yet consistent with slot 10's layout for textures titles stream pre-tiled: their data is
+  in the console's tiled layout, which the runtime does not yet de-tile.
 
 ## Audio processor heap (`AcpHal.dll`)
 

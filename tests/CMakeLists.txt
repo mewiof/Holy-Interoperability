@@ -18,6 +18,7 @@ add_executable(holy_unit_tests
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader/rdna.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader/translate.cpp
   unit/test_strings.cpp
+  unit/test_texture_layout.cpp
   unit/test_vfs.cpp
   unit/test_write_watch.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/write_watch.cpp
@@ -112,3 +113,7 @@ set_tests_properties(e2e.unimplemented_traps PROPERTIES
 add_test(NAME e2e.unimplemented_continues
   COMMAND holy run "${HOLY_SAMPLE_DIR}" --unimplemented continue --timeout 60 -- --call-missing)
 set_tests_properties(e2e.unimplemented_continues PROPERTIES PASS_REGULAR_EXPRESSION "SAMPLE TITLE: PASS")
+# Full sample runs measure host memory going back after release (system-wide
+# commit): run them one at a time so other runs' allocations stay out of it.
+set_tests_properties(e2e.run_sandboxed e2e.run_unsandboxed e2e.run_online e2e.run_local_user
+                     e2e.unimplemented_continues PROPERTIES RESOURCE_LOCK sample_title_memory)

@@ -448,6 +448,59 @@ void test_texture_layout() {
   check(copied == S_OK && memory[0] == 1 && memory[3] == 4 && memory[4] == 0xEE && memory[256] == 5 &&
             memory[259] == 8,
         "texture computers copy texels into rows 256 bytes apart");
+  // Slot 6: the byte offset of a texel, in the same layout.
+  using OffsetFn = uint64_t(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t,
+                                                uint32_t*);
+  const auto offset = reinterpret_cast<OffsetFn>((*static_cast<void***>(computer))[6]);
+  check(offset(computer, 0, 0, 3, 1, 0, 0, nullptr) == 259 && offset(computer, 0, 0, 0, 0, 0, 0, nullptr) == 0,
+        "texture computers give texel offsets in the layout they copy into");
+  reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(computer))[2])(computer);
+
+  // Slot 10, resource tiling, in the console's order: a 512x512 BC7 texture
+  // of 10 levels in 2 array slices takes 6 tiles a slice (level 0: 4, level
+  // 1: 1, levels 2-9 in the mip tail: 1), the mip tail first, level 0 last.
+  const uint32_t bc7 = 98;
+  const uint64_t size = 512;
+  const uint32_t tall = 512;
+  const uint16_t slices = 2, levels = 10;
+  std::memcpy(desc + 16, &size, 8);
+  std::memcpy(desc + 24, &tall, 4);
+  std::memcpy(desc + 28, &slices, 2);
+  std::memcpy(desc + 30, &levels, 2);
+  std::memcpy(desc + 32, &bc7, 4);
+  computer = nullptr;
+  check(create(desc, &computer) == S_OK && computer, "the layout library creates computers for arrays");
+  if (!computer) return;
+  // The desktop D3D12_PACKED_MIP_INFO, D3D12_TILE_SHAPE and
+  // D3D12_SUBRESOURCE_TILING layouts.
+  struct PackedMips {
+    uint8_t NumStandardMips, NumPackedMips;
+    uint32_t NumTilesForPackedMips, StartTileIndexInOverallResource;
+  };
+  struct TileShape {
+    uint32_t WidthInTexels, HeightInTexels, DepthInTexels;
+  };
+  struct SubresourceTiling {
+    uint32_t WidthInTiles;
+    uint16_t HeightInTiles, DepthInTiles;
+    uint32_t StartTileIndexInOverallResource;
+  };
+  constexpr uint32_t kPackedTile = 0xFFFFFFFF;
+  using TilingFn = void(STDMETHODCALLTYPE*)(void*, UINT*, PackedMips*, TileShape*, UINT*, UINT, SubresourceTiling*);
+  UINT tiles = 0, tilings_count = 12;
+  PackedMips packed{};
+  TileShape shape{};
+  SubresourceTiling tilings[12] = {};
+  reinterpret_cast<TilingFn>((*static_cast<void***>(computer))[10])(computer, &tiles, &packed, &shape,
+                                                                    &tilings_count, 0, tilings);
+  check(tiles == 12 && packed.NumStandardMips == 2 && packed.NumPackedMips == 8 && packed.NumTilesForPackedMips == 1 &&
+            shape.WidthInTexels == 256 && shape.HeightInTexels == 256,
+        "resource tiling counts tiles, standard levels and the mip tail");
+  check(tilings_count == 12 && tilings[0].StartTileIndexInOverallResource == 2 && tilings[0].WidthInTiles == 2 &&
+            tilings[1].StartTileIndexInOverallResource == 1 &&
+            tilings[2].StartTileIndexInOverallResource == kPackedTile &&
+            tilings[10].StartTileIndexInOverallResource == 6 + 2,
+        "resource tiling places the mip tail first and level 0 last in each slice");
   reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(computer))[2])(computer);
 }
 

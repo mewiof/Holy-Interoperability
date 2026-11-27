@@ -53,6 +53,9 @@ struct MemoryMap {
   std::vector<uint32_t> free_slots;                 // of released heaps, for heaps of one slot
   std::vector<DescriptorHeap*> heaps;               // shader-visible heaps holding the views
   Device* device = nullptr;
+  // Cached pages' GPU write flags (shader/translate.h), mapped for the CPU.
+  ID3D12Resource* flags_buffer = nullptr;
+  volatile uint32_t* flags = nullptr;
 };
 MemoryMap g_map;  // under g_lock
 std::atomic<const uint8_t*> g_table{nullptr};
@@ -82,6 +85,34 @@ void write_slot_view(Device* device, const DescriptorHeap* heap, uint32_t slot) 
   const uint64_t index = heap->host_count - kReservedHostViews + slot;
   device->host->CreateUnorderedAccessView(buffer, nullptr, &desc,
                                           {static_cast<SIZE_T>(heap->host_cpu + index * heap->increment)});
+}
+
+// The flags buffer's view at kFlagsView of a heap (null when there is none).
+void write_flags_view(Device* device, const DescriptorHeap* heap) {
+  D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+  desc.Format = DXGI_FORMAT_R32_TYPELESS;
+  desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  desc.Buffer.NumElements = g_map.flags_buffer ? kPageCacheLines : 0;
+  const uint64_t index = heap->host_count - kReservedHostViews + kFlagsView;
+  device->host->CreateUnorderedAccessView(g_map.flags_buffer, nullptr, &desc,
+                                          {static_cast<SIZE_T>(heap->host_cpu + index * heap->increment)});
+}
+
+// Cached entries (g_lock held): what changes an entry hands a cached one's
+// line back to the page cache (page_cache.h), and the slot an entry's memory
+// is in either way.
+void (*g_dropped_hook)(uint32_t line) = nullptr;
+void drop_cached(volatile uint32_t* entry) {
+  const uint32_t word = entry[0];
+  if ((word & kCachedPageBit) && g_dropped_hook) g_dropped_hook(word & ~kCachedPageBit);
+}
+uint32_t entry_slot(volatile uint32_t* entry) {
+  const uint32_t word = entry[0];
+  if (!(word & kCachedPageBit)) return word;
+  const auto* line = reinterpret_cast<const volatile uint32_t*>(g_map.table + kPageTableLevel1Bytes) +
+                     4ull * (word & ~kCachedPageBit);
+  return line[2];
 }
 
 // The slots of a heap's buffer (g_lock held); 0 when there are no more.
@@ -163,6 +194,7 @@ void map_pages(uint64_t begin, uint64_t end, uint32_t first_slot, uint64_t heap_
     if (slot >= g_map.slots.size() || g_map.slots[slot].buffer != g_map.slots[first_slot].buffer) continue;
     volatile uint32_t* entry = page_entry(page, true);
     if (!entry) return;
+    drop_cached(entry);
     entry[1] = view_offset;
     _ReadWriteBarrier();
     entry[0] = slot;
@@ -321,7 +353,12 @@ std::map<uintptr_t, std::pair<uintptr_t, HeapRecord>>::iterator retire_locked(
   const uint64_t slots = record.slot ? slot_count(record.size) : 0;
   for (uint64_t page = base & ~0xFFFFull; page < base + record.size; page += 0x10000) {
     volatile uint32_t* entry = page_entry(page, false);
-    if (entry && entry[0] >= record.slot && entry[0] < record.slot + slots) entry[0] = 0;
+    if (!entry) continue;
+    const uint32_t slot = entry_slot(entry);
+    if (slot >= record.slot && slot < record.slot + slots) {
+      drop_cached(entry);
+      entry[0] = 0;
+    }
   }
   for (uint64_t i = 0; i < slots; ++i) {
     const auto slot = static_cast<uint32_t>(record.slot + i);
@@ -395,6 +432,24 @@ uint64_t ensure_page_table(Device* device) {
     return 0;
   }
   buffer->SetName(L"holy page table");
+  // Cached pages' flags: written by translated programs, read and set by the
+  // CPU (page_cache.h); zeroed as made.
+  D3D12_RESOURCE_DESC flags_desc = desc;
+  flags_desc.Width = kPageCacheLines * 4ull;
+  flags_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  void* flags = nullptr;
+  if (SUCCEEDED(device->host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &flags_desc,
+                                                      D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                      IID_PPV_ARGS(&g_map.flags_buffer))) &&
+      SUCCEEDED(g_map.flags_buffer->Map(0, &nothing_read, &flags))) {
+    g_map.flags_buffer->SetName(L"holy cached page flags");
+    g_map.flags = static_cast<volatile uint32_t*>(flags);
+    for (const DescriptorHeap* view_heap : g_map.heaps) write_flags_view(device, view_heap);
+  } else {
+    LIB_LOG(lib::kError, "d3d12", "no flags for cached pages: title memory is not cached in video memory");
+    if (g_map.flags_buffer) g_map.flags_buffer->Release();
+    g_map.flags_buffer = nullptr;
+  }
   g_map.failed = false;
   g_map.table = static_cast<uint8_t*>(memory);
   g_map.host_va = buffer->GetGPUVirtualAddress();
@@ -503,6 +558,7 @@ void apply_mapping_events() {
     if (covering) {
       map_pages(event.granule, event.granule + 0x10000, covering->second.slot, event.offset - covering->first);
     } else if (volatile uint32_t* entry = page_entry(event.granule, false)) {
+      drop_cached(entry);
       entry[0] = 0;
     }
   }
@@ -745,14 +801,83 @@ void collect_released_heaps() {
 void unmap_range(uint64_t title_va, uint64_t size) {
   std::lock_guard<std::mutex> lock(g_lock);
   for (uint64_t page = title_va & ~0xFFFFull; page < title_va + size; page += 0x10000) {
-    if (volatile uint32_t* entry = page_entry(page, false)) entry[0] = 0;
+    if (volatile uint32_t* entry = page_entry(page, false)) {
+      drop_cached(entry);
+      entry[0] = 0;
+    }
   }
+}
+
+bool page_place(uint64_t page, PagePlace* out) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  volatile uint32_t* entry = page_entry(page, false);
+  if (!entry || !entry[0] || (entry[0] & kCachedPageBit) || entry[0] >= g_map.slots.size()) return false;
+  const Slot& slot = g_map.slots[entry[0]];
+  const uint32_t view_offset = entry[1];
+  // Whole pages inside their view only (a page starting before its heap wraps).
+  if (!slot.buffer || static_cast<uint64_t>(view_offset) + 0x10000 > slot.bytes) return false;
+  *out = PagePlace{entry[0], view_offset, slot.buffer, slot.first + view_offset};
+  return true;
+}
+
+uint32_t add_buffer_slots(Device* device, ID3D12Resource* buffer, uint64_t size) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  if (!ensure_page_table(device)) return 0;
+  HeapRecord record;
+  record.whole = buffer;
+  record.size = size;
+  return add_slots(device, record);
+}
+
+bool cache_page(uint64_t page, const PagePlace& place, uint32_t line, uint32_t copy_slot, uint32_t copy_offset) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  volatile uint32_t* entry = page_entry(page, false);
+  if (!entry || entry[0] != place.slot || entry[1] != place.view_offset || line >= kPageCacheLines) return false;
+  auto* words = reinterpret_cast<volatile uint32_t*>(g_map.table + kPageTableLevel1Bytes) + 4ull * line;
+  words[0] = copy_slot;
+  words[1] = copy_offset;
+  words[2] = place.slot;
+  words[3] = place.view_offset;
+  _ReadWriteBarrier();
+  entry[0] = kCachedPageBit | line;
+  return true;
+}
+
+void uncache_page(uint64_t page, uint32_t line) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  volatile uint32_t* entry = page_entry(page, false);
+  if (!entry || entry[0] != (kCachedPageBit | line)) return;
+  const auto* words = reinterpret_cast<const volatile uint32_t*>(g_map.table + kPageTableLevel1Bytes) + 4ull * line;
+  entry[1] = words[3];
+  _ReadWriteBarrier();
+  entry[0] = words[2];
+}
+
+volatile uint32_t* cache_flags() {
+  std::lock_guard<std::mutex> lock(g_lock);
+  return g_map.flags;
+}
+
+void set_cache_dropped_hook(void (*hook)(uint32_t line)) {
+  std::lock_guard<std::mutex> lock(g_lock);
+  g_dropped_hook = hook;
+}
+
+uint32_t page_entry_word(uint64_t page) {
+  const uint8_t* table = g_table.load(std::memory_order_acquire);
+  if (!table || (page >> 47)) return 0;
+  const uint32_t number = reinterpret_cast<const volatile uint32_t*>(table)[page >> 30];
+  if (!number) return 0;
+  return reinterpret_cast<const volatile uint32_t*>(table + kPageTableLevel2Base +
+                                                    static_cast<uint64_t>(number - 1) * kPageTableTableBytes +
+                                                    ((page >> 16) & 0x3FFF) * 8)[0];
 }
 
 void add_view_heap(Device* device, DescriptorHeap* heap) {
   if (!heap || heap->host_count <= kReservedHostViews) return;
   std::lock_guard<std::mutex> lock(g_lock);
   for (uint32_t slot = 0; slot < g_map.slots.size(); ++slot) write_slot_view(device, heap, slot);
+  write_flags_view(device, heap);
   g_map.heaps.push_back(heap);
 }
 

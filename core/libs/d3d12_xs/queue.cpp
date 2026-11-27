@@ -18,6 +18,7 @@
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
+#include "core/libs/d3d12_xs/page_cache.h"
 #include "core/libs/d3d12_xs/present.h"
 #include "core/libs/d3d12_xs/texture_upload.h"
 #include "core/libs/support.h"
@@ -72,6 +73,7 @@ void STDMETHODCALLTYPE queue_execute_command_lists_x(CommandQueue* self, UINT co
     LIB_LOG(lib::kDebug, "d3d12", "queue type %d executes title lists%s", self->type, numbers.c_str());
   }
   refresh_textures(self->device, self->host);
+  page_cache_before_submit(self->device, self->host);
   collect_released_heaps();
   submit_command_lists(self, count, lists);
 }

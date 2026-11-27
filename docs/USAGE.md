@@ -67,6 +67,7 @@ Debugging aids, set in the environment:
 | `HOLY_D3D_DRED=1` | only the device-removed data (what the GPU was doing, page faults), without the debug layer's checks and their cost |
 | `HOLY_D3D_CHECK=1` | after every call into the device, its queues and command lists (and the runtime's own host calls), the host device is checked; the first call after which it was removed is logged with the 32 calls before it |
 | `HOLY_TEXTURE_TRACKING=0` | host copies of textures in title memory are made once and not kept current (for comparing) |
+| `HOLY_BUFFER_COPIES=<MiB>` | copies in video memory of title memory translated programs read through bound buffers, up to that many MiB (off by default until checked on the reference title; the live count is `d3d12.cached_pages`) |
 | `HOLY_D3D_TRACE=<n>` | every call between presents `n-1` and `n` (from the start for `n` = 1) is logged, with what draws, clears, barriers, pipelines, render targets and viewports were given, and for draws their vertex buffers (first vertex as floats) and root arguments: an account of one frame |
 | `HOLY_CAPTURE_EVERY=<n>` | besides presents 1, 30 and 300, write every `n`th presented frame to `<data>/frames/present-<n>.bmp` |
 | `HOLY_DUMP_TARGETS=<n>` | at present `n`, every live texture of the title is written to `<data>/frames/textures-<n>/` and its per-channel minimum and maximum logged |

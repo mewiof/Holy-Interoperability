@@ -21,6 +21,7 @@
 #include "core/libs/d3d12_xs/descriptors.h"
 #include "core/libs/d3d12_xs/shader/descriptor_layout.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
+#include "core/libs/d3d12_xs/page_cache.h"
 #include "core/libs/d3d12_xs/texture_upload.h"
 #include "core/libs/support.h"
 
@@ -310,6 +311,10 @@ void STDMETHODCALLTYPE create_unordered_access_view(Device* self, void* resource
     write_buffer_descriptor(dest, object->title_va + desc->Buffer.FirstElement * stride,
                             raw ? 0 : desc->Buffer.StructureByteStride,
                             raw ? static_cast<uint32_t>(desc->Buffer.NumElements * stride) : desc->Buffer.NumElements);
+    // Desktop programs write through the view: its memory's copies are not
+    // read again (page_cache.h).
+    page_cache_gpu_writes(object->title_va + desc->Buffer.FirstElement * stride,
+                          static_cast<uint64_t>(desc->Buffer.NumElements) * stride);
   } else {
     write_indexed_descriptor(dest, kKindUnorderedAccess);
   }

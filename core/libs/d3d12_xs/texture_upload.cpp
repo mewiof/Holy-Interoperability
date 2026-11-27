@@ -13,6 +13,7 @@
 #include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
+#include "core/libs/d3d12_xs/page_cache.h"
 #include "core/libs/d3d12_xs/write_watch.h"
 #include "core/libs/support.h"
 #include "core/libs/texture_layout.h"
@@ -188,6 +189,7 @@ void scan_range(Tracked& allocation, uint64_t begin, uint64_t end) {
     }
     for (ULONG_PTR i = 0; i < count; ++i) {
       const auto page = reinterpret_cast<uint64_t>(pages[i]);
+      page_cache_written(page, granularity);  // the reset hides it from the page cache's own scan
       for (Record* record : allocation.records) {
         if (record->address < page + granularity && page < record->address + record->size) mark(record);
       }

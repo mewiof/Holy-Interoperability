@@ -38,6 +38,7 @@
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
+#include "core/libs/d3d12_xs/page_cache.h"
 #include "core/libs/d3d12_xs/shader/descriptor_layout.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
 #include "core/libs/support.h"
@@ -202,7 +203,10 @@ void reach_table(Device* device, uint64_t table, uint32_t descriptors) {
     const auto* words = reinterpret_cast<const uint32_t*>(where.title + static_cast<uint64_t>(i) * where.heap->stride);
     if (words[1] == kDescriptorMarker) continue;
     const uint64_t base = words[0] | (static_cast<uint64_t>(words[1] & 0xFFFF) << 32);
-    if (base) reach(device, base);
+    if (!base) continue;
+    reach(device, base);
+    const uint32_t stride = (words[1] >> 16) & 0x3FFF;
+    page_cache_want(base, stride ? static_cast<uint64_t>(stride) * words[2] : words[2]);
   }
 }
 
@@ -215,6 +219,7 @@ void reach_root(Device* device, const RootBinding& binding) {
       reach_table(device, binding.values[i], p.descriptors);
     } else if (p.type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
       reach(device, binding.values[i]);
+      if (p.type != D3D12_ROOT_PARAMETER_TYPE_UAV) page_cache_want(binding.values[i], 0x10000);
     }
   }
 }
@@ -356,6 +361,7 @@ bool bind_translated_graphics(CommandList* list, uint32_t base_vertex, uint32_t 
     vt[4 * i + 2] = v.StrideInBytes ? v.SizeInBytes / v.StrideInBytes : v.SizeInBytes;
     vt[4 * i + 3] = 4u | (5u << 3) | (6u << 6) | (7u << 9);
     reach(device, v.BufferLocation);
+    page_cache_want(v.BufferLocation, v.SizeInBytes);
   }
   uint32_t user[16] = {};
   user[0] = static_cast<uint32_t>(table.title);
@@ -428,6 +434,9 @@ void bind_title_root(CommandList* list, bool compute) {
         } else if (p.type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
           compute ? host->SetComputeRootShaderResourceView(i, address) : host->SetGraphicsRootShaderResourceView(i, address);
         } else {
+          // A desktop program writes through it, as far as it likes: its
+          // memory's copies are not read again (a generous span).
+          page_cache_gpu_writes(value, 16ull << 20);
           compute ? host->SetComputeRootUnorderedAccessView(i, address)
                   : host->SetGraphicsRootUnorderedAccessView(i, address);
         }

@@ -26,6 +26,7 @@
 #include "core/libs/d3d12_xs/forward.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
 #include "core/libs/d3d12_xs/ngg.h"
+#include "core/libs/d3d12_xs/page_cache.h"
 #include "core/libs/d3d12_xs/texture_dump.h"
 #include "core/libs/d3d12_xs/views.h"
 #include "core/libs/d3d12_xs/pipeline_stream.h"
@@ -226,6 +227,7 @@ void STDMETHODCALLTYPE list_clear_render_target_view(CommandList* self, SIZE_T h
 // WriteBufferImmediate (32-bit values) at the translated address.
 void write_immediate(CommandList* self, uint64_t address, const uint32_t* values, UINT count,
                      D3D12_WRITEBUFFERIMMEDIATE_MODE mode) {
+  page_cache_gpu_writes(address, 4ull * count);
   const uint64_t host = translate_gpu_va(self->device, address);
   if (!host || !self->host2 || count > 2) {
     LIB_LOG(lib::kError, "d3d12", "immediate write to %p: no GPU memory there", reinterpret_cast<void*>(address));
@@ -289,6 +291,7 @@ void STDMETHODCALLTYPE list_write_timestamp_x(CommandList* self, uint64_t addres
     LIB_LOG(lib::kDebug, "d3d12", "timestamp write with options 0x%llx 0x%llx 0x%x",
             static_cast<unsigned long long>(a), static_cast<unsigned long long>(b), flags);
   }
+  page_cache_gpu_writes(address, 8);
   TimestampHeap* heap = timestamps(self->device);
   Backing backing;
   if (!heap->heap || self->type == D3D12_COMMAND_LIST_TYPE_COPY || !locate(self->device, address, &backing, 8) ||
@@ -904,6 +907,7 @@ void STDMETHODCALLTYPE list_copy_buffer_region(CommandList* self, void* destinat
   const Resource* from = copied(source, "a buffer copy");
   if (!to || !from) return;
   HOLY_TRACE("list %u copies 0x%llx bytes between buffers", self->number, static_cast<unsigned long long>(bytes));
+  page_cache_gpu_writes(to->title_va + destination_offset, bytes);
   self->host->CopyBufferRegion(to->host, destination_offset + buffer_slack(to), from->host,
                                source_offset + buffer_slack(from), bytes);
 }
@@ -926,6 +930,12 @@ void STDMETHODCALLTYPE list_copy_texture_region(CommandList* self, const D3D12_T
   D3D12_TEXTURE_COPY_LOCATION to{}, from{};
   if (!destination || !source || !host_copy_location(*destination, &to) || !host_copy_location(*source, &from)) return;
   HOLY_TRACE("list %u copies a texture region", self->number);
+  if (destination->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+    const D3D12_SUBRESOURCE_FOOTPRINT& f = destination->PlacedFootprint.Footprint;
+    page_cache_gpu_writes(static_cast<const Resource*>(static_cast<const void*>(destination->pResource))->title_va +
+                              destination->PlacedFootprint.Offset,
+                          static_cast<uint64_t>(f.RowPitch) * f.Height * f.Depth);
+  }
   self->host->CopyTextureRegion(&to, x, y, z, &from, box);
 }
 
@@ -934,6 +944,7 @@ void STDMETHODCALLTYPE list_copy_resource(CommandList* self, void* destination, 
   const Resource* from = copied(source, "a resource copy");
   if (!to || !from) return;
   HOLY_TRACE("list %u copies a resource", self->number);
+  if (to->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) page_cache_gpu_writes(to->title_va, to->desc.Width);
   if (to->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && from->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     // Host buffers of placed buffers are wider than the title's.
     self->host->CopyBufferRegion(to->host, buffer_slack(to), from->host, buffer_slack(from),

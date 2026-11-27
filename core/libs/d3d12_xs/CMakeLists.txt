@@ -22,6 +22,8 @@ holy_add_system_library(holy_lib_d3d12_xs
     gpu_memory.h
     ngg.cpp
     ngg.h
+    page_cache.cpp
+    page_cache.h
     pipeline_cache.cpp
     pipeline_cache.h
     pipeline_stream.cpp

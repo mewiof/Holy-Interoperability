@@ -1455,6 +1455,218 @@ void test_committed_buffers_and_copies(void* device, void* queue) {
   call<ULONG>(allocator, 2);
 }
 
+// Copies of title memory in video memory (page_cache.h; HOLY_BUFFER_COPIES
+// sets them going, else this is not run): a native program reads 256 times
+// 16 bytes per thread over 1 MiB of a buffer viewed in the bound table, in
+// title memory the host watches writes to. A first submission starts the copies, the next
+// reads them (timed against the first), and what the title and its GPU work
+// write stays seen: the CPU's writes after the copy, a native store read back
+// later in the same list, and a buffer copy into the memory.
+void test_memory_copies(void* device, void* queue) {
+  using CounterFn = volatile int64_t* (*)(const char*);
+  const HMODULE runtime = GetModuleHandleW(L"holyrt.dll");
+  const auto counter = runtime ? reinterpret_cast<CounterFn>(GetProcAddress(runtime, "HolyCounter")) : nullptr;
+  volatile int64_t* cached = counter ? counter("d3d12.cached_pages") : nullptr;
+  wchar_t budget[16] = {};
+  if (!GetEnvironmentVariableW(L"HOLY_BUFFER_COPIES", budget, 16) || budget[0] == L'0' || !cached) {
+    std::printf("    (copies of title memory in video memory are off: not run)\n");
+    return;
+  }
+  void* allocator = nullptr;
+  void* list = nullptr;
+  void* fence = nullptr;
+  void* heap = nullptr;
+  void* root = nullptr;
+  void* reader = nullptr;
+  void* writer = nullptr;
+  void* placed = nullptr;
+  void* source = nullptr;
+  const uint32_t list_desc[4] = {0, 2, 1, 0};
+  call<HRESULT>(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), &allocator);
+  if (allocator) call<HRESULT>(device, 73, list_desc, allocator, static_cast<void*>(nullptr), kListIid, &list);
+  call<HRESULT>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), &fence);
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                                       1};
+  call<HRESULT>(device, 14, &heap_desc, __uuidof(ID3D12DescriptorHeap), &heap);
+  D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+  D3D12_ROOT_PARAMETER1 parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable = {1, &range};
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants = {0, 0, 4};
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+  root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  root_desc.Desc_1_1.NumParameters = 2;
+  root_desc.Desc_1_1.pParameters = parameters;
+  ID3DBlob* serialized = nullptr;
+  if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&root_desc, &serialized, nullptr)) && serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &root);
+  }
+  // The reader: 256 reads of 16 bytes per thread over a 1 MiB working set
+  // (more than the first-level caches hold, less than the second level):
+  // s_load_dwordx4 s[4:7], s[0:1] (s[5:6] the data's address); s[20:23] the
+  // data (1 MiB + 4 KiB); s[24:27] the sums (1 KiB at +2 MiB); v1 = v0 << 4;
+  // v[6:9] = 0; 256 times: s30 = 4096k, buffer_load_dwordx4 v[2:5], v1,
+  // s[20:23], s30 offen, v[6:9] += v[2:5]; buffer_store_dwordx4 v[6:9], v1,
+  // s[24:27] offen; s_endpgm.
+  std::vector<uint32_t> code = {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE940305u, 0xBE950306u, 0xBE9603FFu,
+                                0x00101000u, 0xBE970380u, 0x8018FF05u, 0x00200000u, 0x82198006u, 0xBE9A03FFu,
+                                0x00000400u, 0xBE9B0380u, 0x34020084u, 0x7E0C0280u, 0x7E0E0280u, 0x7E100280u,
+                                0x7E120280u};
+  for (uint32_t k = 0; k < 256; ++k) {
+    for (uint32_t word : {0xBE9E03FFu, k * 4096u, 0xE0381000u, 0x1E050201u, 0xBF8C3F70u, 0x4A0C0D02u, 0x4A0E0F03u,
+                          0x4A101104u, 0x4A121305u}) {
+      code.push_back(word);
+    }
+  }
+  for (uint32_t word : {0xE0781000u, 0x80060601u, 0xBF810000u}) code.push_back(word);
+  const std::vector<uint8_t> reader_container = native_only_container(code);
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+  pso.CS = {reader_container.data(), reader_container.size()};
+  call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
+                __uuidof(ID3D12PipelineState), &reader);
+  // The writer: stores s7 (the third constant) at the data's word 0
+  // (s[20:23] the data), then reads word 0 back and stores it at +0x400
+  // (word 256).
+  const std::vector<uint8_t> writer_container = native_only_container(
+      {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE940305u, 0xBE950306u, 0xBE9603FFu, 0x00010000u, 0xBE970380u,
+       0x7E020207u, 0x7E000280u, 0xE0700000u, 0x80050100u, 0xBF8C3F70u, 0xE0300000u, 0x80050200u, 0xBF8C3F70u,
+       0xE0700400u, 0x80050200u, 0xBF810000u});
+  pso.CS = {writer_container.data(), writer_container.size()};
+  call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
+                __uuidof(ID3D12PipelineState), &writer);
+  // Data (1 MiB + 4 KiB), sums (1 KiB at +2 MiB) and timestamps (at +3 MiB)
+  // in title memory the host watches; a committed upload buffer to copy from.
+  constexpr uint32_t kSums = 0x200000, kStamps = 0x300000, kDataWords = 0x101000 / 4;
+  auto* memory = static_cast<uint8_t*>(XMemVirtualAlloc(nullptr, 0x400000, MEM_RESERVE | MEM_COMMIT, 0x23, PAGE_READWRITE));
+  D3D12_HEAP_PROPERTIES upload_heap{};
+  upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 0x10000;
+  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  call<HRESULT>(device, 27, &upload_heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ,
+                static_cast<const D3D12_CLEAR_VALUE*>(nullptr), __uuidof(ID3D12Resource), &source);
+  if (!list || !fence || !heap || !root || !reader || !writer || !memory || !source) {
+    check(false, "the objects for copies of title memory exist");
+    return;
+  }
+  auto* data = reinterpret_cast<volatile uint32_t*>(memory);
+  for (uint32_t i = 0; i < kDataWords; ++i) data[i] = i * 2654435761u;
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  buffer.Width = 0x400000;
+  buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  call<HRESULT>(device, 133, base, &buffer, static_cast<UINT>(0xFFFFFFFF), static_cast<const void*>(nullptr),
+                __uuidof(ID3D12Resource), &placed);
+  // The data viewed in the table (what makes it read through a binding).
+  struct {
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+    uint64_t address;
+  } view{};
+  view.srv.Format = DXGI_FORMAT_R32_TYPELESS;
+  view.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  view.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  view.srv.Buffer.NumElements = kDataWords;
+  view.srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+  view.address = base;
+  D3D12_RESOURCE_DESC viewed = buffer;
+  viewed.Width = kDataWords * 4ull;
+  viewed.Flags = D3D12_RESOURCE_FLAG_NONE;
+  call<void>(device, 70, &viewed, &view, call<uint64_t>(heap, 9));
+  UINT64 frequency = 0;
+  call<HRESULT>(queue, 18, &frequency);
+  uint64_t fence_value = 0;
+  double last_wall_ms = 0;
+  const auto* value = call<const volatile uint64_t*>(fence, 12);
+  // Records `program` (4 x 4096 groups for the reader, one group for the
+  // writer) between timestamps, runs it and waits; the GPU milliseconds.
+  auto run = [&](void* program, uint32_t value7, bool copy_first) {
+    // The allocator is reset once the GPU is done with the list's last run
+    // (not while the new list records with it).
+    bool ok = (!fence_value || call<HRESULT>(allocator, 8) == S_OK) &&
+              call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
+    if (copy_first) call<void>(list, 15, placed, UINT64{0x40}, source, UINT64{0}, UINT64{16});
+    void* heaps[] = {heap};
+    call<void>(list, 32, 1u, static_cast<void* const*>(heaps));
+    call<void>(list, 72, base + kStamps, UINT64{0}, UINT64{0}, 1u);
+    const uint32_t constants[4] = {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32), value7, 0};
+    call<void>(list, 33, root);
+    call<void>(list, 35, 0u, call<uint64_t>(heap, 10));
+    call<void>(list, 39, 1u, 4u, static_cast<const void*>(constants), 0u);
+    call<void>(list, 25, program);
+    call<void>(list, 14, program == reader ? 256u : 1u, 1u, 1u);
+    call<void>(list, 72, base + kStamps + 8, UINT64{0}, UINT64{0}, 1u);
+    ok = ok && call<HRESULT>(list, 9) == S_OK;
+    void* lists[] = {list};
+    LARGE_INTEGER wall_start{}, wall_end{}, wall_frequency{};
+    QueryPerformanceFrequency(&wall_frequency);
+    QueryPerformanceCounter(&wall_start);
+    call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+    call<HRESULT>(queue, 16, fence, ++fence_value);
+    while (value && *value < fence_value) YieldProcessor();
+    QueryPerformanceCounter(&wall_end);
+    last_wall_ms = static_cast<double>(wall_end.QuadPart - wall_start.QuadPart) * 1e3 /
+                   static_cast<double>(wall_frequency.QuadPart);
+    const auto* stamps = reinterpret_cast<const volatile uint64_t*>(memory + kStamps);
+    const double ms = frequency ? static_cast<double>(stamps[1] - stamps[0]) * 1e3 / static_cast<double>(frequency) : 0;
+    return ok && value && *value == fence_value ? ms : -1.0;
+  };
+  // Thread t's first sum: the data's words 4t + 1024k.
+  auto sum_right = [&](uint32_t thread) {
+    uint32_t expected = 0;
+    for (uint32_t k = 0; k < 256; ++k) expected += data[thread * 4 + k * 1024];
+    return *reinterpret_cast<const volatile uint32_t*>(memory + kSums + thread * 16) == expected;
+  };
+  const int64_t cached_before = *cached;
+  const double uncached_ms = run(reader, 0, false);  // starts the copies
+  const double uncached_wall = last_wall_ms;
+  const bool uncached_right = sum_right(0) && sum_right(63);
+  const double cached_ms = run(reader, 0, false);     // reads them
+  const double cached_wall = last_wall_ms;
+  const bool cached_right = sum_right(0) && sum_right(63);
+  std::printf("    (wall time from submission to the fence: %.3f ms uncached, %.3f ms cached)\n", uncached_wall,
+              cached_wall);
+  const int64_t cached_pages = *cached - cached_before;
+  // The CPU writes the data after the copy: the next run sees it.
+  for (uint32_t k = 0; k < 256; k += 16) data[k * 1024] += 1000 + k;
+  run(reader, 0, false);
+  const bool cpu_write_seen = sum_right(0);
+  // A native store to the copied page, read back by the same program after
+  // it (the page's flag sends the read to the memory itself).
+  run(writer, 0x5704E5u, false);
+  const bool store_seen = data[0] == 0x5704E5u && data[256] == 0x5704E5u;
+  // A buffer copy into the data (word 16), read in the same list after it.
+  auto* from = static_cast<uint32_t*>(nullptr);
+  call<HRESULT>(source, 8, 0u, static_cast<const D3D12_RANGE*>(nullptr), reinterpret_cast<void**>(&from));
+  for (uint32_t i = 0; i < 4; ++i) from[i] = 0xC0910000u + i;
+  run(reader, 0, true);
+  const bool copy_seen = data[16] == 0xC0910000u && sum_right(4);
+  std::printf("    (copies of title memory: %lld pages; uncached %.3f ms, cached %.3f ms on the GPU (%.1fx); sums %s %s; "
+              "CPU write %s, copy %s, store %s)\n",
+              static_cast<long long>(cached_pages), uncached_ms, cached_ms,
+              cached_ms > 0 ? uncached_ms / cached_ms : 0.0, uncached_right ? "right" : "wrong",
+              cached_right ? "right" : "wrong", cpu_write_seen ? "seen" : "missed", copy_seen ? "seen" : "missed",
+              store_seen ? "seen" : "missed");
+  check(uncached_ms > 0 && cached_ms > 0 && uncached_right && cached_right && cached_pages > 0,
+        "translated reads of title memory go to its copy in video memory, and compute the same");
+  check(cpu_write_seen, "the CPU's writes to copied title memory reach the GPU at the next submission");
+  check(copy_seen && store_seen, "GPU writes to copied title memory are read back (copies and native stores)");
+
+  if (placed) call<ULONG>(placed, 2);
+  call<ULONG>(source, 2);
+  call<ULONG>(writer, 2);
+  call<ULONG>(reader, 2);
+  call<ULONG>(root, 2);
+  call<ULONG>(heap, 2);
+  call<ULONG>(fence, 2);
+  call<ULONG>(list, 2);
+  call<ULONG>(allocator, 2);
+  VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 // Title memory released while the GPU still reads it (a title's mistake the
 // console may forgive): the work finishes, later work runs, and the runtime's
 // heap over the memory goes once the GPU is done (its count of released
@@ -2081,6 +2293,7 @@ void test_graphics_resources(void* device, void* queue) {
   if (queue) test_root_arguments_outlive_later_recording(device, queue);
   if (queue) test_memory_released_while_read(device, queue);
   if (queue) test_committed_buffers_and_copies(device, queue);
+  if (queue) test_memory_copies(device, queue);
   if (queue) test_native_depth(device, queue, false);
   if (queue) test_native_depth(device, queue, true);
   test_page_mapping_update(device);

@@ -77,6 +77,33 @@ void unmap_range(uint64_t title_va, uint64_t size);
 // with (called before submissions; also when the title releases memory).
 void collect_released_heaps();
 
+// --- cached pages (page_cache.h; shader/translate.h has the layout) ----------
+//
+// Where a mapped, uncached title page is: its slot and view offset, and the
+// buffer and byte offset holding its first byte. False for pages not mapped,
+// cached already, or not wholly inside their view.
+struct PagePlace {
+  uint32_t slot = 0;
+  uint32_t view_offset = 0;
+  ID3D12Resource* buffer = nullptr;
+  uint64_t buffer_offset = 0;
+};
+bool page_place(uint64_t page, PagePlace* out);
+// Memory slots for a buffer of the runtime's own, 0 when none are left.
+uint32_t add_buffer_slots(Device* device, ID3D12Resource* buffer, uint64_t size);
+// Makes the page read through cache line `line` (its copy at copy_slot,
+// copy_offset) if it is still at `place`.
+bool cache_page(uint64_t page, const PagePlace& place, uint32_t line, uint32_t copy_slot, uint32_t copy_offset);
+// Makes a page cached through `line` read its own memory again.
+void uncache_page(uint64_t page, uint32_t line);
+// The lines' GPU write flags, mapped (null when there are none).
+volatile uint32_t* cache_flags();
+// Called, under the memory map's lock, when the map drops a cached entry (its
+// memory released or remapped): the line is free once the GPU is done.
+void set_cache_dropped_hook(void (*hook)(uint32_t line));
+// The first word of a page's entry, without the lock (0: not mapped).
+uint32_t page_entry_word(uint64_t page);
+
 // A slot views kSlotBytes of its heap's buffer (2^27 raw elements, the
 // desktop's limit for buffer views), one every kSlotStride bytes: consecutive
 // slots of a heap overlap by a page, so a page lies wholly in the slot its

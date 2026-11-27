@@ -418,8 +418,8 @@ Notes describe the platform, never a title.
   for every call: each host heap over title memory has memory slots (raw views of 512 MiB of its buffer, in a block
   of 65536 descriptors past the title's own in every shader-visible host heap) and a page table maps each 64 KiB
   page of title addresses to a slot and offset (`shader/translate.h`). Heaps' pages enter the table when the heaps
-  are opened (committed memory) or located (physical pages); descriptor heaps' GPU ranges when the heaps are
-  made; buffers the bound tables, root views and vertex buffers name are located before the call if their page
+  are opened (committed memory; physical pages: every title address showing storage the heap covers, kept current
+  as the title maps and unmaps pages); descriptor heaps' GPU ranges when the heaps are made; buffers the bound tables, root views and vertex buffers name are located before the call if their page
   is not in the table yet. Partial: memory nothing has located (reached only through pointers held in memory)
   reads as zero; the ring is not fenced.
 - *measured* host behaviour: a buffer placed in a heap takes whole 64 KiB units of it, so title memory of less

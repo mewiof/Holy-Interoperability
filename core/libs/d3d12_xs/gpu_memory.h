@@ -48,14 +48,14 @@ uint64_t translate_gpu_va(Device* device, uint64_t title_va);
 // Every heap opened here gets memory slots (shader/translate.h): a raw view of
 // each 512 MiB of its buffer, written into the reserved block of every
 // shader-visible CBV/SRV/UAV heap at the slot's index. Its pages enter the
-// page table as they become known: committed memory when its heap is opened,
-// physical pages when they are located (the run of them one heap covers),
-// aliases when made. Translated programs therefore reach every piece of title
-// memory the runtime has located, whatever the call binds.
+// page table as they become known: committed memory when its heap is opened;
+// physical pages wherever the title shows storage a heap covers (when the
+// heap is opened, and as the title maps and unmaps pages: xmem tells this
+// file), aliases when made. Translated programs therefore reach every piece
+// of title memory the runtime has located, whatever the call binds.
 //
 // Partial: memory nothing has located yet (reached only through pointers the
-// title wrote) reads as zero; physical pages the title maps elsewhere later
-// keep their old entries until located again.
+// title wrote, in storage no heap covers) reads as zero.
 
 // The host GPU address of the page table (a root view), 0 if it could not be
 // made.

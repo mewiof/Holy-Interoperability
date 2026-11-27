@@ -50,6 +50,7 @@ struct MemoryMap {
 };
 MemoryMap g_map;  // under g_lock
 std::atomic<const uint8_t*> g_table{nullptr};
+std::atomic<uint64_t> g_table_va{0};
 
 const lib::Counter& c_slots() {
   static const lib::Counter c("d3d12.memory_slots");
@@ -182,6 +183,33 @@ QueryPhysicalFn query_physical() {
   return fn;
 }
 
+// Physical page mappings as xmem changes them (HolyXMemObserveMappings),
+// queued (the observer runs under xmem's lock, which this file takes inside
+// its own) and applied under g_lock (apply_mapping_events).
+struct MappingEvent {
+  uintptr_t granule;
+  HANDLE section;  // null: unmapped
+  uint64_t offset;
+};
+std::mutex g_events_lock;
+std::vector<MappingEvent> g_events;
+std::atomic<bool> g_events_pending{false};
+
+void observe_mapping(void*, uintptr_t granule, HANDLE section, uint64_t offset) {
+  std::lock_guard<std::mutex> lock(g_events_lock);
+  g_events.push_back({granule, section, offset});
+  g_events_pending.store(true, std::memory_order_release);
+}
+
+using ObserveFn = void (*)(void (*)(void*, uintptr_t, HANDLE, uint64_t), void*);
+using EnumerateFn = void (*)(HANDLE, uint64_t, uint64_t, void (*)(void*, uintptr_t, uint64_t), void*);
+
+EnumerateFn enumerate_mapped() {
+  static const auto fn = reinterpret_cast<EnumerateFn>(
+      GetProcAddress(GetModuleHandleW(L"xmem.dll"), "HolyXMemEnumerateMapped"));
+  return fn;
+}
+
 bool finish_record(Device* device, ID3D12Heap* heap, HeapRecord* record, bool slots = true) {
   record->heap = heap;
   // Buffers take whole 64 KiB units of a heap (measured, the host's debug
@@ -266,6 +294,11 @@ uint64_t ensure_page_table(Device* device) {
   g_map.table = memory;
   g_map.host_va = record.host_gpu_va;
   g_table.store(memory, std::memory_order_release);
+  g_table_va.store(record.host_gpu_va, std::memory_order_release);
+  if (const auto observe = reinterpret_cast<ObserveFn>(
+          GetProcAddress(GetModuleHandleW(L"xmem.dll"), "HolyXMemObserveMappings"))) {
+    observe(&observe_mapping, nullptr);
+  }
   return g_map.host_va;
 }
 
@@ -319,7 +352,53 @@ const std::pair<uint64_t, HeapRecord>* section_span(Device* device, HANDLE secti
           static_cast<unsigned long long>(first), static_cast<unsigned long long>(heap_record.size),
           reinterpret_cast<void*>(heap_record.host_gpu_va));
   record.spans.emplace_back(first, heap_record);
+  // Every title address already showing storage of the span.
+  if (const auto enumerate = enumerate_mapped()) {
+    struct Visit {
+      uint32_t slot;
+      uint64_t first;
+    } visit{heap_record.slot, first};
+    enumerate(
+        section, first, first + heap_record.size,
+        [](void* context, uintptr_t granule, uint64_t offset) {
+          const auto* v = static_cast<const Visit*>(context);
+          map_pages(granule, granule + 0x10000, v->slot, offset - v->first);
+        },
+        &visit);
+  }
   return &record.spans.back();
+}
+
+// Applies the queued mapping events (g_lock held): granules showing storage
+// a span covers are entered, others (unmapped, or remapped to storage no span
+// covers yet) leave the page table.
+void apply_mapping_events() {
+  if (!g_events_pending.load(std::memory_order_acquire)) return;
+  std::vector<MappingEvent> events;
+  {
+    std::lock_guard<std::mutex> lock(g_events_lock);
+    events.swap(g_events);
+    g_events_pending.store(false, std::memory_order_relaxed);
+  }
+  for (const MappingEvent& event : events) {
+    const std::pair<uint64_t, HeapRecord>* covering = nullptr;
+    if (event.section) {
+      const auto found = sections().find(event.section);
+      if (found != sections().end()) {
+        for (const auto& span : found->second.spans) {
+          if (event.offset >= span.first && event.offset + 0x10000 <= span.first + span.second.size) {
+            covering = &span;
+            break;
+          }
+        }
+      }
+    }
+    if (covering) {
+      map_pages(event.granule, event.granule + 0x10000, covering->second.slot, event.offset - covering->first);
+    } else if (volatile uint32_t* entry = page_entry(event.granule, false)) {
+      entry[0] = 0;
+    }
+  }
 }
 
 }  // namespace
@@ -333,6 +412,7 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
   ID3D12Device3* d3 = device3(device);
   if (!d3) return false;
   ensure_page_table(device);  // before any heap, so every heap's pages are entered
+  apply_mapping_events();
 
   // Physical pages the title mapped: `run` bytes from the address are pages
   // laid out in order in one section.
@@ -441,8 +521,12 @@ uint64_t translate_gpu_va(Device* device, uint64_t title_va) {
 }
 
 uint64_t page_table_address(Device* device) {
+  const uint64_t made = g_table_va.load(std::memory_order_acquire);
+  if (made && !g_events_pending.load(std::memory_order_acquire)) return made;
   std::lock_guard<std::mutex> lock(g_lock);
-  return ensure_page_table(device);
+  const uint64_t address = ensure_page_table(device);
+  apply_mapping_events();
+  return address;
 }
 
 bool page_mapped(uint64_t title_va) {

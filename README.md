@@ -39,7 +39,7 @@ flowchart LR
 | Frames presented at the title's pace | ✅ 30 a second, measured |
 | Runs for minutes without crashing | 🟡 five stops in the title's first seconds fixed; runs on the development host now end within 2-30 s because its system commit is exhausted (about 60 GiB still pinned by a host graphics driver leak that older builds triggered; current builds measurably do not leak, and a host restart frees it). The "invalid call" device removals in those runs follow the exhausted commit (`HOLY_D3D_CHECK` finds no call that causes them) |
 | No memory leaks (RAM, VRAM, system commit) | 🟡 live-object counters in every run; host heaps no longer leak system commit after exit, released textures free their host copies |
-| A correct picture | ⬜ frames are black: the loading screen's three draws a frame reach no render target (every texture reads zero); a per-frame call trace (`HOLY_D3D_TRACE`) is ready to find out why |
+| A correct picture | ⬜ frames are black: the loading screen's three draws a frame reach no render target (every texture reads zero). Translated programs used to read zero from memory reached through pointers (a per-draw table of at most 64 pieces of memory); they now reach all title memory the runtime knows through a page table, not yet tried on the title. A per-frame call trace (`HOLY_D3D_TRACE`) is ready for what remains |
 | Menus and input | 🟡 a gamepad from the host controller or keyboard; menus not reached yet |
 | Sound | ⬜ silent audio device |
 | In game at a stable 30 FPS, no leaks | ⬜ |
@@ -54,7 +54,7 @@ flowchart LR
 | Graphics: shader translation | `█████░░░░░` 45% (ray-intersection instructions open) |
 | Graphics: pipelines and caches | `███████░░░` 70% |
 | Graphics: correct output | `█░░░░░░░░░` 8% |
-| Graphics: performance | `█░░░░░░░░░` 10% |
+| Graphics: performance | `██░░░░░░░░` 15% (memory accesses: two page-table reads instead of a scan; no views written per draw) |
 | Input | `████░░░░░░` 40% |
 | Audio | `█░░░░░░░░░` 10% |
 | Measurement: statistics, profiler, leak checks, call check, frame trace | `████████░░` 75% |

@@ -110,6 +110,12 @@ struct Region {
 SRWLOCK g_lock = SRWLOCK_INIT;
 std::atomic<DWORD> g_lock_owner{0};
 
+// HolyXMemObserveMappings: told, with g_lock held, when a granule gets its
+// page's storage and when it is unmapped.
+using MappingObserver = void (*)(void* context, uintptr_t granule, HANDLE section, uint64_t offset);
+MappingObserver g_observer = nullptr;
+void* g_observer_context = nullptr;
+
 void lock() {
   AcquireSRWLockExclusive(&g_lock);
   g_lock_owner.store(GetCurrentThreadId());
@@ -345,6 +351,7 @@ void unmap_granule(uintptr_t granule) {
   const auto unmap = kernelbase<UnmapViewOfFile2Fn>("UnmapViewOfFile2");
   if (unmap) unmap(GetCurrentProcess(), reinterpret_cast<void*>(granule), kMemPreservePlaceholder);
   mapped().erase(found);
+  if (g_observer) g_observer(g_observer_context, granule, nullptr, 0);
 }
 
 void* map_view(const Page& page, uintptr_t granule) {
@@ -420,6 +427,9 @@ bool back_granule(uintptr_t granule, ULONG_PTR id) {
   }
   mapped()[granule] = id;
   c_granules_backed().add(1);
+  if (g_observer) {
+    g_observer(g_observer_context, granule, sections()[page.section].handle, static_cast<uint64_t>(page.index) * kPage);
+  }
   return true;
 }
 
@@ -573,6 +583,36 @@ HOLY_EXPORT BOOL HolyXMemQueryPhysical(const void* address, HANDLE* section, uin
   }
   unlock();
   return found;
+}
+
+// Not console functions: let this project's graphics library keep its view of
+// which title addresses show which section storage current. The observer is
+// called, with this library's lock held (it must not call back into this
+// library), when a granule gets its page's storage (`section` and the page's
+// `offset` in it) and when a granule is unmapped (`section` null).
+HOLY_EXPORT void HolyXMemObserveMappings(MappingObserver observer, void* context) {
+  lock();
+  g_observer = observer;
+  g_observer_context = context;
+  unlock();
+}
+
+// Calls `visit` (without the lock) for every granule showing storage of
+// `section` in [begin, end), with the storage's offset.
+HOLY_EXPORT void HolyXMemEnumerateMapped(HANDLE section, uint64_t begin, uint64_t end,
+                                         void (*visit)(void* context, uintptr_t granule, uint64_t offset),
+                                         void* context) {
+  std::vector<std::pair<uintptr_t, uint64_t>> found;
+  lock();
+  for (const auto& [granule, id] : mapped()) {
+    if (pending().count(granule) || id == 0 || id > pages().size()) continue;
+    const Page& page = pages()[id - 1];
+    if (page.section < 0 || sections()[page.section].handle != section) continue;
+    const uint64_t offset = static_cast<uint64_t>(page.index) * kPage;
+    if (offset >= begin && offset < end) found.emplace_back(granule, offset);
+  }
+  unlock();
+  for (const auto& [granule, offset] : found) visit(context, granule, offset);
 }
 
 // For the graphics library: the page number (as XMemAllocatePhysicalPages

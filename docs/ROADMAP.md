@@ -116,8 +116,10 @@ The largest piece.
   at its own check when one cannot be placed; seen with the host's commit exhausted, when sections can only be
   reserved). Tiled host buffers over the pages are not possible (the host refuses tile mappings into heaps over
   existing memory, measured); translated programs already reach such pages one by one through the page table.
-- next: enter physical pages in the page table when the title maps them (not only when located), and remove
-  them when it unmaps them.
+- done: the page table follows the title's physical page mappings (xmem reports pages getting storage and being
+  unmapped; a heap opened over section storage enters every title address showing it).
+- next: open heaps for physical storage the title maps before anything locates it, within the commit the host
+  allows (memory reached only through pointers into such storage still reads as zero).
 - done: native pipelines with a program that neither exports nor interpolates (depth-only passes) and with an
   unusual target field; placeholder pipelines in the reference title's first minute went from 426 to 66.
 - done: unordered-access views of depth textures, through a twin texture kept in step at barriers.

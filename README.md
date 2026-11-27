@@ -37,7 +37,8 @@ flowchart LR
 | Graphics device, title memory as GPU memory, pipelines from native GPU code | ✅ done; translated rendering not yet checked against known results |
 | Start-up in seconds, memory within the host's means | ✅ first frame after 3 s; about 5 GiB of commit at the first frames (was 17 GiB) |
 | Frames presented at the title's pace | ✅ 30 a second, measured |
-| Runs for minutes without crashing | 🟡 next: the title faults in its own code 10 to 100 s in |
+| Runs for minutes without crashing | 🟡 the fault seconds after the first frame is fixed (a calling-convention bug); next: a breakpoint in the title's own code about 18 s in |
+| No memory leaks (RAM, VRAM, system commit) | 🟡 live-object counters in every run; host heaps no longer leak system commit after exit, released textures free their host copies |
 | A correct picture | ⬜ frames are black |
 | Menus and input | ⬜ no input devices yet |
 | Sound | ⬜ silent audio device |
@@ -99,7 +100,7 @@ What this means in practice: a retail title image loads, runs its static initial
 game runtime, creates its window, graphics device and over 80,000 pipelines (shaders translated from native
 GPU code), streams its start-up data through fast storage, and presents frames onto a swap chain on its window
 at 30 a second from 3 seconds after start, with about 5 GiB of commit. Its frames are still black, and it
-faults in its own code between ten seconds and two minutes in (see [docs/ROADMAP.md](docs/ROADMAP.md)). No
+stops at a breakpoint in its own code about 18 seconds in (see [docs/ROADMAP.md](docs/ROADMAP.md)). No
 title is playable.
 
 Progress is measured as *console library coverage*: of the console-only symbols a title imports, how many

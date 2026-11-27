@@ -74,8 +74,16 @@ UINT format_bytes(DXGI_FORMAT format) {
 UINT64 slack_elements(uint64_t slack, UINT stride) {
   if (!slack) return 0;
   if (!stride || slack % stride) {
-    LIB_LOG(lib::kError, "d3d12", "buffer view slack of %llu bytes is not a multiple of its %u-byte elements",
-            static_cast<unsigned long long>(slack), stride);
+    // Only desktop programs read host views (translated ones read the
+    // title's descriptors); observed tens of times a second, so counted and
+    // logged now and then.
+    static std::atomic<uint64_t> seen{0};
+    const uint64_t n = seen.fetch_add(1);
+    if (n < 4 || n % 4096 == 0) {
+      LIB_LOG(lib::kError, "d3d12",
+              "buffer view slack of %llu bytes is not a multiple of its %u-byte elements (%llu such views so far)",
+              static_cast<unsigned long long>(slack), stride, static_cast<unsigned long long>(n + 1));
+    }
     return 0;
   }
   return slack / stride;

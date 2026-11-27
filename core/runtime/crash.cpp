@@ -14,6 +14,14 @@ constexpr DWORD kCppException = 0xE06D7363;
 std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_title_filter{nullptr};
 std::atomic<int> g_first_chance_budget{16};
 
+// Reads memory that may be unmapped without faulting (no exception reaches
+// the title's or the memory library's handlers).
+bool read_memory(DWORD64 address, void* out, size_t bytes) {
+  SIZE_T read = 0;
+  return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), out, bytes, &read) &&
+         read == bytes;
+}
+
 void log_frame(int index, DWORD64 address) {
   LOG_ERROR(kComponent, "  #%02d %s", index,
             describe_address(reinterpret_cast<const void*>(address)).c_str());
@@ -62,6 +70,27 @@ void log_registers(const CONTEXT* c) {
   LOG_ERROR(kComponent, "  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx", c->Rsi, c->Rdi, c->Rbp, c->Rsp);
   LOG_ERROR(kComponent, "  r8 =%016llx r9 =%016llx r10=%016llx r11=%016llx", c->R8, c->R9, c->R10, c->R11);
   LOG_ERROR(kComponent, "  r12=%016llx r13=%016llx r14=%016llx r15=%016llx", c->R12, c->R13, c->R14, c->R15);
+  // Register values inside loaded images (code and static data), by image.
+  const struct {
+    const char* name;
+    DWORD64 value;
+  } registers[] = {{"rax", c->Rax}, {"rbx", c->Rbx}, {"rcx", c->Rcx}, {"rdx", c->Rdx}, {"rsi", c->Rsi},
+                   {"rdi", c->Rdi}, {"rbp", c->Rbp}, {"r8", c->R8},   {"r9", c->R9},   {"r10", c->R10},
+                   {"r11", c->R11}, {"r12", c->R12}, {"r13", c->R13}, {"r14", c->R14}, {"r15", c->R15}};
+  for (const auto& r : registers) {
+    if (r.value < 0x10000) continue;
+    const std::string where = describe_address(reinterpret_cast<const void*>(r.value));
+    if (where.find('+') != std::string::npos) LOG_ERROR(kComponent, "  %s = %s", r.name, where.c_str());
+  }
+  // The first 64 bytes of readable memory registers point at (objects the
+  // faulting code was working on).
+  for (const auto& r : registers) {
+    if (r.value < 0x10000) continue;
+    uint64_t words[8];
+    if (!read_memory(r.value, words, sizeof(words))) continue;
+    LOG_ERROR(kComponent, "  [%s] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx", r.name,
+              words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+  }
 }
 
 LONG CALLBACK first_chance_handler(EXCEPTION_POINTERS* info) {

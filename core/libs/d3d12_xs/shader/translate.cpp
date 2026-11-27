@@ -134,6 +134,7 @@ class Translator {
   // before the register is written).
   void put_select(uint32_t reg, const Operand& mask, const Operand& a, const Operand& b) {
     emit(dx::kMovc, {D(reg), mask, a, b});
+    if (reg == kExecLoR) emit(dx::kAnd, {D(reg), R(reg), I(1)});
   }
   Operand in_temp(const Operand& v) { return is_temp(v) ? v : op1(dx::kMov, v); }
   Operand copy(const Operand& v) { return op1(dx::kMov, v); }

@@ -919,7 +919,10 @@ Notes describe the platform, never a title.
   hash of the native code and the parameters that shape the translation, compressed (`core/libs/lz.h`: 8.7 times
   smaller on translated programs, about 440 MB/s to compress and 3.7 GB/s to decompress, measured; titles create
   pipelines for all their programs while loading, so every start reads the whole cache, which would be about
-  11 GB uncompressed for the reference title), and reused by later runs; directories
+  11 GB uncompressed for the reference title), one file a translation (*measured* on the development host:
+  reading a 60 KB file costs 27-30 us against 8 us for the same bytes inside one large file, about 0.5 s a start
+  for 23,000 programs; writing costs 0.4 ms a file, once, on the threads that translate; a single archive would
+  save less than a second a start and need crash-safe appends from many threads), and reused by later runs; directories
   of other translator builds are deleted in the background when a run first uses the cache (they are never hit
   again). Translations of more than 256 KiB are compiled one at a time (*observed* host behaviour: the driver
   refuses some such programs with `E_OUTOFMEMORY` when several compile at once, and accepts them alone), with

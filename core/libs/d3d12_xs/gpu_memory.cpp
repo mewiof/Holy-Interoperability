@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <unordered_map>
 #include <mutex>
 #include <vector>
 
+#include "core/common/memory_query.h"
 #include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/descriptors.h"
 #include "core/libs/d3d12_xs/device.h"
@@ -28,6 +30,9 @@ struct HeapRecord {
   // Committed memory: the base of the allocation the heap was opened over,
   // telling memory released and allocated again at the same address apart.
   uint64_t allocation = 0;
+  // Superseded by a larger heap over the same memory: its slots kept their
+  // views, and return for reuse when the heap is let go of.
+  bool recycle_slots = false;
 };
 
 std::mutex g_lock;
@@ -333,6 +338,12 @@ const lib::Counter& c_block_commit() {
   return c;
 }
 
+// Reserved title memory committed so that growing stretches fit their heaps.
+const lib::Counter& c_stretch_room() {
+  static const lib::Counter c("d3d12.stretch_room_bytes");
+  return c;
+}
+
 const lib::Counter& c_heaps_released() {
   static const lib::Counter c("d3d12.gpu_heaps_released");
   return c;
@@ -369,6 +380,20 @@ std::map<uintptr_t, std::pair<uintptr_t, HeapRecord>>::iterator retire_locked(
   c_slots().add(-static_cast<int64_t>(slots));
   LIB_LOG(lib::kDebug, "d3d12", "heap over %p (0x%llx bytes, slot %u) released with the memory",
           reinterpret_cast<void*>(base), static_cast<unsigned long long>(record.size), record.slot);
+  retired->push_back(record);
+  g_generation.fetch_add(1, std::memory_order_acq_rel);
+  return region_heaps().erase(it);
+}
+
+// Takes a heap over committed memory that a larger heap now covers out of the
+// map (g_lock held). Its memory is still the title's: its pages become the
+// new heap's when it enters them, and its slots keep their views until the
+// GPU finished the work submitted before (which may still reach the memory
+// through them), then return for reuse with the heap (collect_released_heaps).
+std::map<uintptr_t, std::pair<uintptr_t, HeapRecord>>::iterator supersede_locked(
+    std::map<uintptr_t, std::pair<uintptr_t, HeapRecord>>::iterator it, std::vector<HeapRecord>* retired) {
+  HeapRecord record = it->second.second;
+  record.recycle_slots = record.slot != 0;
   retired->push_back(record);
   g_generation.fetch_add(1, std::memory_order_acq_rel);
   return region_heaps().erase(it);
@@ -599,10 +624,14 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
     // Still the allocation the heap was opened over? Memory released without
     // the runtime hearing of it and allocated again at the same address would
     // otherwise reach the old heap's pages (the GPU then reads and writes
-    // memory the title no longer has).
-    MEMORY_BASIC_INFORMATION now{};
-    if (VirtualQuery(reinterpret_cast<void*>(title_va), &now, sizeof(now)) && now.State == MEM_COMMIT &&
-        reinterpret_cast<uint64_t>(now.AllocationBase) == region->second.second.allocation) {
+    // memory the title no longer has). Asked of the host's record of the
+    // allocation (memory_query.h): VirtualQuery takes milliseconds on the
+    // large committed allocations heaps are opened over, and this runs for
+    // every timestamp, buffer placement and reached address (measured: a
+    // loading thread spent 89 s of 100 in it).
+    AllocationExtent now;
+    const bool known = query_allocation(reinterpret_cast<const void*>(title_va), &now);
+    if (known && now.base == region->second.second.allocation && now.committed) {
       const uint64_t at = title_va - region->second.first;
       *out = Backing{region->second.second.heap, at, region->first - title_va, region->second.second.host_gpu_va + at,
                      region->second.second.whole, region->second.first, region->second.second.size,
@@ -613,65 +642,112 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
     if (logged.fetch_add(1) < 8) {
       LIB_LOG(lib::kError, "d3d12",
               "the GPU heap over %p was still recorded after its memory was released (allocation %p, now %p, "
-              "state 0x%lx): opened again",
+              "0x%llx bytes committed): opened again",
               reinterpret_cast<void*>(region->second.first),
-              reinterpret_cast<void*>(region->second.second.allocation), now.AllocationBase, now.State);
+              reinterpret_cast<void*>(region->second.second.allocation), reinterpret_cast<void*>(now.base),
+              static_cast<unsigned long long>(known ? now.committed : 0));
     }
     std::vector<HeapRecord> retired;
     retire_locked(region, &retired);
     release_retired(retired);
   }
-  MEMORY_BASIC_INFORMATION info;
-  if (!VirtualQuery(reinterpret_cast<void*>(title_va), &info, sizeof(info)) || info.State == MEM_FREE) return false;
-  const auto allocation = reinterpret_cast<uintptr_t>(info.AllocationBase);
-  uintptr_t allocation_end = allocation;
-  for (;;) {
-    MEMORY_BASIC_INFORMATION part;
-    if (!VirtualQuery(reinterpret_cast<void*>(allocation_end), &part, sizeof(part))) break;
-    if (reinterpret_cast<uintptr_t>(part.AllocationBase) != allocation || part.State == MEM_FREE) break;
-    allocation_end = reinterpret_cast<uintptr_t>(part.BaseAddress) + part.RegionSize;
-  }
+  AllocationExtent extent;
+  if (!query_allocation(reinterpret_cast<const void*>(title_va), &extent)) return false;
+  const uintptr_t allocation = extent.base;
+  const uintptr_t allocation_end = extent.base + extent.size;
+  MEMORY_BASIC_INFORMATION info{};
+  const ULONGLONG started = GetTickCount64();
   if (!HolyEnsureCommitted(reinterpret_cast<void*>(allocation), allocation_end - allocation)) return false;
+  const ULONGLONG committed_at = GetTickCount64();
   // Observed: titles commit stretches of a reservation and leave reserved
   // gaps between them. The host opens heaps from an address only over a
   // wholly committed allocation, or (ID3D12Device13) over a committed stretch
   // given with its size: such allocations get a heap per stretch.
   // Measured (the host's debug layer): heaps are opened only over pages of one
   // protection (titles hand thread stacks, whose guard pages differ, to the
-  // GPU too), so stretches also end where the protection changes.
+  // GPU too), so stretches also end where the protection changes. Whether all
+  // of the allocation is committed comes from its record (memory_query.h):
+  // walking it run by run took seconds per heap on titles' large, partly
+  // committed reservations (measured). A wholly committed allocation of mixed
+  // protection is refused by the host and taken stretch by stretch below.
   uintptr_t base = allocation, end = allocation_end;
-  bool whole = true;
-  DWORD protection = 0;
-  for (uintptr_t at = allocation; at < allocation_end;) {
-    MEMORY_BASIC_INFORMATION part;
-    if (!VirtualQuery(reinterpret_cast<void*>(at), &part, sizeof(part))) break;
-    if (part.State != MEM_COMMIT || (protection && part.Protect != protection)) whole = false;
-    if (!protection) protection = part.Protect;
-    at = reinterpret_cast<uintptr_t>(part.BaseAddress) + part.RegionSize;
-  }
+  AllocationExtent now;
+  bool whole = query_allocation(reinterpret_cast<const void*>(title_va), &now) && now.base == allocation &&
+               now.committed == now.size;
   ID3D12Heap* heap = nullptr;
   HRESULT hr = E_FAIL;
   if (whole) {
     hr = d3->OpenExistingHeapFromAddress(reinterpret_cast<void*>(base), IID_PPV_ARGS(&heap));
-  } else {
-    if (!VirtualQuery(reinterpret_cast<void*>(title_va), &info, sizeof(info)) || info.State != MEM_COMMIT) return false;
-    base = reinterpret_cast<uintptr_t>(info.BaseAddress);
-    end = base + info.RegionSize;
-    for (;;) {  // committed regions before and after (protection changes split regions)
+    if (FAILED(hr)) whole = false;
+  }
+  bool grown = false;
+  if (!whole) {
+    // The committed run holding the address, found walking the allocation's
+    // runs from its base: a query at a run's start reports all of the run,
+    // one anywhere else only the rest of it (stepping back page by page from
+    // the address took seconds: every step scanned the run to its end).
+    // Runs split where the state or protection changes, so one committed run
+    // is one protection.
+    uintptr_t reserved_after = 0;  // reserved bytes right after the run
+    info.State = 0;
+    for (uintptr_t at = allocation; at < allocation_end;) {
       MEMORY_BASIC_INFORMATION part;
-      if (base <= allocation || !VirtualQuery(reinterpret_cast<void*>(base - 1), &part, sizeof(part)) ||
-          part.State != MEM_COMMIT || part.Protect != info.Protect) {
+      if (!VirtualQuery(reinterpret_cast<void*>(at), &part, sizeof(part))) return false;
+      const uintptr_t part_end = reinterpret_cast<uintptr_t>(part.BaseAddress) + part.RegionSize;
+      if (title_va < part_end) {
+        info = part;
+        base = at;
+        end = std::min(part_end, allocation_end);
+        MEMORY_BASIC_INFORMATION next;
+        if (end < allocation_end && VirtualQuery(reinterpret_cast<void*>(end), &next, sizeof(next)) &&
+            next.State == MEM_RESERVE) {
+          reserved_after = std::min(reinterpret_cast<uintptr_t>(next.BaseAddress) + next.RegionSize, allocation_end) - end;
+        }
         break;
       }
-      base = reinterpret_cast<uintptr_t>(part.BaseAddress);
+      at = part_end;
     }
-    for (;;) {
-      MEMORY_BASIC_INFORMATION part;
-      if (end >= allocation_end || !VirtualQuery(reinterpret_cast<void*>(end), &part, sizeof(part)) ||
-          part.State != MEM_COMMIT || part.Protect != info.Protect) {
-        break;
+    if (info.State != MEM_COMMIT) return false;
+    // Observed: titles commit a reservation progressively (a stretch that
+    // grows frame after frame), and every growth needed a new heap over the
+    // whole stretch. A stretch that outgrew its heap gets room to grow into:
+    // half its size again (at least 32 MiB, at most 256 MiB) of the reserved
+    // pages after it, committed here (the title's own commits there later
+    // succeed as they would), so growth costs a heap now and then.
+    for (const auto& [heap_end, entry] : region_heaps()) {
+      if (entry.second.allocation == allocation && entry.first < end && heap_end > base) grown = true;
+    }
+    if (grown && reserved_after) {
+      const uintptr_t room = std::min<uintptr_t>(
+          reserved_after, std::clamp<uintptr_t>((end - base) / 2, 32ull << 20, 256ull << 20) & ~uintptr_t{0xFFFF});
+      if (room && VirtualAlloc(reinterpret_cast<void*>(end), room, MEM_COMMIT, info.Protect)) {
+        c_stretch_room().add(static_cast<int64_t>(room));
+        end += room;
       }
-      end = reinterpret_cast<uintptr_t>(part.BaseAddress) + part.RegionSize;
+    }
+    // Measured (the host's debug layer): a heap opened at an address that is
+    // not 64 KiB-aligned has 4 KiB alignment, and no buffer may be placed on
+    // it. The release runtime places one anyway, and the device is removed
+    // ("invalid call") once work uses it: observed tens of seconds into the
+    // reference title, gone with the debug layer refusing the buffer. Such a
+    // stretch is opened from its first 64 KiB boundary; the pages before it
+    // stay out of the GPU's reach.
+    const uintptr_t aligned = (base + 0xFFFF) & ~static_cast<uintptr_t>(0xFFFF);
+    if (aligned != base) {
+      if (title_va < aligned || aligned + 0x10000 > end) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 8) {
+          LIB_LOG(lib::kError, "d3d12",
+                  "title memory at %p lies before the first 64 KiB boundary of its committed stretch %p-%p "
+                  "(protection 0x%lx): the GPU cannot reach it",
+                  reinterpret_cast<void*>(title_va), reinterpret_cast<void*>(base), reinterpret_cast<void*>(end),
+                  info.Protect);
+        }
+        return false;
+      }
+      LIB_LOG(lib::kDebug, "d3d12", "committed stretch %p-%p opened from %p (64 KiB boundary)",
+              reinterpret_cast<void*>(base), reinterpret_cast<void*>(end), reinterpret_cast<void*>(aligned));
+      base = aligned;
     }
     if (ID3D12Device13* d13 = device13(device)) {
       hr = d13->OpenExistingHeapFromAddress1(reinterpret_cast<void*>(base), end - base, IID_PPV_ARGS(&heap));
@@ -685,11 +761,33 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
   }
   HeapRecord record;
   if (!finish_record(device, heap, &record)) return false;
+  const ULONGLONG took = GetTickCount64() - started;
+  if (took >= 5) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 16) {
+      LIB_LOG(lib::kWarn, "d3d12",
+              "opening a GPU heap over title memory took %llu ms (%llu committing): %p, 0x%llx bytes of an "
+              "allocation of 0x%llx (0x%llx committed)%s",
+              static_cast<unsigned long long>(took), static_cast<unsigned long long>(committed_at - started),
+              reinterpret_cast<void*>(base), static_cast<unsigned long long>(record.size),
+              static_cast<unsigned long long>(allocation_end - allocation),
+              static_cast<unsigned long long>(now.committed), whole ? "" : " (a committed stretch)");
+    }
+  }
   LIB_LOG(lib::kDebug, "d3d12", "GPU heap over title memory at %p: 0x%llx bytes (allocation %p + 0x%llx), host %p",
           reinterpret_cast<void*>(base), static_cast<unsigned long long>(record.size),
           reinterpret_cast<void*>(allocation), static_cast<unsigned long long>(allocation_end - allocation),
           reinterpret_cast<void*>(record.host_gpu_va));
   record.allocation = allocation;
+  if (grown) {
+    // The heaps the new one covers go once the GPU is done with them.
+    std::vector<HeapRecord> superseded;
+    for (auto it = region_heaps().upper_bound(base); it != region_heaps().end() && it->second.first < base + record.size;) {
+      it = it->second.second.allocation == allocation && it->second.first >= base ? supersede_locked(it, &superseded)
+                                                                                    : std::next(it);
+    }
+    release_retired(superseded);
+  }
   region_heaps()[base + record.size] = std::make_pair(base, record);
   map_pages(base, base + record.size, record.slot, 0);
   const uint64_t at = title_va - base;
@@ -741,11 +839,48 @@ bool page_mapped(uint64_t title_va) {
   return entry[0] != 0;
 }
 
+namespace {
+// Pages reach could not locate, not asked about again until title memory
+// changes (g_generation) or a second has passed (memory the title allocates
+// or commits there later). Observed: root arguments carry values no GPU heap
+// can be opened over, and every draw looked them up again, each lookup
+// walking an allocation in the host's memory queries.
+struct Unreachable {
+  uint64_t generation;
+  ULONGLONG until;
+};
+std::mutex g_unreachable_lock;
+std::unordered_map<uint64_t, Unreachable> g_unreachable;  // by 64 KiB page
+
+const lib::Counter& c_unreachable() {
+  static const lib::Counter c("d3d12.unreachable_pages");
+  return c;
+}
+}  // namespace
+
 void reach(Device* device, uint64_t title_va) {
   if (!title_va || page_mapped(title_va)) return;
   if (!page_table_address(device)) return;
+  const uint64_t page = title_va >> 16;
+  const uint64_t generation = g_generation.load(std::memory_order_acquire);
+  const ULONGLONG now = GetTickCount64();
+  {
+    std::lock_guard<std::mutex> guard(g_unreachable_lock);
+    const auto it = g_unreachable.find(page);
+    if (it != g_unreachable.end()) {
+      if (it->second.generation == generation && now < it->second.until) return;
+      g_unreachable.erase(it);
+      c_unreachable().add(-1);
+    }
+  }
   Backing backing;
-  locate(device, title_va, &backing, 64ull << 20);
+  if (locate(device, title_va, &backing, 64ull << 20)) return;
+  std::lock_guard<std::mutex> guard(g_unreachable_lock);
+  if (g_unreachable.size() >= 65536) {  // a bound: stale entries go wholesale
+    c_unreachable().add(-static_cast<int64_t>(g_unreachable.size()));
+    g_unreachable.clear();
+  }
+  if (g_unreachable.emplace(page, Unreachable{generation, now + 1000}).second) c_unreachable().add(1);
 }
 
 bool map_alias(Device* device, uint64_t alias, uint64_t size, uint64_t target) {
@@ -790,6 +925,22 @@ void collect_released_heaps() {
       ++count;
     }
     g_released.erase(g_released.begin(), g_released.begin() + static_cast<std::ptrdiff_t>(count));
+  }
+  bool recycle = false;
+  for (const HeapRecord& record : done) recycle |= record.recycle_slots;
+  if (recycle) {
+    std::lock_guard<std::mutex> lock(g_lock);
+    for (const HeapRecord& record : done) {
+      if (!record.recycle_slots) continue;
+      const uint64_t slots = slot_count(record.size);
+      for (uint64_t i = 0; i < slots; ++i) {
+        const auto slot = static_cast<uint32_t>(record.slot + i);
+        g_map.slots[slot] = Slot{};
+        for (const DescriptorHeap* heap : g_map.heaps) write_slot_view(g_map.device, heap, slot);
+        g_map.free_slots.push_back(slot);
+      }
+      c_slots().add(-static_cast<int64_t>(slots));
+    }
   }
   for (const HeapRecord& record : done) {
     record.whole->Release();

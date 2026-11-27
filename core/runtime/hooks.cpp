@@ -8,6 +8,7 @@
 #include <string>
 
 #include "core/common/log.h"
+#include "core/common/memory_query.h"
 #include "core/common/strings.h"
 #include "core/runtime/binder.h"
 #include "core/runtime/crash.h"
@@ -220,13 +221,12 @@ BOOL WINAPI hook_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, 
 BOOL WINAPI hook_VirtualFree(LPVOID address, SIZE_T size, DWORD type) {
   SIZE_T extent = size;
   if ((type & MEM_RELEASE) && size == 0 && address) {
-    // The whole allocation goes: its extent, before it does.
-    MEMORY_BASIC_INFORMATION info;
-    auto at = static_cast<uint8_t*>(address);
-    while (VirtualQuery(at, &info, sizeof(info)) && info.AllocationBase == address && info.State != MEM_FREE) {
-      at = static_cast<uint8_t*>(info.BaseAddress) + info.RegionSize;
+    // The whole allocation goes: its extent, before it does (the host's
+    // record of it, memory_query.h; a VirtualQuery walk takes milliseconds).
+    AllocationExtent allocation;
+    if (query_allocation(address, &allocation) && allocation.base == reinterpret_cast<uintptr_t>(address)) {
+      extent = static_cast<SIZE_T>(allocation.size);
     }
-    extent = static_cast<SIZE_T>(at - static_cast<uint8_t*>(address));
   }
   // Host objects over the memory (GPU heaps) go first.
   if (type & (MEM_RELEASE | MEM_DECOMMIT)) before_release(address, extent);

@@ -1,5 +1,7 @@
 #include "core/libs/d3d12_xs/texture_upload.h"
 
+#include "core/common/memory_query.h"
+
 #include <windows.h>
 
 #include <algorithm>
@@ -135,27 +137,21 @@ bool tracking() {
 
 // The allocation holding `address`, whether the host tracks its writes, and
 // whether it is a mapped view (physical pages).
+// (The host's record of the allocation, memory_query.h: VirtualQuery walks of
+// large committed allocations take milliseconds.)
 bool allocation_of(uint64_t address, uint64_t* base, uint64_t* size, bool* watched, bool* mapped) {
-  MEMORY_BASIC_INFORMATION info{};
-  if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) || info.State == MEM_FREE) return false;
-  const auto allocation = reinterpret_cast<uint64_t>(info.AllocationBase);
-  uint64_t end = allocation;
-  for (;;) {
-    MEMORY_BASIC_INFORMATION part{};
-    if (!VirtualQuery(reinterpret_cast<const void*>(end), &part, sizeof(part))) break;
-    if (reinterpret_cast<uint64_t>(part.AllocationBase) != allocation || part.State == MEM_FREE) break;
-    end = reinterpret_cast<uint64_t>(part.BaseAddress) + part.RegionSize;
-  }
-  *base = allocation;
-  *size = end - allocation;
-  *mapped = info.Type == MEM_MAPPED;
+  AllocationExtent extent;
+  if (!query_allocation(reinterpret_cast<const void*>(address), &extent)) return false;
+  *base = extent.base;
+  *size = extent.size;
+  *mapped = extent.mapped;
+  // Fails for memory reserved without write tracking (mapped views: physical
+  // pages). One page of a tracked allocation answers as well as all of it.
   void* page = nullptr;
   ULONG_PTR count = 1;
   DWORD granularity = 0;
-  // Fails for memory reserved without write tracking (mapped views: physical pages).
-  *watched = info.Type == MEM_PRIVATE &&
-             GetWriteWatch(0, reinterpret_cast<void*>(allocation), static_cast<SIZE_T>(*size), &page, &count,
-                           &granularity) == 0;
+  *watched = !extent.mapped &&
+             GetWriteWatch(0, reinterpret_cast<void*>(address & ~0xFFFull), 0x1000, &page, &count, &granularity) == 0;
   return true;
 }
 
@@ -390,6 +386,34 @@ Key key_of(uint64_t address, const lib::TextureShape& shape) {
 }
 
 // Whether `size` bytes from `address` are committed, readable title memory.
+// Whether `size` bytes from `address` lie in private memory committed whole
+// (the host's record of the allocation, memory_query.h): such memory needs no
+// commit before it is read. Committed is not readable: titles keep no-access
+// pages inside committed allocations (observed), so reads go through
+// copy_title_memory.
+bool committed_whole(uint64_t address, uint64_t size) {
+  AllocationExtent extent;
+  return query_allocation(reinterpret_cast<const void*>(address), &extent) && !extent.mapped &&
+         extent.committed == extent.size && address + size <= extent.base + extent.size;
+}
+
+// Copies title memory, false when part of it cannot be read (the access
+// faults; memory committed on first touch is committed by the runtime's own
+// handler first). No C++ objects here: structured exception handling. The
+// copy is an opaque call: the compiler takes an inlined copy for one that
+// cannot fault and drops the handler around it (observed: the fault went
+// unhandled).
+void* (*volatile g_copy)(void*, const void*, size_t) = &std::memcpy;
+bool copy_title_memory(void* to, const void* from, size_t size) {
+  __try {
+    g_copy(to, from, size);
+    return true;
+  } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                               : EXCEPTION_CONTINUE_SEARCH) {
+    return false;
+  }
+}
+
 bool readable(uint64_t address, uint64_t size) {
   const uint64_t end = address + size;
   while (address < end) {
@@ -427,8 +451,12 @@ ID3D12Resource* staged_copy(Device* device, uint64_t address, uint64_t size) {
     buffer->Release();
     return nullptr;
   }
-  std::memcpy(mapped, reinterpret_cast<const void*>(address), size);
+  const bool copied = copy_title_memory(mapped, reinterpret_cast<const void*>(address), size);
   buffer->Unmap(0, nullptr);
+  if (!copied) {
+    buffer->Release();
+    return nullptr;
+  }
   return buffer;
 }
 
@@ -451,8 +479,11 @@ bool record_fill(Device* device, Uploader* up, const Record& record, ID3D12Resou
   if (located && backing.whole && backing.contiguous >= record.size) {
     source_buffer = backing.whole;
     source_offset = backing.heap_offset;
-  } else if ((is_readable = readable(record.address, record.size))) {
+  } else {
+    // The copy itself finds out whether the memory can be read (a check
+    // before it costs host queries of milliseconds on large committed runs).
     source_buffer = staged_copy(device, record.address, record.size);
+    is_readable = source_buffer != nullptr;
     if (source_buffer) up->staging.push_back(source_buffer);
   }
   if (!source_buffer) {
@@ -598,7 +629,9 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
 
   // Memory committed on first touch reads as zero until touched: committed
   // now, so it can be copied (and its writes tracked).
-  if (!readable(address, size)) HolyEnsureCommitted(reinterpret_cast<void*>(address), static_cast<size_t>(size));
+  if (!committed_whole(address, size) && !readable(address, size)) {
+    HolyEnsureCommitted(reinterpret_cast<void*>(address), static_cast<size_t>(size));
+  }
   // Tracked from before the copy reads the memory (a write from now on makes
   // it dirty; the copy may already hold part of it).
   track(record);

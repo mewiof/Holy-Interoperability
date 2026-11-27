@@ -124,8 +124,10 @@ The largest piece.
   watching (page protection cannot be used: measured, the host refuses protection changes on memory a heap was
   opened over), and textures over written pages, remapped pages and released memory are copied again before the
   next submission. The sample title checks a texel written after its view (and fails without the tracking).
-- next: writes to physical pages through the title's views (no write watching for mapped views) and GPU writes
-  under textures.
+- done: writes to physical pages through the title's views, watched by page protection of those views (the host
+  allows it there, measured; the GPU's own views of the pages carry the heaps). The sample title checks a texel
+  written through its view of a physical page.
+- next: GPU writes into title memory under textures (copies and translated programs writing texture memory).
 - done: GPU heaps over title memory are released before the title frees the memory (they kept it charged:
   measured 1 GiB over 16 rounds of 64 MiB); an end-to-end check measures it.
 - done: the page table follows the title's physical page mappings (xmem reports pages getting storage and being

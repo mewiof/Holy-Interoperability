@@ -434,8 +434,12 @@ Notes describe the platform, never a title.
   CPU's and the kernel's (`ReadFile`) writes to it, heap or not (measured). xmem reserves title memory with write
   watching; host copies of textures in it are copied again before a submission when their pages were written
   (asked at most every 16 ms), and remapped physical pages, released memory and writes libraries announce mark them
-  too. Partial: CPU writes to memory without write watching (mapped views of physical pages, memory titles reserve
-  themselves) and GPU writes under a texture are not seen.
+  too. *measured*: protection changes are refused on the view of a section a heap was opened over, but not on
+  another view of the same section, and a write to a read-only view faults. The GPU reaches physical pages through
+  views of its own, so textures in physical pages are watched through the title's views by page protection (the
+  first write makes the page writable again and the texture dirty; kernel writes the runtime announces drop the
+  watch first). Partial: CPU writes to memory titles reserve themselves and GPU writes under a texture are not
+  seen.
 - *measured* host behaviour: a buffer placed in a heap takes whole 64 KiB units of it, so title memory of less
   than 64 KiB cannot be reached by the GPU at all; `XMemAlloc` therefore takes whole 64 KiB units for page
   allocations (the title sees the size it asked for). Memory a title's own allocation hooks hand out is as the

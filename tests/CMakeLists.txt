@@ -17,6 +17,8 @@ add_executable(holy_unit_tests
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader/translate.cpp
   unit/test_strings.cpp
   unit/test_vfs.cpp
+  unit/test_write_watch.cpp
+  ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/write_watch.cpp
   unit/test_xml.cpp)
 holy_target_defaults(holy_unit_tests)
 target_link_libraries(holy_unit_tests PRIVATE holy_common holy_pe holy_package holy_analysis d3d12 dxgi)

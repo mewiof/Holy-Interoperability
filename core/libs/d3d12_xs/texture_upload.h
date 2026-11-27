@@ -14,17 +14,18 @@
 //
 // Host textures filled from title memory are kept current: the host tracks
 // writes to title memory xmem reserved (MEM_WRITE_WATCH: CPU and kernel
-// writes), and remapped physical pages, released memory and writes libraries
-// announce (HolyBeforeWrite) are reported (texture_memory_changed). Before a
+// writes); physical pages are watched through the title's views by page
+// protection (write_watch.h); remapped physical pages, released memory and
+// writes libraries announce (HolyBeforeWrite) are reported
+// (texture_memory_changed). Before a
 // submission, textures over memory written since are copied again and the
 // queue waits for the copies. Tracked writes are asked about at most every
 // 16 ms, so a texture written just before a submission may show its new
 // contents a frame later. HOLY_TEXTURE_TRACKING=0 turns this off.
 //
-// Partial: the CPU's writes to memory the host does not track (mapped views
-// of physical pages, memory titles reserve without xmem) are not seen; what
-// the GPU writes into title memory under a texture is not seen; the CPU never
-// sees what the GPU wrote into a placed texture.
+// Partial: the CPU's writes to memory titles reserve without xmem are not
+// seen; what the GPU writes into title memory under a texture is not seen;
+// the CPU never sees what the GPU wrote into a placed texture.
 #pragma once
 
 #include <d3d12.h>

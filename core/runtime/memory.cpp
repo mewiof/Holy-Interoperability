@@ -150,12 +150,20 @@ bool commit_by_regions(uintptr_t begin, uintptr_t end, const Range& range) {
 
 // Commits the chunk around `address` if it lies in a registered range and is
 // still only reserved. Returns true if the page is (now) committed.
-bool commit_chunk(uintptr_t address) {
+bool commit_chunk(uintptr_t address, bool write) {
   Range range;
   if (!find_range(address, &range)) return false;
   MEMORY_BASIC_INFORMATION info;
   if (!VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info))) return false;
-  if (info.State == MEM_COMMIT) return true;
+  // Committed meanwhile (another thread's fault): retried. A write to a page
+  // committed read-only is not this handler's (write watches make pages
+  // read-only); retrying it would fault forever.
+  if (info.State == MEM_COMMIT) {
+    const DWORD protect = info.Protect & 0xFF;
+    const bool writable = protect == PAGE_READWRITE || protect == PAGE_EXECUTE_READWRITE ||
+                          protect == PAGE_WRITECOPY || protect == PAGE_EXECUTE_WRITECOPY;
+    return !write || writable;
+  }
   if (info.State != MEM_RESERVE) return false;
   uintptr_t begin = std::max(address & ~(kChunk - 1), range.begin);
   uintptr_t end = std::min((address & ~(kChunk - 1)) + kChunk, range.end);
@@ -179,7 +187,7 @@ LONG CALLBACK commit_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;
   }
   const DWORD saved_error = GetLastError();
-  const bool committed = commit_chunk(record->ExceptionInformation[1]);
+  const bool committed = commit_chunk(record->ExceptionInformation[1], record->ExceptionInformation[0] == 1);
   SetLastError(saved_error);
   return committed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }

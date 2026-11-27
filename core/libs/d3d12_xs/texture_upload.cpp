@@ -13,6 +13,7 @@
 #include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/gpu_memory.h"
+#include "core/libs/d3d12_xs/write_watch.h"
 #include "core/libs/support.h"
 #include "core/libs/texture_layout.h"
 
@@ -40,6 +41,7 @@ struct Record {
   D3D12_RESOURCE_DESC desc{};
   uint64_t size = 0;         // bytes in title memory
   bool from_memory = false;  // filled from title memory: kept current
+  bool protected_watch = false;  // its memory is watched by page protection (write_watch.h)
   bool dirty = false;
 };
 
@@ -86,14 +88,23 @@ bool tracking() {
   static const bool enabled = [] {
     wchar_t text[8] = {};
     const bool off = GetEnvironmentVariableW(L"HOLY_TEXTURE_TRACKING", text, 8) && text[0] == L'0';
-    if (!off) HolySetWriteHook([](const void* address, size_t size) { texture_memory_changed(reinterpret_cast<uint64_t>(address), size); });
+    if (!off) {
+      start_write_watch(&texture_memory_changed);
+      // Writes that do not fault (the kernel's): watches over the memory go
+      // now, before the write (a read-only page would make it fail).
+      HolySetWriteHook([](const void* address, size_t size) {
+        forget_memory(reinterpret_cast<uint64_t>(address), size);
+        texture_memory_changed(reinterpret_cast<uint64_t>(address), size);
+      });
+    }
     return !off;
   }();
   return enabled;
 }
 
-// The allocation holding `address`, and whether the host tracks its writes.
-bool allocation_of(uint64_t address, uint64_t* base, uint64_t* size, bool* watched) {
+// The allocation holding `address`, whether the host tracks its writes, and
+// whether it is a mapped view (physical pages).
+bool allocation_of(uint64_t address, uint64_t* base, uint64_t* size, bool* watched, bool* mapped) {
   MEMORY_BASIC_INFORMATION info{};
   if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) || info.State == MEM_FREE) return false;
   const auto allocation = reinterpret_cast<uint64_t>(info.AllocationBase);
@@ -106,6 +117,7 @@ bool allocation_of(uint64_t address, uint64_t* base, uint64_t* size, bool* watch
   }
   *base = allocation;
   *size = end - allocation;
+  *mapped = info.Type == MEM_MAPPED;
   void* page = nullptr;
   ULONG_PTR count = 1;
   DWORD granularity = 0;
@@ -165,7 +177,10 @@ void scan() {
       changes.swap(g_changes);
       g_any_change.store(false, std::memory_order_relaxed);
     }
-    for (const auto& [begin, size] : changes) mark_range(begin, begin + size);
+    for (const auto& [begin, size] : changes) {
+      mark_range(begin, begin + size);
+      forget_memory(begin, size);  // remapped or released pages lose their watches (refreshed records watch again)
+    }
   }
   const ULONGLONG now = GetTickCount64();
   if (now - g_last_scan < 16) return;
@@ -183,6 +198,7 @@ void scan() {
 
 // The registry lets go of a record (g_lock held).
 void drop(Record* record) {
+  if (record->protected_watch) unwatch(reinterpret_cast<WatchToken>(record));
   g_dirty.erase(std::remove(g_dirty.begin(), g_dirty.end(), record), g_dirty.end());
   for (auto& [base, allocation] : tracked()) {
     auto& list = allocation.records;
@@ -457,12 +473,15 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   // go to the textures already there, then this one is tracked too (a write
   // from now on makes it dirty; the copy may already hold part of it).
   uint64_t base = 0, allocation_size = 0;
-  bool watched = false;
-  if (tracking() && allocation_of(address, &base, &allocation_size, &watched) && watched) {
+  bool watched = false, mapped = false;
+  const bool known = tracking() && allocation_of(address, &base, &allocation_size, &watched, &mapped);
+  if (known && watched) {
     Tracked& allocation = tracked()[base];
     allocation.size = allocation_size;
     scan_range(allocation, address, address + size);
     allocation.records.push_back(record);
+  } else if (known && mapped && watch_memory(address, size, reinterpret_cast<WatchToken>(record))) {
+    record->protected_watch = true;  // physical pages: watched through the title's views
   } else {
     c_untracked().add(1);
   }
@@ -516,7 +535,10 @@ void refresh_textures(Device* device, ID3D12CommandQueue* queue) {
   uint32_t refreshed = 0;
   for (Record* record : dirty) {
     record->dirty = false;
-    if (record->texture && record_fill(device, up, *record, record->texture, false)) ++refreshed;
+    if (!record->texture) continue;
+    // Watched again before the copy reads the memory.
+    if (record->protected_watch) watch_memory(record->address, record->size, reinterpret_cast<WatchToken>(record));
+    if (record_fill(device, up, *record, record->texture, false)) ++refreshed;
   }
   const uint64_t value = submit_upload(up);
   // Work submitted after this on the title's queue sees the new contents.

@@ -52,5 +52,7 @@ holy_add_system_library(holy_lib_d3d12_xs
     translation_cache.h
     views.cpp
     views.h
+    write_watch.cpp
+    write_watch.h
     queue.cpp
   LIBS d3d12 dxgi psapi user32 holy_lib_xmem)

@@ -101,7 +101,17 @@ struct Resource {
   D3D12_RESOURCE_DESC desc{};
   void* runtime_memory = nullptr;  // XMemAlloc'd as the console runtime does
   std::atomic<int> layout{-1};      // textures: the layout last recorded (texture_dump.h), -1 unknown
+  // Depth textures that also ask for unordered access, which the desktop
+  // does not allow together: a twin texture of the same format family with
+  // unordered access (and no depth), which unordered-access views use.
+  // Barriers into the unordered-access layout copy the depth texture into the
+  // twin; barriers out of it copy the twin back (command_list.cpp).
+  ID3D12Resource* twin = nullptr;
 };
+
+// Makes `resource`'s twin when its description asks for depth and unordered
+// access together (see Resource::twin).
+void make_depth_twin(Device* device, Resource* resource);
 
 Device* create_device(const void* parameters);
 // The host device (null before the title made its device).

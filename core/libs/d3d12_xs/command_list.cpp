@@ -305,6 +305,43 @@ D3D12_BARRIER_LAYOUT host_layout(D3D12_BARRIER_LAYOUT layout) {
   return D3D12_BARRIER_LAYOUT_PRESENT;
 }
 
+// Copies a depth texture (in `layout`) into its twin (`back`: the twin into
+// it), leaving both as they were: the twin in the unordered-access layout.
+void copy_with_twin(CommandList* self, const Resource* title, D3D12_BARRIER_LAYOUT layout, bool back) {
+  ID3D12Resource* from = back ? title->twin : title->host;
+  ID3D12Resource* to = back ? title->host : title->twin;
+  const D3D12_BARRIER_LAYOUT from_layout = back ? D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS : layout;
+  const D3D12_BARRIER_LAYOUT to_layout = back ? layout : D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS;
+  D3D12_TEXTURE_BARRIER barriers[2]{};
+  barriers[0].SyncBefore = D3D12_BARRIER_SYNC_ALL;
+  barriers[0].SyncAfter = D3D12_BARRIER_SYNC_COPY;
+  barriers[0].AccessBefore = D3D12_BARRIER_ACCESS_COMMON;
+  barriers[0].AccessAfter = D3D12_BARRIER_ACCESS_COPY_SOURCE;
+  barriers[0].LayoutBefore = from_layout;
+  barriers[0].LayoutAfter = D3D12_BARRIER_LAYOUT_COPY_SOURCE;
+  barriers[0].pResource = from;
+  barriers[0].Subresources.IndexOrFirstMipLevel = 0xFFFFFFFF;  // all subresources
+  barriers[1] = barriers[0];
+  barriers[1].AccessAfter = D3D12_BARRIER_ACCESS_COPY_DEST;
+  barriers[1].LayoutBefore = to_layout;
+  barriers[1].LayoutAfter = D3D12_BARRIER_LAYOUT_COPY_DEST;
+  barriers[1].pResource = to;
+  D3D12_BARRIER_GROUP group{};
+  group.Type = D3D12_BARRIER_TYPE_TEXTURE;
+  group.NumBarriers = 2;
+  group.pTextureBarriers = barriers;
+  self->host7->Barrier(1, &group);
+  self->host->CopyResource(to, from);
+  for (auto& b : barriers) {
+    std::swap(b.SyncBefore, b.SyncAfter);
+    std::swap(b.AccessBefore, b.AccessAfter);
+    std::swap(b.LayoutBefore, b.LayoutAfter);
+    b.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+    b.AccessAfter = D3D12_BARRIER_ACCESS_COMMON;
+  }
+  self->host7->Barrier(1, &group);
+}
+
 void STDMETHODCALLTYPE list_barrier(CommandList* self, UINT32 count, const D3D12_BARRIER_GROUP* groups) {
   if (!self->host7) {
     LIB_LOG(lib::kError, "d3d12", "the host has no enhanced barriers");
@@ -350,6 +387,22 @@ void STDMETHODCALLTYPE list_barrier(CommandList* self, UINT32 count, const D3D12
     }
   }
   self->host7->Barrier(count, host.data());
+  // Depth textures with an unordered-access twin (Resource::twin): their
+  // contents move to the twin when the title moves them into the
+  // unordered-access layout, and back when it moves them out.
+  for (UINT32 g = 0; g < count; ++g) {
+    if (groups[g].Type != D3D12_BARRIER_TYPE_TEXTURE) continue;
+    for (UINT32 i = 0; i < groups[g].NumBarriers; ++i) {
+      const D3D12_TEXTURE_BARRIER& b = groups[g].pTextureBarriers[i];
+      const auto* title = static_cast<const Resource*>(static_cast<const void*>(b.pResource));
+      if (!title || !title->twin) continue;
+      const bool into = b.LayoutAfter == D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS &&
+                        b.LayoutBefore != D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS;
+      const bool out = b.LayoutBefore == D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS &&
+                       b.LayoutAfter != D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS;
+      if (into || out) copy_with_twin(self, title, host_texture_layout(title, host_layout(b.LayoutAfter)), out);
+    }
+  }
 }
 
 // Observed: slot 20 is IASetPrimitiveTopology, at its desktop position.

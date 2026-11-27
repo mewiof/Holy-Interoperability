@@ -163,6 +163,8 @@ ULONG STDMETHODCALLTYPE resource_release(Resource* self) {
     if (self->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) unregister_texture(self->desc, self->title_va, self->host);
     if (self->host) self->host->Release();
     self->host = nullptr;
+    if (self->twin) self->twin->Release();
+    self->twin = nullptr;
     if (self->runtime_memory) XMemFree(self->runtime_memory, kResourceMemoryAttributes);
     self->runtime_memory = nullptr;
     c_resources().add(-1);
@@ -344,6 +346,39 @@ D3D12_BARRIER_LAYOUT host_texture_layout(const Resource* resource, D3D12_BARRIER
   return layout_for_flags(layout, desktop_resource_desc(resource->desc).Flags);
 }
 
+void make_depth_twin(Device* device, Resource* resource) {
+  const D3D12_RESOURCE_FLAGS flags = resource->desc.Flags;
+  if (resource->twin || !resource->host || !(flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+      !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+    return;
+  }
+  const D3D12_RESOURCE_DESC host = resource->host->GetDesc();
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = host.Dimension;
+  desc.Width = host.Width;
+  desc.Height = host.Height;
+  desc.DepthOrArraySize = host.DepthOrArraySize;
+  desc.MipLevels = host.MipLevels;
+  desc.Format = host.Format;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  // The same format family as the depth texture, so copies go both ways.
+  switch (desc.Format) {
+    case DXGI_FORMAT_D16_UNORM: desc.Format = DXGI_FORMAT_R16_TYPELESS; break;
+    case DXGI_FORMAT_D32_FLOAT: desc.Format = DXGI_FORMAT_R32_TYPELESS; break;
+    default: break;
+  }
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  const HRESULT hr = create_host_committed(device, heap, D3D12_HEAP_FLAG_NONE, desc,
+                                           D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS, nullptr, &resource->twin);
+  LIB_LOG(FAILED(hr) ? lib::kError : lib::kDebug, "d3d12",
+          "unordered-access twin of a depth texture %llux%ux%u format %u -> 0x%08lX",
+          static_cast<unsigned long long>(desc.Width), desc.Height, desc.DepthOrArraySize,
+          static_cast<unsigned>(desc.Format), static_cast<unsigned long>(hr));
+}
+
 DXGI_FORMAT host_view_format(const void* resource, DXGI_FORMAT format) {
   const auto* r = static_cast<const Resource*>(resource);
   if (!r || r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return desktop_format(format);
@@ -401,6 +436,7 @@ HRESULT create_committed_resource(Device* device, const D3D12_HEAP_PROPERTIES* p
   resource->desc = *desc;
   resource->runtime_memory = memory;
   if (layout) resource->layout.store(static_cast<int>(state));
+  if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) make_depth_twin(device, resource);
   if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     resource->host_va = host->GetGPUVirtualAddress();
     resource->title_va = resource->host_va;
@@ -442,6 +478,7 @@ HRESULT create_placed_resource_x(Device* device, uint64_t address, const D3D12_R
     resource->layout.store(static_cast<int>(state));
     resource->title_va = address;
     resource->desc = *desc;
+    make_depth_twin(device, resource);
     *out = resource;
     return S_OK;
   }

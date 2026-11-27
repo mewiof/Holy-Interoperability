@@ -160,7 +160,22 @@ void test_resources(void* device) {
                       __uuidof(ID3D12Resource), &shadow) == S_OK &&
             shadow,
         "a depth texture asking for unordered access is placed in the unordered-access layout");
-  if (shadow) call<ULONG>(shadow, 2);
+  if (shadow) {
+    // An unordered-access view of it (of its twin on the host).
+    D3D12_DESCRIPTOR_HEAP_DESC views_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 1};
+    void* views = nullptr;
+    call<HRESULT>(device, 14, &views_desc, __uuidof(ID3D12DescriptorHeap), &views);
+    if (views) {
+      D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+      uav.Format = DXGI_FORMAT_R16_UNORM;
+      uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+      uav.Texture2DArray.ArraySize = 6;
+      call<void>(device, 19, shadow, static_cast<void*>(nullptr), &uav, call<uint64_t>(views, 9));
+      check(true, "depth textures that ask for unordered access get unordered-access views");
+      call<ULONG>(views, 2);
+    }
+    call<ULONG>(shadow, 2);
+  }
 
   // A committed texture like the display buffers titles create: render target
   // and unordered access, created in the unordered-access layout (3).

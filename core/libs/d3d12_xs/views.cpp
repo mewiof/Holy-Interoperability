@@ -209,9 +209,24 @@ void STDMETHODCALLTYPE create_unordered_access_view(Device* self, void* resource
                                                     const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, SIZE_T dest) {
   const auto* object = static_cast<const Resource*>(resource);
   if (object && (object->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
-    // The host texture has no unordered access (desktop_resource_desc).
-    LIB_LOG(lib::kError, "d3d12", "unordered access view of a depth texture (format %u)", object->desc.Format);
-    HolyUnimplementedFrom(kLibrary, "unordered access view of a depth texture", _ReturnAddress());
+    // The host texture has no unordered access (desktop_resource_desc): the
+    // view is of its twin (Resource::twin).
+    if (!object->twin) {
+      LIB_LOG(lib::kError, "d3d12", "unordered access view of a depth texture without a twin (format %u)",
+              object->desc.Format);
+      HolyUnimplementedFrom(kLibrary, "unordered access view of a depth texture", _ReturnAddress());
+      return;
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC host = desc ? *desc : D3D12_UNORDERED_ACCESS_VIEW_DESC{};
+    if (desc) {
+      switch (desc->Format) {
+        case DXGI_FORMAT_D16_UNORM: host.Format = DXGI_FORMAT_R16_UNORM; break;
+        case DXGI_FORMAT_D32_FLOAT: host.Format = DXGI_FORMAT_R32_FLOAT; break;
+        default: break;
+      }
+    }
+    self->host->CreateUnorderedAccessView(object->twin, nullptr, desc ? &host : nullptr, host_cpu_handle(dest));
+    write_indexed_descriptor(dest, kKindUnorderedAccess);
     return;
   }
   D3D12_UNORDERED_ACCESS_VIEW_DESC host = {};

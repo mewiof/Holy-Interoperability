@@ -50,11 +50,11 @@ flowchart LR
 | Title memory (`xmem`, commit on demand) | `████████░░` 80% |
 | Fast storage | `███████░░░` 70% |
 | Game runtime services | `██████░░░░` 60% |
-| Graphics: device, resources, command recording | `██████░░░░` 58% (one memory map for translated programs; heaps released with title memory; root arguments in memory the GPU caches, owned by the recordings that use them) |
+| Graphics: device, resources, command recording | `██████░░░░` 62% (committed buffers the CPU reaches in title memory; buffer, texture and resource copies; released memory let go of once the GPU is done; one memory map for translated programs; heaps released with title memory; root arguments in memory the GPU caches, owned by the recordings that use them) |
 | Graphics: shader translation | `█████░░░░░` 45% (ray-intersection instructions open) |
 | Graphics: pipelines and caches | `███████░░░` 70% |
 | Graphics: correct output | `███░░░░░░░` 28% (fence values belong to their fence; textures read with all four channels; texture copies follow the title's writes; native pipelines get their targets, depth tests and vertices right) |
-| Graphics: performance | `██░░░░░░░░` 18% (memory accesses: two page-table reads instead of a scan; no views written per draw; recording a draw of native programs costs 0.3 us of CPU time, 0.4 us with a pipeline and table change each draw, measured over 20,000 draws; translated memory reads cost 1.5 times the desktop's on the same memory, and the GPU reads title memory over the bus without its second-level cache, about 20 times slower than video memory: measured; copies in video memory of what translated programs read, opt-in for now, make such reads 3 times faster) |
+| Graphics: performance | `██▌░░░░░░░` 25% (page table and root arguments in memory the GPU caches; aligned reads as one load; memory accesses: two page-table reads instead of a scan; no views written per draw; recording a draw of native programs costs 0.3 us of CPU time, 0.4 us with a pipeline and table change each draw, measured over 20,000 draws; translated memory reads cost 1.5 times the desktop's on the same memory, and the GPU reads title memory over the bus without its second-level cache, about 20 times slower than video memory: measured; copies in video memory of what translated programs read, opt-in for now, make such reads 3 times faster) |
 | Input | `████░░░░░░` 40% |
 | Audio | `█░░░░░░░░░` 10% |
 | Measurement: statistics, profiler, leak checks, call check, frame trace | `████████░░` 75% |

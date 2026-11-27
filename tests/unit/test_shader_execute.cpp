@@ -950,8 +950,9 @@ TEST(ray_intersection_reads_half_boxes_and_half_directions) {
 }
 
 // Differential: random programs (fixed seed) of scalar and vector arithmetic,
-// scalar ifs, counted loops, loops entered in the middle, divergent ifs with
-// and without an execz branch and early exits; every loop runs a few times
+// scalar and vector memory reads (any offset), scalar ifs, counted loops,
+// loops entered in the middle, divergent ifs with and without an execz
+// branch and early exits; every loop runs a few times
 // at most, so every program ends. Each runs on 8 lanes translated as the
 // reference (TranslatorOptions::reference: the dispatcher, nothing known of
 // EXEC, no folded moves) and as the runtime translates it; the results must
@@ -997,7 +998,7 @@ struct ProgramGenerator {
   void block(int depth) {
     const int count = 1 + static_cast<int>(next() % 4);
     for (int k = 0; k < count && statements < 48; ++k, ++statements) {
-      const uint32_t choice = next() % (depth < 3 ? 11 : 5);
+      const uint32_t choice = next() % (depth < 3 ? 13 : 5);
       if (choice <= 1) {  // s_add_u32 / s_xor_b32 sD, sA, sB
         const uint32_t op = choice == 0 ? 0 : 18;
         a.words.push_back(0x80000000u | (op << 23) | (s() << 16) | (s() << 8) | s());
@@ -1036,9 +1037,16 @@ struct ProgramGenerator {
         block(depth + 1);
         a.bind(end);
         a.words.push_back(0x887E007Eu | (saved << 8));  // s_or_b32 exec_lo, exec_lo, saved
-      } else {  // if (sA == sB) leave for the stores
+      } else if (choice == 10) {  // if (sA == sB) leave for the stores
         a.words.push_back(0xBF060000u | (s() << 8) | s());  // s_cmp_eq_u32
         a.branch(5, out);
+      } else if (choice == 11) {  // s_load_dword sD, s[0:1], offset (reads below 128 bytes)
+        a.words.push_back(0xF4000000u | (s() << 6));
+        a.words.push_back((0x7Du << 25) | (4 * (next() % 32)));
+      } else {  // buffer_load_dword vD, vA, s[0:3], 0 offen: any offset (unaligned, past the 128-byte records)
+        const uint32_t address = v(), data = v();
+        a.words.push_back(0xE0301000u);
+        a.words.push_back(address | (data << 8) | (0u << 16) | (0x80u << 24));
       }
     }
   }
@@ -1049,10 +1057,13 @@ struct ProgramGenerator {
     for (uint32_t r = 1; r <= 3; ++r) a.words.push_back((37u << 25) | (r << 17) | (0u << 9) | (8 + r));
     block(0);
     a.bind(out);
-    a.words.push_back(0x34140085u);  // v_lshlrev_b32 v10, 5, v0
-    for (uint32_t r = 0; r < 4; ++r) a.words.push_back(0x7E000200u | ((4 + r) << 17) | (8 + r));  // v4-v7 = s8-s11
-    for (uint32_t r = 1; r <= 7; ++r) {
-      a.words.push_back(0xE0701000u | (4 * (r - 1)));          // buffer_store_dword vr, v10, s[4:7], 0 offen
+    // Results above the 128 bytes the program reads (no lane reads what
+    // another writes): v1-v3 and s8 ^ s9 at 128 + lane * 16.
+    a.words.push_back(0x34140084u);                                      // v_lshlrev_b32 v10, 4, v0
+    a.words.push_back(0x80000000u | (18u << 23) | (25u << 16) | (9u << 8) | 8u);  // s_xor_b32 s25, s8, s9
+    a.words.push_back(0x7E000200u | (4u << 17) | 25u);                   // v_mov_b32 v4, s25
+    for (uint32_t r = 1; r <= 4; ++r) {
+      a.words.push_back(0xE0701000u | (128 + 4 * (r - 1)));  // buffer_store_dword vr, v10, s[4:7], 0 offen
       a.words.push_back(10u | (r << 8) | (1u << 16) | (0x80u << 24));
     }
     a.words.push_back(0xBF810000u);
@@ -1074,7 +1085,8 @@ TEST(random_control_flow_runs_the_same_as_the_reference_translation) {
     std::printf("      (no Direct3D 12 device: not run)\n");
     return;
   }
-  EXPECT(gpu.set_constants({0, 0, 0, 0, 0, 1, 256, 0}, true));
+  // s[0:3]: reads (2^32, 128-byte records); s[4:7]: results (256 bytes).
+  EXPECT(gpu.set_constants({0, 1, 128, 0, 0, 1, 256, 0}, true));
   int compared = 0, different = 0, failed = 0;
   for (uint32_t seed = 1; seed <= 60; ++seed) {
     ProgramGenerator generator;
@@ -1096,8 +1108,10 @@ TEST(random_control_flow_runs_the_same_as_the_reference_translation) {
       std::printf("      (seed %u: %s)\n", seed, error.c_str());
       continue;
     }
-    const std::vector<uint32_t> expected = gpu.dispatch(reference, std::vector<uint32_t>(64, 0));
-    const std::vector<uint32_t> got = gpu.dispatch(optimised, std::vector<uint32_t>(64, 0));
+    std::vector<uint32_t> memory(64);
+    for (uint32_t i = 0; i < 64; ++i) memory[i] = (seed << 16) ^ (i * 0x9E3779B9u);
+    const std::vector<uint32_t> expected = gpu.dispatch(reference, memory);
+    const std::vector<uint32_t> got = gpu.dispatch(optimised, memory);
     ++compared;
     if (expected.size() != 64 || got != expected) {
       ++different;

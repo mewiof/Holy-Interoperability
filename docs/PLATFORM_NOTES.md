@@ -744,7 +744,8 @@ Notes describe the platform, never a title.
   dispatcher loop (they jump through registers: subroutines). Unit tests run nested loops with a branch out of
   both, overlapping loops, and a group barrier between waves; a differential test runs 60 random programs
   (scalar ifs, counted loops, loops entered in the middle, divergent ifs with and without execz branches, early
-  exits) on 8 lanes translated both ways, with and without the layout, what is known of EXEC and folded moves
+  exits, scalar and vector memory reads at any offset; no lane reads what another writes, which would make the
+  result depend on the order lanes run in) on 8 lanes translated both ways, with and without the layout, what is known of EXEC and folded moves
   (`TranslatorOptions::reference`), and requires the same results (33 of the 60 differ when the layout's guards
   are left out, 3 when masks saved while EXEC was unknown are trusted).
 - Ray intersection (`image_bvh_intersect_ray` 230, `image_bvh64_intersect_ray` 231): *documented* (RDNA 2) the

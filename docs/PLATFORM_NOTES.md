@@ -716,7 +716,9 @@ Notes describe the platform, never a title.
   scratch temps live within one instruction's code): over all 19,305 saved programs 11,425 MiB became 10,469 MiB,
   for 15-30% more translation time (translation is about a hundredth of the host compiler's time). The 60
   programs now compile in 56 s (measured without cache answers); treating every vector load as aligned would
-  save 5% more (53 s), not enough to drop unaligned reads, which 16-bit loads can make legitimately. Where EXEC is known to be on (from the
+  save 5% more (53 s), not enough to drop unaligned reads, which 16-bit loads can make legitimately. All 435
+  translations under 1 MB of a 500-program sample (compute, NGG, vertex and pixel programs, pixel programs
+  after their paired vertex program) compile on the host, none refused: 268 s, 0.6 s a program on average. Where EXEC is known to be on (from the
   program's start, after an `s_cbranch_execz` not taken in a block nothing branches to, after EXEC is set to a
   constant with the lane's bit or or-ed while on, or restored from a mask an `s_*_saveexec` saved while it was
   on) results are written without the lane test: 2.7% less host bytecode over the saved programs, and in the

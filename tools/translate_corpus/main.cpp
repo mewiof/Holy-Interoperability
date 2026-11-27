@@ -11,7 +11,10 @@
 // one shader's native code (for a disassembler) to the given path; --decode
 // lists its instructions as the translator decodes them (operand codes as in
 // shader/rdna.h); --translate writes one shader's host container. --compile
-// also compiles each compute translation into a host pipeline and reports the
+// also compiles each translation into a host pipeline (graphics programs: a
+// vertex program alone, a pixel program after the vertex program the runtime
+// pairs it with; HOLY_D3D_DEBUG=1 prints the debug layer's reasons for
+// refusals) and reports the
 // host compiler's time by translation size (each program gets a store of a
 // unique value, so the host's shader caches, which key on the code, do not
 // answer).
@@ -68,6 +71,7 @@ struct Result {
   double ms = 0;
   size_t bytes_in = 0, bytes_out = 0;
   double compile_ms = -1;  // --compile: the host compiler's time (-1: not compiled)
+  ShaderInterface link;    // graphics programs: what the translation exports or reads
   HRESULT compile_result = S_OK;
 };
 
@@ -75,15 +79,29 @@ struct Result {
 // through (the runtime's translated_root_signature, same ranges).
 struct Host {
   ID3D12Device* device = nullptr;
+  ID3D12InfoQueue* messages = nullptr;  // with the debug layer
   ID3D12RootSignature* root = nullptr;
   bool caches_off = false;
 };
 
 bool open_host(Host* host) {
+  // HOLY_D3D_DEBUG=1: the host's debug layer, whose messages say why a
+  // pipeline was refused.
+  wchar_t flag[4] = {};
+  if (GetEnvironmentVariableW(L"HOLY_D3D_DEBUG", flag, 4) && flag[0] == L'1') {
+    ID3D12Debug* debug = nullptr;
+    if (SUCCEEDED(D3D12GetDebugInterface(__uuidof(ID3D12Debug), reinterpret_cast<void**>(&debug)))) {
+      debug->EnableDebugLayer();
+      debug->Release();
+    } else {
+      std::fprintf(stderr, "no debug layer on this host\n");
+    }
+  }
   if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void**>(&host->device)))) {
     return false;
   }
+  host->device->QueryInterface(__uuidof(ID3D12InfoQueue), reinterpret_cast<void**>(&host->messages));
   ID3D12Device9* device9 = nullptr;
   if (SUCCEEDED(host->device->QueryInterface(__uuidof(ID3D12Device9), reinterpret_cast<void**>(&device9)))) {
     host->caches_off = SUCCEEDED(device9->ShaderCacheControl(
@@ -178,6 +196,25 @@ std::vector<uint8_t> with_nonce(const std::vector<uint8_t>& container, uint64_t 
   return out;
 }
 
+// The debug layer's messages about a refused pipeline, then cleared.
+void print_messages(const Host& host, const Result* r) {
+  if (!host.messages) return;
+  static std::mutex lock;
+  std::lock_guard<std::mutex> guard(lock);
+  const UINT64 count = host.messages->GetNumStoredMessages();
+  for (UINT64 i = 0; FAILED(r->compile_result) && i < count && i < 4; ++i) {
+    SIZE_T bytes = 0;
+    host.messages->GetMessage(i, nullptr, &bytes);
+    std::vector<uint8_t> storage(bytes);
+    auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+    if (SUCCEEDED(host.messages->GetMessage(i, message, &bytes))) {
+      std::printf("  %ls: %.*s\n", r->name.c_str(), static_cast<int>(message->DescriptionByteLength),
+                  message->pDescription);
+    }
+  }
+  host.messages->ClearStoredMessages();
+}
+
 void compile_one(const Host& host, const std::vector<uint8_t>& translated, Result* r) {
   static const uint64_t run = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
   static std::atomic<uint64_t> serial{0};
@@ -189,6 +226,50 @@ void compile_one(const Host& host, const std::vector<uint8_t>& translated, Resul
   const auto t0 = std::chrono::steady_clock::now();
   r->compile_result = host.device->CreateComputePipelineState(&desc, __uuidof(ID3D12PipelineState),
                                                              reinterpret_cast<void**>(&pipeline));
+  print_messages(host, r);
+  r->compile_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (pipeline) pipeline->Release();
+}
+
+// A graphics pipeline from a vertex translation alone, or from a pixel
+// translation with the vertex program the runtime pairs NGG programs with
+// (ngg_vertex_program, passing on the attributes the pixel program reads).
+void compile_graphics(const Host& host, const std::vector<uint8_t>& translated, bool pixel,
+                      const ShaderInterface& link, Result* r) {
+  static const uint64_t run = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+  static std::atomic<uint64_t> serial{0};
+  const std::vector<uint8_t> program = with_nonce(translated, run ^ (serial.fetch_add(1) << 40));
+  std::vector<uint8_t> vertex;
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+  desc.pRootSignature = host.root;
+  if (pixel) {
+    uint32_t attributes = 0;
+    for (uint32_t bits = link.params | link.half_params; bits; bits &= bits - 1) ++attributes;
+    vertex = ngg_vertex_program(16 * (1 + attributes), link.params, link.half_params);  // as the runtime pairs them
+    desc.VS = {vertex.data(), vertex.size()};
+    desc.PS = {program.data(), program.size()};
+  } else {
+    desc.VS = {program.data(), program.size()};
+  }
+  desc.BlendState.IndependentBlendEnable = FALSE;
+  desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  for (int i = 1; i < 8; ++i) desc.BlendState.RenderTarget[i] = desc.BlendState.RenderTarget[0];
+  desc.SampleMask = 0xFFFFFFFFu;
+  desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  desc.RasterizerState.DepthClipEnable = TRUE;
+  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  if (pixel) {
+    desc.NumRenderTargets = 8;
+    for (int i = 0; i < 8; ++i) desc.RTVFormats[i] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    if (link.depth) desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+  }
+  desc.SampleDesc.Count = 1;
+  ID3D12PipelineState* pipeline = nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
+  r->compile_result = host.device->CreateGraphicsPipelineState(&desc, __uuidof(ID3D12PipelineState),
+                                                              reinterpret_cast<void**>(&pipeline));
+  print_messages(host, r);
   r->compile_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   if (pipeline) pipeline->Release();
 }
@@ -231,7 +312,7 @@ void translate_one(const std::vector<uint8_t>& blob, Result* r, std::vector<uint
   std::vector<uint8_t> out;
   GraphicsStage stage;
   if (native_graphics_stage(code, size, &stage)) {
-    ShaderInterface link;
+    ShaderInterface& link = r->link;
     if (stage == GraphicsStage::Vertex && native_ngg_program(code, size)) {
       r->kind = raw ? Kind::RawNgg : Kind::Ngg;
       NggInfo info;
@@ -385,7 +466,13 @@ int wmain(int argc, wchar_t** argv) {
         const auto t0 = std::chrono::steady_clock::now();
         translate_one(blob, &r, compile ? &bytecode : nullptr);
         r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        if (compile && r.ok && (r.kind == Kind::Compute || r.kind == Kind::RawCompute)) compile_one(host, bytecode, &r);
+        if (compile && r.ok) {
+          if (r.kind == Kind::Compute || r.kind == Kind::RawCompute || r.kind == Kind::Ngg || r.kind == Kind::RawNgg) {
+            compile_one(host, bytecode, &r);
+          } else if (r.kind != Kind::NotNative) {
+            compile_graphics(host, bytecode, r.kind == Kind::Pixel || r.kind == Kind::RawPixel, r.link, &r);
+          }
+        }
       }
     });
   }
@@ -430,7 +517,10 @@ int wmain(int argc, wchar_t** argv) {
     for (const Result& r : results) {
       if (r.compile_ms < 0) continue;
       if (FAILED(r.compile_result)) {
-        ++refused;
+        if (refused++ < 10) {
+          std::printf("  refused by the host: %ls (%s, 0x%08lx)\n", r.name.c_str(), kind_name(r.kind),
+                      static_cast<unsigned long>(r.compile_result));
+        }
         continue;
       }
       size_t b = 0;
@@ -440,7 +530,7 @@ int wmain(int argc, wchar_t** argv) {
       bytes[b] += static_cast<double>(r.bytes_out);
       total += r.compile_ms;
     }
-    std::printf("host compiler (shader caches %s; each program made unique): %.1f s over the compute "
+    std::printf("host compiler (shader caches %s; each program made unique): %.1f s over the "
                 "translations, %zu refused\n",
                 host.caches_off ? "off" : "on", total / 1000, refused);
     for (int b = 0; b < 5; ++b) {

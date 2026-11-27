@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "core/libs/d3d12_xs/shader/geometry.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
 #include "tests/unit/test.h"
 
@@ -363,11 +364,13 @@ struct Gpu {
 
   // Draws a triangle covering the target with the two programs and returns
   // the target's texels as bits (row-major); empty when the host refuses.
-  std::vector<uint32_t> draw(const std::vector<uint8_t>& vs, const std::vector<uint8_t>& ps) {
+  std::vector<uint32_t> draw(const std::vector<uint8_t>& vs, const std::vector<uint8_t>& ps,
+                             const std::vector<uint8_t>* gs = nullptr, UINT vertices = 3) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = root;
     desc.VS = {vs.data(), vs.size()};
     desc.PS = {ps.data(), ps.size()};
+    if (gs) desc.GS = {gs->data(), gs->size()};
     desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     desc.SampleMask = 0xFFFFFFFFu;
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -394,8 +397,10 @@ struct Gpu {
     list->RSSetScissorRects(1, &scissor);
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = targets->GetCPUDescriptorHandleForHeapStart();
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const float zero[4] = {};
+    list->ClearRenderTargetView(rtv, zero, 0, nullptr);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list->DrawInstanced(3, 1, 0, 0);
+    list->DrawInstanced(vertices, 1, 0, 0);
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Transition = {target, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
     list->ResourceBarrier(1, &barrier);
@@ -444,6 +449,23 @@ std::vector<uint8_t> covering_vertex_shader() {
   ID3DBlob* blob = nullptr;
   std::vector<uint8_t> out;
   if (compile && SUCCEEDED(compile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "vs_5_1", 0, 0,
+                                   &blob, nullptr))) {
+    const auto* bytes = static_cast<const uint8_t*>(blob->GetBufferPointer());
+    out.assign(bytes, bytes + blob->GetBufferSize());
+    blob->Release();
+  }
+  return out;
+}
+
+// A desktop program compiled from HLSL (empty without the host compiler).
+std::vector<uint8_t> compiled(const char* source, const char* profile) {
+  HMODULE compiler = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  using CompileFn = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*,
+                                     UINT, UINT, ID3DBlob**, ID3DBlob**);
+  const auto compile = compiler ? reinterpret_cast<CompileFn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+  ID3DBlob* blob = nullptr;
+  std::vector<uint8_t> out;
+  if (compile && SUCCEEDED(compile(source, std::strlen(source), nullptr, nullptr, nullptr, "main", profile, 0, 0,
                                    &blob, nullptr))) {
     const auto* bytes = static_cast<const uint8_t*>(blob->GetBufferPointer());
     out.assign(bytes, bytes + blob->GetBufferSize());
@@ -1123,4 +1145,54 @@ TEST(pack_conversions_and_packed_half_fma_run_as_documented) {
   EXPECT(after[17] == 0x80014000u);  // snorm16: 0.5 -> 16384, -1 -> -32767
   EXPECT(after[18] == 0x0007FFFFu);  // 0x12345 saturated, 7
   EXPECT(after[20] == 0x00004400u);  // {1.5 * 2 + 1, 2 * 0.5 - 1} = {4.0, 0}
+}
+
+// Rectangle lists: the generated geometry program draws the whole rectangle
+// three corners describe, and attributes take their affine values in the
+// corner it adds.
+TEST(rectangle_lists_draw_the_whole_rectangle) {
+  Gpu gpu;
+  const std::vector<uint8_t> vs = compiled(
+      "struct O { float4 pos : SV_Position; float4 t : TEXCOORD0; };"
+      "O main(uint id : SV_VertexID) {"
+      "  float2 uv = float2(id == 1, id == 2);"
+      "  O o;"
+      "  o.pos = float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1);"
+      "  o.t = float4(10 + 3 * uv.x + 5 * uv.y, 0, 0, 0);"
+      "  return o;"
+      "}",
+      "vs_5_1");
+  const std::vector<uint8_t> ps = compiled(
+      "float4 main(float4 pos : SV_Position, float4 t : TEXCOORD0) : SV_Target { return t.x; }", "ps_5_1");
+  if (vs.empty() || ps.empty() || !gpu.open()) {
+    std::printf("      (no Direct3D 12 device or shader compiler: not run)\n");
+    return;
+  }
+  std::vector<SignatureEntry> outputs;
+  EXPECT(read_output_signature(vs.data(), vs.size(), &outputs));
+  EXPECT(outputs.size() == 2);
+  const std::vector<uint8_t> gs = rectangle_list_program(outputs);
+  const std::vector<uint32_t> half = gpu.draw(vs, ps);
+  const std::vector<uint32_t> whole = gpu.draw(vs, ps, &gs);
+  EXPECT(half.size() == kSize * kSize && whole.size() == kSize * kSize);
+  if (half.size() != kSize * kSize || whole.size() != kSize * kSize) return;
+  auto as_float = [](uint32_t bits) {
+    float value;
+    std::memcpy(&value, &bits, 4);
+    return value;
+  };
+  bool covered = true, affine = true, half_uncovered = false;
+  for (UINT y = 0; y < kSize; ++y) {
+    for (UINT x = 0; x < kSize; ++x) {
+      const float u = (x + 0.5f) / kSize, v = (y + 0.5f) / kSize;
+      const float expected = 10 + 3 * u + 5 * v;
+      const float got = as_float(whole[y * kSize + x]);
+      covered = covered && got != 0.0f;
+      affine = affine && std::fabs(got - expected) < 1e-4f;
+      half_uncovered = half_uncovered || half[y * kSize + x] == 0;
+    }
+  }
+  EXPECT(half_uncovered);  // the triangle alone leaves the far corner empty
+  EXPECT(covered);
+  EXPECT(affine);
 }

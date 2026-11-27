@@ -83,6 +83,10 @@ struct Pipeline : Wrapper {
   // reference held), and what it writes.
   Pipeline* ngg_compute = nullptr;
   NggInfo ngg{};
+  // The same pipeline drawing rectangle lists (a geometry program adds each
+  // rectangle's fourth corner; shader/geometry.h), made at first such draw.
+  std::shared_ptr<HostPipeline> rectangles;
+  bool rectangles_tried = false;
 };
 
 // The pipeline behind a title object, or null if it is not one.
@@ -115,6 +119,11 @@ HRESULT create_derived_pipeline(Device* device, const void* base, uint32_t count
 // compiled yet (and waiting for a compile in progress). Null if the host
 // refused it. Marks the pipeline as used.
 ID3D12PipelineState* pipeline_host(const void* pipeline);
+
+// The host pipeline for drawing rectangle lists with a title pipeline (see
+// Pipeline::rectangles); null if there cannot be one (the caller then draws
+// triangle lists).
+ID3D12PipelineState* pipeline_host_rectangles(const void* pipeline);
 
 // Releases a pipeline (vtable slot 2 of pipelines).
 ULONG STDMETHODCALLTYPE pipeline_release(Wrapper* self);

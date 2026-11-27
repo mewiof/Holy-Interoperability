@@ -7,6 +7,7 @@ add_executable(holy_unit_tests
   unit/test_provider.cpp
   unit/test_shader_container.cpp
   unit/test_shader_execute.cpp
+  ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader/geometry.cpp
   unit/test_shader_translate.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader_container.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader/dxbc.cpp

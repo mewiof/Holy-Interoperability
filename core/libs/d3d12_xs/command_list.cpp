@@ -133,6 +133,8 @@ HRESULT STDMETHODCALLTYPE list_reset_x(CommandList* self, void* allocator, void*
   self->graphics = RootBinding{};
   self->compute = RootBinding{};
   self->pipeline = nullptr;
+  self->bound = nullptr;
+  self->rectangles = false;
   self->translated = false;
   std::memset(self->vertex_buffers, 0, sizeof(self->vertex_buffers));
   HostList* h = self->current;
@@ -367,11 +369,10 @@ bool desktop_topology(D3D12_PRIMITIVE_TOPOLOGY t) {
 }
 
 void STDMETHODCALLTYPE list_set_primitive_topology(CommandList* self, D3D12_PRIMITIVE_TOPOLOGY topology) {
+  self->rectangles = topology == kRectangleList;
   if (topology == kRectangleList) {
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true)) {
-      LIB_LOG(lib::kWarn, "d3d12", "rectangle lists are drawn as triangle lists (half of each rectangle)");
-    }
+    // Drawn as triangle lists with a pipeline whose geometry program adds
+    // each rectangle's fourth corner (pipeline_host_rectangles).
     topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
   } else if (!desktop_topology(topology)) {
     LIB_LOG(lib::kError, "d3d12", "primitive topology %d is not a desktop topology", static_cast<int>(topology));
@@ -444,6 +445,7 @@ void STDMETHODCALLTYPE list_set_pipeline_state(CommandList* self, void* pipeline
   self->translated = is_translated(pipeline);
   if (auto* host = pipeline_host(pipeline)) {
     self->host->SetPipelineState(host);
+    self->bound = host;
   } else if (pipeline) {
     static std::atomic<int> logged{0};
     if (logged.fetch_add(1) < 8) LIB_LOG(lib::kError, "d3d12", "pipeline %p has no host pipeline; its draws are dropped", pipeline);
@@ -673,6 +675,24 @@ void mark_work(CommandList* self) {
   LIB_LOG(lib::kDebug, "d3d12", "work on title list %u: %ls", self->number, label.c_str());
 }
 
+// The host pipeline a draw needs: the title pipeline's, or its rectangle
+// list variant while the topology is a rectangle list.
+void bind_draw_pipeline(CommandList* self) {
+  ID3D12PipelineState* wanted = nullptr;
+  if (self->rectangles) {
+    wanted = pipeline_host_rectangles(self->pipeline);
+    static std::atomic<bool> logged{false};
+    if (!wanted && !logged.exchange(true)) {
+      LIB_LOG(lib::kWarn, "d3d12", "rectangle lists drawn as triangle lists (half of each rectangle)");
+    }
+  }
+  if (!wanted) wanted = pipeline_host(self->pipeline);
+  if (wanted && wanted != self->bound) {
+    self->host->SetPipelineState(wanted);
+    self->bound = wanted;
+  }
+}
+
 void STDMETHODCALLTYPE list_draw_instanced(CommandList* self, UINT vertices, UINT instances, UINT first_vertex,
                                            UINT first_instance) {
   if (!self->pipeline) {  // no host pipeline (reported when it was set)
@@ -685,8 +705,10 @@ void STDMETHODCALLTYPE list_draw_instanced(CommandList* self, UINT vertices, UIN
   if (self->translated && ngg_pipeline(self->pipeline, &ngg)) {
     g_work.ngg.fetch_add(1, std::memory_order_relaxed);
     if (!draw_ngg(self, ngg, vertices, instances, first_vertex, first_instance)) report_unbound("an NGG draw");
+    self->bound = nullptr;  // the NGG passes set their own pipelines
     return;
   }
+  bind_draw_pipeline(self);
   if (self->translated) {
     // The host's vertex index already includes the first vertex.
     if (!bind_translated_graphics(self, 0, first_instance)) return report_unbound("a draw");
@@ -710,6 +732,7 @@ void STDMETHODCALLTYPE list_draw_indexed_instanced(CommandList* self, UINT indic
     if (logged.fetch_add(1) < 4) LIB_LOG(lib::kError, "d3d12", "indexed draw with an NGG pipeline: not drawn");
     return;
   }
+  bind_draw_pipeline(self);
   if (self->translated) {
     // The host's vertex index is the index; native code adds the base vertex.
     if (!bind_translated_graphics(self, static_cast<uint32_t>(base_vertex), first_instance)) {

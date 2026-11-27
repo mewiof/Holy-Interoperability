@@ -34,6 +34,9 @@ enum Opcode : uint32_t {
   kImmAtomicIadd = 180, kImmAtomicAnd = 181, kImmAtomicOr = 182, kImmAtomicXor = 183, kImmAtomicExch = 184,
   kImmAtomicCmpExch = 185, kImmAtomicImax = 186, kImmAtomicImin = 187, kImmAtomicUmax = 188,
   kImmAtomicUmin = 189, kSync = 190, kDerivRtxFine = 123, kDerivRtyFine = 125,
+  // Geometry programs.
+  kDclGsOutputTopology = 92, kDclGsInputPrimitive = 93, kDclMaxOutputVertexCount = 94, kDclInputSiv = 97,
+  kEmitStream = 117, kCutStream = 118, kDclStream = 143,
 };
 
 // Instruction controls (bits 11-23 of the opcode token).
@@ -85,7 +88,12 @@ struct SignatureElement {
   uint8_t rw_mask;  // inputs: components read; outputs: components never written
 };
 
-enum class ProgramType : uint32_t { Pixel = 0, Vertex = 1, Compute = 5 };
+enum class ProgramType : uint32_t { Pixel = 0, Vertex = 1, Geometry = 2, Compute = 5 };
+
+// vN[vertex][reg].xyzw (geometry program inputs), oN.xyzw, and stream m0.
+Operand gs_input_xyzw(uint32_t vertex, uint32_t reg);
+Operand output_xyzw(uint32_t reg);
+Operand stream0();
 // CBn[0][register].component and CBn[0][temp.x + register].component.
 Operand cb(uint32_t id, uint32_t reg, uint32_t component);
 Operand cb_indexed(uint32_t id, uint32_t temp_index, uint32_t reg, uint32_t component);
@@ -156,6 +164,11 @@ class Program {
   void dcl_output(uint32_t reg, uint32_t mask);
   void dcl_output_siv(uint32_t reg, uint32_t mask, SystemValue name);
   void dcl_output_depth();
+  // Geometry programs: inputs v[vertices][reg] (`position`: the SV_Position
+  // input), triangles in, triangle strips of at most `max_vertices` out, on
+  // stream 0.
+  void dcl_gs_input(uint32_t vertices, uint32_t reg, uint32_t mask, bool position);
+  void dcl_gs_triangles_to_strips(uint32_t max_vertices);
 
   // Appends `other`'s instructions (no version/length header).
   void append(const Program& other);
@@ -163,6 +176,7 @@ class Program {
 
   // The complete DXBC container (input/output signatures, SHEX, checksum;
   // with `features`, the SFI0 part declaring them: kRequires* bits).
+  // Geometry programs' outputs go in a stream-aware signature (OSG5).
   std::vector<uint8_t> container(const std::vector<SignatureElement>& inputs = {},
                                  const std::vector<SignatureElement>& outputs = {}, uint64_t features = 0) const;
 

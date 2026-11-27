@@ -29,6 +29,8 @@ holy_add_system_library(holy_lib_d3d12_xs
     resource.cpp
     shader/descriptor_layout.h
     shader/dxbc.cpp
+    shader/geometry.cpp
+    shader/geometry.h
     shader/dxbc.h
     ../inflate.cpp
     ../inflate.h

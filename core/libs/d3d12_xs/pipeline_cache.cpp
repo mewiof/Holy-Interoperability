@@ -10,6 +10,7 @@
 #include <iterator>
 #include <unordered_set>
 
+#include "core/libs/d3d12_xs/shader/geometry.h"
 #include "core/libs/d3d12_xs/shader_dump.h"
 #include "core/libs/d3d12_xs/translation_cache.h"
 #include "core/libs/support.h"
@@ -776,10 +777,11 @@ HRESULT create_derived_pipeline(Device* device, const void* base, uint32_t count
   return hr;
 }
 
-ID3D12PipelineState* pipeline_host(const void* object) {
-  Pipeline* pipeline = as_pipeline(object);
-  if (!pipeline || !pipeline->shared) return nullptr;
-  HostPipeline* p = pipeline->shared.get();
+namespace {
+
+// A host pipeline's object, compiled now if it was not compiled yet (and
+// waiting for a compile in progress). Marks it as used.
+ID3D12PipelineState* host_state(HostPipeline* p) {
   if (!p->used.load(std::memory_order_relaxed) && !p->used.exchange(true) && p->recipe) remember_use(p->key);
   if (ID3D12PipelineState* state = p->state.load(std::memory_order_acquire)) return state;
   AcquireSRWLockExclusive(&p->lock);
@@ -800,6 +802,60 @@ ID3D12PipelineState* pipeline_host(const void* object) {
   }
   ReleaseSRWLockExclusive(&p->lock);
   return p->state.load();
+}
+
+std::mutex g_variant_lock;
+
+}  // namespace
+
+ID3D12PipelineState* pipeline_host(const void* object) {
+  Pipeline* pipeline = as_pipeline(object);
+  if (!pipeline || !pipeline->shared) return nullptr;
+  return host_state(pipeline->shared.get());
+}
+
+ID3D12PipelineState* pipeline_host_rectangles(const void* object) {
+  Pipeline* pipeline = as_pipeline(object);
+  if (!pipeline || !pipeline->recipe || !pipeline->shared) return nullptr;
+  std::shared_ptr<HostPipeline> variant;
+  {
+    std::lock_guard<std::mutex> guard(g_variant_lock);
+    if (!pipeline->rectangles_tried) {
+      pipeline->rectangles_tried = true;
+      // The vertex program's outputs, from its bytecode.
+      const Recipe& base = *pipeline->recipe;
+      ProgramRef vertex;
+      size_t program = 0;
+      bool has_geometry = false;
+      walk(base.stream, [&](uint32_t type, size_t inner, size_t) {
+        if (!is_shader(type)) return;
+        D3D12_SHADER_BYTECODE code;
+        std::memcpy(&code, base.stream.data() + inner, sizeof(code));
+        if (!code.BytecodeLength) return;
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && program < base.programs.size()) {
+          vertex = base.programs[program];
+        }
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS) has_geometry = true;
+        ++program;
+      });
+      std::vector<SignatureEntry> outputs;
+      const auto bytes = vertex ? vertex->bytes() : nullptr;
+      if (!has_geometry && bytes && read_output_signature(bytes->data(), bytes->size(), &outputs) && !outputs.empty()) {
+        ProgramRef geometry = intern_program(rectangle_list_program(outputs));
+        auto recipe = std::make_shared<Recipe>(base);
+        const D3D12_SHADER_BYTECODE code{nullptr, geometry->size()};  // patched in when compiling
+        stream_append(&recipe->stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, &code, sizeof(code));
+        recipe->programs.push_back(std::move(geometry));
+        std::vector<uint8_t> content = content_of(*recipe);
+        recipe->key = fnv(content);
+        pipeline->rectangles = host_pipeline_for(pipeline->shared->device, recipe, std::move(content));
+      } else {
+        LIB_LOG(lib::kWarn, "d3d12", "a pipeline drawing rectangle lists has no vertex outputs to complete them from");
+      }
+    }
+    variant = pipeline->rectangles;
+  }
+  return variant ? host_state(variant.get()) : nullptr;
 }
 
 ULONG STDMETHODCALLTYPE pipeline_release(Wrapper* self) {

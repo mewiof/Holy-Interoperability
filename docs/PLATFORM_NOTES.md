@@ -294,9 +294,13 @@ Notes describe the platform, never a title.
   vertices are three corners of a rectangle, the GPU adds the fourth. *observed* host behaviour: given to the host
   as is, the host device is removed as hung (`DXGI_ERROR_DEVICE_HUNG`) within milliseconds of the list's next
   submitted work, whatever that work is (an immediate write to the host's own memory is enough); device-removed
-  data shows the list stopped before its first operation. Implementation, partial: rectangle lists are drawn as
-  triangle lists (one half of each rectangle is drawn); other topologies the desktop does not define report
-  themselves.
+  data shows the list stopped before its first operation. Implementation: rectangle lists are drawn as triangle
+  lists with a variant of the pipeline (made at its first such draw) whose generated geometry program passes each
+  triangle on and adds the fourth corner as v1 + v2 - v0 for every vertex output, a strip of four vertices
+  (attributes varying affinely over the rectangle complete the same way; checked on the host GPU by a unit test).
+  The geometry program is built from the vertex program's output signature. Partial: NGG pipelines and vertex
+  programs without a readable output signature still draw one half of each rectangle. Other topologies the
+  desktop does not define report themselves.
 - *observed*: titles reset a command list and submit it again while its previous submission is still executing;
   the desktop forbids submitting a list before the GPU has finished its previous submission (the debug layer
   refuses it). Implementation: title lists record into host lists from a pool; a reset whose host list may still

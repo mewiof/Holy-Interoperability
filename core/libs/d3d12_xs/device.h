@@ -81,6 +81,8 @@ struct CommandList {
   RootBinding graphics, compute;
   const void* pipeline = nullptr;  // the title's current pipeline (a Wrapper)
   bool translated = false;         // it runs translated native code
+  ID3D12PipelineState* bound = nullptr;  // the host pipeline set on the host list (null: unknown)
+  bool rectangles = false;               // the title's topology is a rectangle list
   uint32_t number = 0;             // in the host list's name ("title list N")
   D3D12_VERTEX_BUFFER_VIEW vertex_buffers[16] = {};  // title addresses
   // Input assembly state as set on the host, restored after NGG draws.

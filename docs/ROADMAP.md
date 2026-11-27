@@ -89,8 +89,8 @@ The largest piece.
 - done: the console's rectangle-list topology no longer reaches the host (it removed the host device as hung a
   second into the reference title's first frames); command lists resubmitted while executing get pooled host
   lists.
-- partial: rectangle lists are drawn as triangle lists (half of each rectangle); a geometry stage that adds the
-  fourth corner is next.
+- done: rectangle lists, through a generated geometry program that adds each rectangle's fourth corner (NGG
+  pipelines still draw half of each rectangle).
 - done: NGG vertex programs (a compute pass writing vertex and primitive records, then an indexed draw of them),
   half-precision interpolation after them, image instructions with 16-bit data, cube, multisampled,
   explicit-gradient and unnormalised images, packed 16-bit and sub-dword ALU operations, lane permutes through

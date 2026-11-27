@@ -127,6 +127,15 @@ Operand sampler_indexed_select(uint32_t id, uint32_t temp_index, uint32_t compon
   return indexed(kSampler, select(component), id, temp_index);
 }
 
+Operand gs_input_xyzw(uint32_t vertex, uint32_t reg) {
+  return {kFourComponents | kSwizzleMode | (0xE4u << 4) | type_bits(kInput) | dimension(2), vertex, reg};
+}
+Operand output_xyzw(uint32_t reg) { return output_register(reg, 0xF); }
+Operand stream0() {
+  constexpr uint32_t kStream = 16;
+  return {type_bits(kStream) | dimension(1), 0};
+}
+
 Operand group_shared(uint32_t id, Access access) {
   uint32_t components = access == Access::Load ? swizzle_xxxx() : access == Access::Store ? mask_x() : 0u;
   return {components | type_bits(kGroupShared) | dimension(1), id};
@@ -236,6 +245,25 @@ void Program::dcl_output_siv(uint32_t reg, uint32_t mask, SystemValue name) {
 
 void Program::dcl_output_depth() { tokens_.insert(tokens_.end(), {kDclOutput | (2u << 24), output_depth()[0]}); }
 
+void Program::dcl_gs_input(uint32_t vertices, uint32_t reg, uint32_t mask, bool position) {
+  const uint32_t operand = kFourComponents | kMaskMode | (mask << 4) | type_bits(kInput) | dimension(2);
+  if (position) {
+    tokens_.insert(tokens_.end(), {kDclInputSiv | (5u << 24), operand, vertices, reg, static_cast<uint32_t>(kPosition)});
+  } else {
+    tokens_.insert(tokens_.end(), {kDclInput | (4u << 24), operand, vertices, reg});
+  }
+}
+
+void Program::dcl_gs_triangles_to_strips(uint32_t max_vertices) {
+  constexpr uint32_t kTriangle = 3, kTriangleStrip = 5;
+  const Operand stream = stream0();
+  tokens_.push_back(kDclGsInputPrimitive | (kTriangle << 11) | (1u << 24));
+  tokens_.push_back(kDclStream | (static_cast<uint32_t>(1 + stream.size()) << 24));
+  tokens_.insert(tokens_.end(), stream.begin(), stream.end());
+  tokens_.push_back(kDclGsOutputTopology | (kTriangleStrip << 11) | (1u << 24));
+  tokens_.insert(tokens_.end(), {kDclMaxOutputVertexCount | (2u << 24), max_vertices});
+}
+
 void Program::append(const Program& other) {
   tokens_.insert(tokens_.end(), other.tokens_.begin() + 2, other.tokens_.end());
 }
@@ -243,8 +271,10 @@ void Program::append(const Program& other) {
 namespace {
 
 // A signature chunk's contents: count, 8, 24-byte elements, then the names.
-std::vector<uint8_t> signature_chunk(const std::vector<SignatureElement>& elements) {
-  std::vector<uint8_t> out(8 + 24 * elements.size());
+// With streams (OSG5), each element starts with its stream (28 bytes).
+std::vector<uint8_t> signature_chunk(const std::vector<SignatureElement>& elements, bool streams = false) {
+  const size_t stride = streams ? 28 : 24, lead = streams ? 4 : 0;
+  std::vector<uint8_t> out(8 + stride * elements.size());
   const uint32_t count = static_cast<uint32_t>(elements.size()), eight = 8;
   std::memcpy(out.data(), &count, 4);
   std::memcpy(out.data() + 4, &eight, 4);
@@ -253,9 +283,9 @@ std::vector<uint8_t> signature_chunk(const std::vector<SignatureElement>& elemen
     const uint32_t name = static_cast<uint32_t>(out.size());
     out.insert(out.end(), e.name, e.name + std::strlen(e.name) + 1);
     const uint32_t fields[5] = {name, e.index, e.system_value, e.component_type, e.reg};
-    std::memcpy(out.data() + 8 + 24 * i, fields, sizeof(fields));
-    out[8 + 24 * i + 20] = e.mask;
-    out[8 + 24 * i + 21] = e.rw_mask;
+    std::memcpy(out.data() + 8 + stride * i + lead, fields, sizeof(fields));
+    out[8 + stride * i + lead + 20] = e.mask;
+    out[8 + stride * i + lead + 21] = e.rw_mask;
   }
   while (out.size() % 4) out.push_back(0);
   return out;
@@ -268,7 +298,8 @@ std::vector<uint8_t> Program::container(const std::vector<SignatureElement>& inp
   std::vector<uint32_t> shex = tokens_;
   shex[1] = static_cast<uint32_t>(shex.size());
   // Chunks: ISGN, OSGN, SHEX, and SFI0 (8 bytes of feature bits) if any.
-  const std::vector<uint8_t> in_chunk = signature_chunk(inputs), out_chunk = signature_chunk(outputs);
+  const bool geometry = (tokens_[0] >> 16) == static_cast<uint32_t>(ProgramType::Geometry);
+  const std::vector<uint8_t> in_chunk = signature_chunk(inputs), out_chunk = signature_chunk(outputs, geometry);
   const uint32_t chunks = features ? 4 : 3;
   const uint32_t header = 32 + chunks * 4;
   const uint32_t isgn = header, osgn = isgn + 8 + static_cast<uint32_t>(in_chunk.size());
@@ -294,7 +325,7 @@ std::vector<uint8_t> Program::container(const std::vector<SignatureElement>& inp
   put(isgn, "ISGN", 4);
   put32(isgn + 4, static_cast<uint32_t>(in_chunk.size()));
   put(isgn + 8, in_chunk.data(), in_chunk.size());
-  put(osgn, "OSGN", 4);
+  put(osgn, geometry ? "OSG5" : "OSGN", 4);
   put32(osgn + 4, static_cast<uint32_t>(out_chunk.size()));
   put(osgn + 8, out_chunk.data(), out_chunk.size());
   put(code, "SHEX", 4);

@@ -329,6 +329,8 @@ HRESULT enumerate_containers(Provider* provider, const char* prefix, void* conte
     }
   }
   std::sort(found.begin(), found.end(), [](const ContainerData& a, const ContainerData& b) { return a.name < b.name; });
+  LIB_LOG(holy::lib::kInfo, "gamesave", "containers enumerated (prefix \"%s\"): %zu", prefix ? prefix : "",
+          found.size());
   for (const ContainerData& data : found) {
     const ContainerInfo info{data.name.c_str(), data.display_name.c_str(), data.blobs, data.size, data.modified, false};
     if (!callback(&info, context)) break;
@@ -343,6 +345,8 @@ struct BlobData {
 
 // The blobs named (all of the container's when `names` is null), read.
 HRESULT read_blobs(Container* container, const char** names, uint32_t count, std::vector<BlobData>* out) {
+  LIB_LOG(holy::lib::kInfo, "gamesave", "container %s read (%s)", container->name.c_str(),
+          names ? "named blobs" : "all blobs");
   std::lock_guard<std::mutex> guard(g_lock);
   out->clear();
   if (!names) {
@@ -567,8 +571,12 @@ HRESULT STDMETHODCALLTYPE get_container_info(Object*, void* handle, const char* 
     const std::wstring file = encode(name, L'c');
     if (GetFileAttributesW((provider->dir + L"\\" + file).c_str()) == INVALID_FILE_ATTRIBUTES ||
         !container_data(*provider, file, &data)) {
+      LIB_LOG(holy::lib::kInfo, "gamesave", "container %s asked about: none", name);
       return S_OK;  // no such container: the callback is not called
     }
+  }
+  LIB_LOG(holy::lib::kInfo, "gamesave", "container %s asked about: %u blobs", name, data.blobs);
+  {
   }
   const ContainerInfo info{data.name.c_str(), data.display_name.c_str(), data.blobs, data.size, data.modified, false};
   callback(&info, context);

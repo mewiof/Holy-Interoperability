@@ -505,6 +505,20 @@ void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_
     // A texture in title memory: viewed through a host copy (texture_upload.h).
     note_view(dest, "shader resource view at an address", view->address, resource->Width, resource->Height,
               resource->Format, view->srv.Format);
+    static const bool trace = GetEnvironmentVariableW(L"HOLY_XG_TRACE", nullptr, 0) > 0;
+    if (trace && view->srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+      static const lib::Counter all("d3d12.texture_views_2d"), partial("d3d12.texture_views_2d_from_level_1_on");
+      all.add(1);
+      const bool past_zero = view->srv.Texture2D.MostDetailedMip > 0 || view->srv.Texture2D.ResourceMinLODClamp > 0;
+      if (past_zero) partial.add(1);
+      static std::atomic<int> logged{0};
+      if (past_zero && logged.fetch_add(1) < 200) {
+        LIB_LOG(lib::kInfo, "d3d12", "texture view %llux%u, %u mips, layout 0x%x: levels from %u, %d of them, min LOD %.2f",
+                static_cast<unsigned long long>(resource->Width), resource->Height, resource->MipLevels,
+                static_cast<unsigned>(resource->Layout), view->srv.Texture2D.MostDetailedMip,
+                static_cast<int>(view->srv.Texture2D.MipLevels), view->srv.Texture2D.ResourceMinLODClamp);
+      }
+    }
     ID3D12Resource* texture = texture_at(self, *resource, view->address);
     if (texture) {
       D3D12_SHADER_RESOURCE_VIEW_DESC fitted = view->srv;

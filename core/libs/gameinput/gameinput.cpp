@@ -118,8 +118,8 @@ bool key(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 //
 // For runs without a person at the controls (regression runs, measurements):
 // HOLY_INPUT_SCRIPT lists presses, each `<when>:<controls>[/<ms>]`, separated
-// by ';'. `<when>` is seconds since the process started (the runtime log's
-// clock): `8.5` once, `10-60/2` every 2 s from 10 s to 60 s. `<controls>` are
+// by ';'. `<when>` is seconds since the title's first gamepad reading (logged
+// with its time on the runtime log's clock): `8.5` once, `10-60/2` every 2 s from 10 s to 60 s. `<controls>` are
 // joined by '+': A B X Y Menu View Up Down Left Right LB RB LS RS (buttons),
 // LT RT (triggers), LSUp LSDown LSLeft LSRight RSUp RSDown RSLeft RSRight
 // (sticks pushed fully). A press lasts `<ms>` (150 by default). Scripted
@@ -224,7 +224,15 @@ double process_seconds() {
 void add_scripted(GamepadState* s) {
   const std::vector<ScriptedPress>& presses = script();
   if (presses.empty()) return;
-  const double now = process_seconds();
+  // The clock starts at the title's first reading (its main loop polling
+  // input), so start-up that takes longer than usual (host caches rebuilt)
+  // does not put the presses before the screens they are meant for.
+  static const double origin = [] {
+    const double at = process_seconds();
+    LIB_LOG(holy::lib::kInfo, "gameinput", "scripted input: the clock starts at the first reading, %.1f s in", at);
+    return at;
+  }();
+  const double now = process_seconds() - origin;
   for (const ScriptedPress& p : presses) {
     if (now < p.first || now > p.last + p.hold) continue;
     const double into = p.period > 0 ? std::fmod(now - p.first, p.period) : now - p.first;

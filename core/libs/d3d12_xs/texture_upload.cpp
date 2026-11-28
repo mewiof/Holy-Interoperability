@@ -1085,6 +1085,21 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   LIB_LOG(lib::kDebug, "d3d12", "host texture for format %u %llux%ux%u, %u mips at %p", shape.format,
           static_cast<unsigned long long>(shape.width), shape.height, shape.depth_or_array, shape.mips,
           reinterpret_cast<void*>(address));
+  {
+    // Copies made over memory another copy (of another shape) already covers:
+    // the title reusing its texture memory for other textures (measurement).
+    static const lib::Counter overlaps("d3d12.host_textures_over_other_copies");
+    static const lib::Counter overlap_bytes("d3d12.host_texture_bytes_over_other_copies");
+    auto it = textures().lower_bound(Key{address > g_largest ? address - g_largest : 0, 0, 0, 0, 0, 0, 0});
+    for (; it != textures().end() && std::get<0>(it->first) < address + size; ++it) {
+      const Record* other = it->second;
+      if (other->from_memory && other->address + other->size > address) {
+        overlaps.add(1);
+        overlap_bytes.add(static_cast<int64_t>(std::min(other->size, size)));
+        break;
+      }
+    }
+  }
   textures().emplace(key, record);
   g_largest = std::max(g_largest, size);
   c_live_textures().add(1);

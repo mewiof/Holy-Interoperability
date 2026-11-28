@@ -804,6 +804,12 @@ Notes describe the platform, never a title.
   texture tiles), which has no public description. They were read as plain data (compressed bytes where the
   title expects texels); they now fail, with their status saying so, and are counted
   (`dstorage.unsupported_format_requests`). The title carries on. Not implemented: that format.
+- *measured* (open): 20-40 s into a title's loading its texture streaming stops, at a different place in
+  different runs: its own check that a 64 KiB streaming destination lies inside its pool (the address about 50 GB
+  past the pool's base), a streaming request with a zero count and items, pointers read from such requests;
+  once the host device was removed by an invalid call (the host's debug layer reports nothing in a run under
+  it). Not caused by texture tracking (the same with it off), file reads (none fails) or the fast-storage
+  queue's zlib requests (all inflate since).
 - *measured*: zlib requests whose streams inflate to exactly their destination's size failed when inflated in
   place in title memory (invalid data; the decoder reads its output back) and succeeded into private memory: the
   title then used the unwritten memory. Requests are now inflated into memory of the worker's and copied.

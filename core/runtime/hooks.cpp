@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -213,7 +214,19 @@ BOOL WINAPI hook_ReadFile(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, 
   // runtime did not see): asked again, then read again.
   ensure_committed(buffer, size, true);
   SetLastError(error);
-  return ReadFile(file, buffer, size, read, overlapped);
+  const BOOL again = ReadFile(file, buffer, size, read, overlapped);
+  if (!again && GetLastError() == ERROR_NOACCESS) {
+    const DWORD failure = GetLastError();
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 16) {
+      MEMORY_BASIC_INFORMATION info{};
+      VirtualQuery(buffer, &info, sizeof(info));
+      LOG_ERROR("vfs", "a read of 0x%lx bytes into %p fails: its memory cannot be written (state 0x%lx, type 0x%lx, "
+                "protection 0x%lx)", size, buffer, info.State, info.Type, info.Protect);
+    }
+    SetLastError(failure);
+  }
+  return again;
 }
 
 // The title frees memory: what commit on demand remembers of it is

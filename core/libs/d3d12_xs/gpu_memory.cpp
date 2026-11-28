@@ -66,6 +66,11 @@ MemoryMap g_map;  // under g_lock
 std::atomic<const uint8_t*> g_table{nullptr};
 std::atomic<uint64_t> g_table_va{0};
 
+// Title memory asked for that the GPU cannot reach because it is read-only.
+const lib::Counter& c_read_only_reaches() {
+  static const lib::Counter c("d3d12.read_only_reaches");
+  return c;
+}
 const lib::Counter& c_slots() {
   static const lib::Counter c("d3d12.memory_slots");
   return c;
@@ -708,6 +713,17 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
       at = part_end;
     }
     if (info.State != MEM_COMMIT) return false;
+    // Measured (the host's debug layer): heaps are opened only over writable
+    // memory. Observed: during a title's loading, 377 read-only 64 KiB
+    // regions (the memory library's shared page of zeroes, shown where the
+    // title reserved physical-page addresses and maps no page yet) were asked
+    // for 6,443 times in 40 s, each a refused host call and an error logged.
+    // Such memory is unreachable as it is (the GPU would read the zeroes the
+    // CPU sees); it is counted, not tried, until it becomes writable.
+    if (!(info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY))) {
+      c_read_only_reaches().add(1);
+      return false;
+    }
     // Observed: titles commit a reservation progressively (a stretch that
     // grows frame after frame), and every growth needed a new heap over the
     // whole stretch. A stretch that outgrew its heap gets room to grow into:

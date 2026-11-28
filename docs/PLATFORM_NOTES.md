@@ -798,6 +798,15 @@ Notes describe the platform, never a title.
   format 3), destination address at 8, destination size at 0x18, source (file object or memory address) at
   0x20, file offset at 0x28, source size at 0x30. Requests with bit 0 carry zlib streams (RFC 1950 headers
   seen), whose inflated size is the destination size.
+- *observed* (a title's loading): requests with bit 1 set and bit 0 clear (options 0x200002, 0x20000a,
+  0x20000e: bits 2-3 vary; 180 of them in the first 30 s of loading), sources smaller than their 64 KiB
+  destinations and no zlib header: another compression format, *assumed* the console's texture codec (64 KiB
+  texture tiles), which has no public description. They were read as plain data (compressed bytes where the
+  title expects texels); they now fail, with their status saying so, and are counted
+  (`dstorage.unsupported_format_requests`). The title carries on. Not implemented: that format.
+- *measured*: zlib requests whose streams inflate to exactly their destination's size failed when inflated in
+  place in title memory (invalid data; the decoder reads its output back) and succeeded into private memory: the
+  title then used the unwritten memory. Requests are now inflated into memory of the worker's and copied.
 - *assumed*: queue slots 5 `EnqueueSignal(fence, value)` and 6 `Submit()`, status array slots 3
   `IsComplete(index)` and 4 `GetHResult(index)`, in the desktop order (not yet called by titles).
 - Implementation: requests are carried out when enqueued (reads through the title's path translation, zlib

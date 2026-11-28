@@ -726,6 +726,17 @@ void test_fast_storage() {
   reinterpret_cast<SubmitFn>(q[6])(queue);
   check(wait_for(1) && reinterpret_cast<ResultFn>(st[4])(status, 1) == S_OK && std::memcmp(unpacked, "packed", 6) == 0,
         "fast storage inflates zlib requests");
+  // A request in the other compression format titles use (bit 1, not zlib;
+  // not implemented): its status reports the failure, and the destination is
+  // left as it was rather than given the compressed bytes.
+  char untouched[7] = "------";
+  const uint8_t other[] = {0x30, 0x30, 0x3C, 0x3E, 0x7A, 0xDD};
+  const std::vector<uint8_t> other_format = request((1ull << 22) | 2, untouched, 6, other, 0, sizeof(other));
+  reinterpret_cast<EnqueueFn>(q[3])(queue, other_format.data());
+  reinterpret_cast<StatusFn>(q[4])(queue, status, 0);
+  reinterpret_cast<SubmitFn>(q[6])(queue);
+  check(wait_for(0) && FAILED(reinterpret_cast<ResultFn>(st[4])(status, 0)) && std::memcmp(untouched, "------", 6) == 0,
+        "fast storage fails requests in a compression format it does not implement");
   reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(file))[2])(file);
 }
 

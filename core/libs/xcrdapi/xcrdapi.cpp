@@ -225,8 +225,16 @@ ULONG STDMETHODCALLTYPE queue_release(Queue* self) {
 // bit 0: set for the title's format 3, a zlib stream), destination
 // address at 8, destination size at 0x18, source at 0x20 (a file object, or
 // a memory address), file offset at 0x28, source size at 0x30.
+// Observed: requests with bit 1 set and bit 0 clear (options 0x200002,
+// 0x20000a, 0x20000e: bits 2-3 vary), whose sources are smaller than their
+// 64 KiB destinations and are not zlib streams: compressed in another format,
+// *assumed* the console's texture codec (the destinations are 64 KiB texture
+// tiles), which has no public description. Not implemented: such requests
+// fail (their status says so) and are counted, rather than leaving
+// compressed bytes where the title expects texels.
 constexpr uint64_t kSourceMemory = 1ull << 22;
 constexpr uint64_t kCompressed = 1ull;
+constexpr uint64_t kOtherFormat = 0xEull;
 
 HRESULT read_into(File* file, uint64_t offset, void* destination, uint32_t size) {
   // One event per thread, reused (requests come by the thousand).
@@ -350,6 +358,43 @@ HRESULT carry_out(const Operation& op) {
           static_cast<unsigned long long>(options), reinterpret_cast<void*>(destination), destination_size,
           reinterpret_cast<void*>(source), static_cast<unsigned long long>(offset), source_size);
   if (!destination || !source) return E_INVALIDARG;
+  {
+    // Each kind of request once (options, and whether the sizes match):
+    // what titles ask of the queue, for studying the options not established.
+    static std::mutex seen_lock;
+    static std::vector<uint64_t> seen;
+    const uint64_t kind = options | (destination_size == source_size ? 0 : (1ull << 63));
+    std::lock_guard<std::mutex> hold(seen_lock);
+    if (std::find(seen.begin(), seen.end(), kind) == seen.end() && seen.size() < 64) {
+      seen.push_back(kind);
+      uint8_t head[16] = {};
+      if (options & kSourceMemory) {
+        std::memcpy(head, reinterpret_cast<const void*>(source + offset), std::min<uint32_t>(16, source_size));
+      } else {
+        read_into(reinterpret_cast<File*>(source), offset, head, std::min<uint32_t>(16, source_size));
+      }
+      LIB_LOG(holy::lib::kInfo, "dstorage",
+              "first request of options 0x%llx: 0x%x bytes into 0x%x; source starts %02x %02x %02x %02x %02x %02x "
+              "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+              static_cast<unsigned long long>(options), source_size, destination_size, head[0], head[1], head[2],
+              head[3], head[4], head[5], head[6], head[7], head[8], head[9], head[10], head[11], head[12], head[13],
+              head[14], head[15]);
+    }
+  }
+  if (!(options & kCompressed) && (options & kOtherFormat)) {
+    static const holy::lib::Counter unsupported("dstorage.unsupported_format_requests");
+    unsupported.add(1);
+    static std::mutex logged_lock;
+    static std::vector<uint64_t> logged;
+    std::lock_guard<std::mutex> hold(logged_lock);
+    if (std::find(logged.begin(), logged.end(), options & 0xFF) == logged.end()) {
+      logged.push_back(options & 0xFF);
+      LIB_LOG(holy::lib::kError, "dstorage",
+              "request in a compression format not implemented (options 0x%llx, 0x%x bytes into 0x%x): failed",
+              static_cast<unsigned long long>(options), source_size, destination_size);
+    }
+    return E_NOTIMPL;
+  }
   if (options & kCompressed) {
     // Observed: the streams are zlib (RFC 1950) streams, inflated straight
     // into the destination.
@@ -362,16 +407,32 @@ HRESULT carry_out(const Operation& op) {
       stream = packed.data();
     }
     if (SUCCEEDED(hr)) {
-      HolyEnsureCommitted(reinterpret_cast<void*>(destination), destination_size);
-      HolyBeforeWrite(reinterpret_cast<void*>(destination), destination_size);
+      // Inflated into memory of this thread's, then copied: inflating reads
+      // its output back (matches, the checksum), and the destination is title
+      // memory that may not read back what was written (measured: requests
+      // whose streams inflate to exactly their destination's size failed in
+      // place, invalid data, and succeeded into private memory; the title then
+      // used the unwritten memory and crashed during loading).
+      thread_local std::vector<uint8_t> inflated;
+      if (inflated.size() < destination_size) inflated.resize(destination_size);
       size_t produced = 0;
-      if (!holy::lib::zlib_inflate_into(stream, source_size, reinterpret_cast<uint8_t*>(destination), destination_size,
-                                        &produced)) {
+      if (!holy::lib::zlib_inflate_into(stream, source_size, inflated.data(), destination_size, &produced)) {
         hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+      } else {
+        HolyEnsureCommitted(reinterpret_cast<void*>(destination), destination_size);
+        HolyBeforeWrite(reinterpret_cast<void*>(destination), destination_size);
+        std::memcpy(reinterpret_cast<void*>(destination), inflated.data(), produced);
       }
     }
     if (FAILED(hr)) {
-      LIB_LOG(holy::lib::kError, "dstorage", "compressed request failed (0x%08lX)", static_cast<unsigned long>(hr));
+      uint8_t head[8] = {};
+      if (!(options & kSourceMemory) || stream) std::memcpy(head, stream, std::min<size_t>(8, source_size));
+      LIB_LOG(holy::lib::kError, "dstorage",
+              "compressed request failed (0x%08lX): options 0x%llx, 0x%x bytes at 0x%llx into 0x%x; stream starts "
+              "%02x %02x %02x %02x %02x %02x %02x %02x",
+              static_cast<unsigned long>(hr), static_cast<unsigned long long>(options), source_size,
+              static_cast<unsigned long long>(offset), destination_size, head[0], head[1], head[2], head[3], head[4],
+              head[5], head[6], head[7]);
       return hr;
     }
     return S_OK;

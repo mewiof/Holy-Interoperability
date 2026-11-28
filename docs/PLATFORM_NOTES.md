@@ -1151,6 +1151,12 @@ Notes describe the platform, never a title.
 - *measured*: GPU heaps over physical-page storage were opened over 64 MiB blocks committed whole; titles map
   their page pools sparsely and this charged 7.5 GiB of commit by three and a half minutes of loading (the host's
   commit ran out). 8 MiB blocks: 2.1 GiB at the same point, 1,335 memory slots.
+- *measured* (open): host copies of textures grow past the title's own texture memory during loading (32,838
+  live, 7.5 GB, against 6 GB of committed physical pages; host video memory then exceeds a 12 GB card, pipeline
+  compiles fail for lack of memory and the device has been removed as hung). 11,988 of them (2.26 GB) were made
+  over memory another copy already covers: titles reuse texture memory for other textures, and the earlier
+  copies stay. Views rarely say which levels are resident (322 of 18,225 2D views start past level 0). Next:
+  retiring copies superseded at the same memory, safely for descriptors that still name them.
 - *observed*: command-list slot 129 is `DispatchMesh(x, y, z)` (34 x 1 x 1 seen in a title's loading). Not
   implemented: such dispatches are dropped and counted (`d3d12.mesh_dispatches_dropped`).
 - The graphics library detiles textures out of title memory into its host copies on the CPU (sample-title

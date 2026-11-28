@@ -22,6 +22,11 @@ much of the work toward that goal each area has, not test coverage.
 
 **Latest** (newest first):
 
+- Measured the memory problem behind late-loading failures: host copies of textures outgrow the title's own
+  texture memory (7.5 GB against 6 GB) because copies of memory the title reused for other textures stay alive
+  (2.3 GB of them); the 12 GB card overflows. Retiring superseded copies is next.
+- Unattended runs are robust to slow start-ups: scripted input counts from the title's first gamepad reading.
+
 - Loading reaches past five minutes. New console command-list methods: ExecuteIndirect (slot 61), a dispatch
   with console flags (80), a driver hint (101), texture and resource copies with flags (85, 86); mesh-shader
   dispatches (129) are counted and dropped until mesh programs are translated (the title's are NGG programs of
@@ -47,7 +52,7 @@ pie showData title Work toward the goal (rough estimate)
 | Performance at 30 FPS in game: detiling and codec on worker threads or the GPU, GPU reads of title memory, pipeline stalls | large |
 | Audio processor (decoding and mixing) | large |
 | Input and menus behaving | medium |
-| Memory within a 12 GB GPU and the host's commit | medium |
+| Memory within a 12 GB GPU and the host's commit: retire superseded texture copies, budget the rest | large |
 
 | Milestone (reference title) | State |
 | --- | --- |

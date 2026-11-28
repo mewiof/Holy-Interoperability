@@ -14,38 +14,35 @@ virtual machine and no separate runtime process.
 
 ## Progress
 
-_Last updated: 2026-11-27 (late night)._ The goal is a reference title running as smoothly as on the console: a correct
+_Last updated: 2026-11-28 (early morning)._ The goal is a reference title running as smoothly as on the console: a correct
 picture, sound and input at a stable 30 frames a second or better. The percentages are rough estimates of how
 much of the work toward that goal each area has, not test coverage.
 
-**Overall: about 50%** `██████████░░░░░░░░░░`
+**Overall: about 52%** `██████████▍░░░░░░░░░`
 
 **Latest** (newest first):
 
-- Textures in the console GPU's own memory layout: an implementation of the GPU family's surface addressing
-  (sizes, mip tails, swizzle patterns) that matches AMD's public address library on every element of 21 test
-  surfaces; the layout library, allocation sizes and texture uploads (detiled on the CPU) all follow it.
-- The console's texture codec for streamed tiles: a decoder written for this project; its constant tables are
-  not part of it and are supplied by the user (`HOLY_TEXTURE_CODEC_TABLES`). With them, every codec request of
-  the title's first minutes of loading decodes.
-- Loading runs past three and a half minutes: page-list destinations, the console's memory size, console copy
-  methods (command-list slots 85 and 86).
+- Loading reaches past five minutes. New console command-list methods: ExecuteIndirect (slot 61), a dispatch
+  with console flags (80), a driver hint (101), texture and resource copies with flags (85, 86); mesh-shader
+  dispatches (129) are counted and dropped until mesh programs are translated (the title's are NGG programs of
+  128 threads, already translated by the NGG path).
+- Memory: GPU heaps over the title's sparse page pools are opened over 8 MiB blocks instead of 64 MiB (7.5 GiB of
+  commit by 3.5 minutes of loading, now 2.1 GiB; the host's commit had run out).
 - Loading work spread out: fast-storage requests between two status entries run on a pool of threads; a texture
-  whose memory changes is refreshed only in the rows of blocks that changed, from reused upload memory (bytes
-  detiled during loading down about 8 times, measured).
-- Open now: mesh-shader dispatches (command-list slot 129, from about 3 minutes into loading) are counted and
-  dropped until mesh programs are translated; loading still runs at under 10 frames a second (profiling next);
-  one GPU page fault seen in the texture upload queue (diagnostics added).
+  whose memory changes is refreshed only in the rows of blocks that changed (bytes detiled down about 8 times).
+- Textures in the console GPU's own memory layout (sizes, mip tails, swizzle patterns; matches AMD's public address
+  library on every element of 21 test surfaces), detiled into the host copies; the console's texture codec for
+  streamed tiles (a decoder of this project's; its constant tables are user-supplied, `HOLY_TEXTURE_CODEC_TABLES`).
 
 ```mermaid
 pie showData title Work toward the goal (rough estimate)
-  "Done" : 50
-  "Left" : 50
+  "Done" : 52
+  "Left" : 48
 ```
 
 | What is left, in order | Share of the remaining work |
 | --- | --- |
-| Mesh-shader pipelines and dispatches; the rest of loading into the game world | large |
+| Mesh-shader dispatches through the NGG path; indirect work that changes root arguments; the rest of loading into the game world | large |
 | Picture correctness in 3D scenes (stencil clears, sRGB, missing symbols, GPU-written textures read back) | large |
 | Performance at 30 FPS in game: detiling and codec on worker threads or the GPU, GPU reads of title memory, pipeline stalls | large |
 | Audio processor (decoding and mixing) | large |

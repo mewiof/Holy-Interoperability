@@ -156,6 +156,7 @@ void rebind_package_module(HMODULE module) {
       if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old_protection)) continue;
       *slot = entry->hook;
       VirtualProtect(slot, sizeof(void*), old_protection, &old_protection);
+      LOG_DEBUG(kComponent, "  %s!%s interposed", library.name.c_str(), entry->symbol);
       ++rebound;
     }
   }

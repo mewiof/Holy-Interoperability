@@ -1081,3 +1081,10 @@ Notes describe the platform, never a title.
 - Implementation: a silent audio device. Shape contexts and the processor's memory are audio processor memory;
   connections, activations and commands are accepted and not carried out (nothing is decoded, mixed or played),
   so the audio processor never produces results. Other control processor slots report themselves.
+- *observed*: titles play their mixed audio through the desktop's audio stack: title code creates the host's
+  `MMDeviceEnumerator` (`CoCreateInstance` at start-up) and renders through WASAPI; the video library a title
+  ships imports `XAudio2Create` but never calls it when the title gives it its own sound driver. *measured*
+  (`holy run --record-audio`, tools/audio_report): with the audio processor silent, the sound of a video the
+  title plays reaches the host about two thirds of the time, broken 60 times a second (once per video frame):
+  the title's engine, which the processor normally paces and feeds, starves the stream. Not yet implemented:
+  the audio processor's decoding and mixing.

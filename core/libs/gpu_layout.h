@@ -98,6 +98,10 @@ uint64_t bytes_from(const Layout& layout, uint32_t first);
 // if the layout is not addressable or a buffer is too small.
 bool detile(const Layout& layout, const uint8_t* tiled, uint64_t tiled_size, uint32_t mip, uint32_t slice,
             uint8_t* rows, uint64_t row_pitch, uint64_t depth_pitch);
+// The same for the element rows [y0, y1) of the level only (row y0 at `rows`).
+bool detile_rows(const Layout& layout, const uint8_t* tiled, uint64_t tiled_size, uint32_t mip, uint32_t slice,
+                 uint32_t y0, uint32_t y1, uint8_t* rows, uint64_t row_pitch, uint64_t depth_pitch);
+
 // The reverse: rows into the layout (`tiled` at least the layout's size).
 bool tile(const Layout& layout, uint8_t* tiled, uint64_t tiled_size, uint32_t mip, uint32_t slice, const uint8_t* rows,
           uint64_t row_pitch, uint64_t depth_pitch);

@@ -18,6 +18,7 @@
 
 #include <intrin.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -277,21 +278,126 @@ HRESULT carry_out(const Operation& op);
 // worker reaches it; fences are signalled after the operations before them.
 // A queue whose enqueued operations reach its capacity submits them itself
 // (the desktop's behaviour).
+// Threads that carry out requests for every queue: requests between two
+// status or signal operations may complete in any order (the documented
+// model), so each such run is shared out (the texture codec and zlib cost
+// tens of milliseconds a megabyte on one thread).
+class Pool {
+ public:
+  static Pool& instance() {
+    static Pool* pool = new Pool();
+    return *pool;
+  }
+
+  // Carries out `count` requests, the calling thread taking part; returns
+  // the first failure among them (S_OK if none).
+  HRESULT run(const Operation* ops, size_t count) {
+    if (count == 1 || threads_ == 0) {
+      HRESULT first = S_OK;
+      for (size_t i = 0; i < count; ++i) {
+        const HRESULT hr = carry_out(ops[i]);
+        if (FAILED(hr) && SUCCEEDED(first)) first = hr;
+      }
+      return first;
+    }
+    Batch batch{ops, count};
+    {
+      std::lock_guard<std::mutex> hold(lock_);
+      batches_.push_back(&batch);
+    }
+    wake_.notify_all();
+    work(&batch);
+    {
+      std::unique_lock<std::mutex> hold(lock_);
+      // Pool threads that picked the batch may not have let go of it yet.
+      done_.wait(hold, [&batch] { return batch.finished.load() == batch.count && batch.users == 0; });
+      batches_.erase(std::find(batches_.begin(), batches_.end(), &batch));
+    }
+    return batch.failure.load();
+  }
+
+ private:
+  struct Batch {
+    const Operation* ops;
+    size_t count;
+    std::atomic<size_t> next{0}, finished{0};
+    std::atomic<HRESULT> failure{S_OK};
+    int users = 0;  // pool threads working on it (under lock_)
+  };
+
+  Pool() {
+    const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+    threads_ = std::min(8u, cores > 2 ? cores / 2 : 1u);
+    for (unsigned i = 0; i < threads_; ++i) std::thread([this] { loop(); }).detach();
+  }
+
+  void work(Batch* batch) {
+    for (size_t i; (i = batch->next.fetch_add(1)) < batch->count;) {
+      const HRESULT hr = carry_out(batch->ops[i]);
+      HRESULT ok = S_OK;
+      if (FAILED(hr)) batch->failure.compare_exchange_strong(ok, hr);
+      if (batch->finished.fetch_add(1) + 1 == batch->count) {
+        std::lock_guard<std::mutex> hold(lock_);
+        done_.notify_all();
+      }
+    }
+  }
+
+  void loop() {
+    for (;;) {
+      Batch* batch = nullptr;
+      {
+        std::unique_lock<std::mutex> hold(lock_);
+        wake_.wait(hold, [this, &batch] {
+          for (Batch* b : batches_) {
+            if (b->next.load() < b->count) {
+              batch = b;
+              ++b->users;
+              return true;
+            }
+          }
+          return false;
+        });
+      }
+      work(batch);
+      std::lock_guard<std::mutex> hold(lock_);
+      --batch->users;
+      done_.notify_all();
+    }
+  }
+
+  unsigned threads_ = 0;
+  std::mutex lock_;
+  std::condition_variable wake_, done_;
+  std::vector<Batch*> batches_;
+};
+
 void worker(Queue* queue) {
+  std::vector<Operation> run;
   for (;;) {
     Operation op;
+    run.clear();
     {
       std::unique_lock<std::mutex> hold(queue->lock);
       queue->ready.wait(hold, [queue] { return !queue->submitted.empty(); });
-      op = queue->submitted.front();
-      queue->submitted.pop_front();
+      // The requests up to the next status or signal, together.
+      while (!queue->submitted.empty() && queue->submitted.front().kind == Operation::kRequest && run.size() < 1024) {
+        run.push_back(queue->submitted.front());
+        queue->submitted.pop_front();
+      }
+      if (run.empty()) {
+        op = queue->submitted.front();
+        queue->submitted.pop_front();
+      }
+    }
+    if (!run.empty()) {
+      const HRESULT hr = Pool::instance().run(run.data(), run.size());
+      if (FAILED(hr) && SUCCEEDED(queue->error)) queue->error = hr;
+      continue;
     }
     switch (op.kind) {
-      case Operation::kRequest: {
-        const HRESULT hr = carry_out(op);
-        if (FAILED(hr) && SUCCEEDED(queue->error)) queue->error = hr;
+      case Operation::kRequest:
         break;
-      }
       case Operation::kStatus:
         op.array->entries[op.index].store(queue->error);
         queue->error = S_OK;

@@ -30,8 +30,12 @@ much of the work toward that goal each area has, not test coverage.
   the title's first minutes of loading decodes.
 - Loading runs past three and a half minutes: page-list destinations, the console's memory size, console copy
   methods (command-list slots 85 and 86).
-- Open now: an unimplemented command-list method at about 3.5 minutes into loading (slot 129, by its place the
-  mesh-shader dispatch); one GPU page fault seen in the texture upload queue (diagnostics added).
+- Loading work spread out: fast-storage requests between two status entries run on a pool of threads; a texture
+  whose memory changes is refreshed only in the rows of blocks that changed, from reused upload memory (bytes
+  detiled during loading down about 8 times, measured).
+- Open now: mesh-shader dispatches (command-list slot 129, from about 3 minutes into loading) are counted and
+  dropped until mesh programs are translated; loading still runs at under 10 frames a second (profiling next);
+  one GPU page fault seen in the texture upload queue (diagnostics added).
 
 ```mermaid
 pie showData title Work toward the goal (rough estimate)

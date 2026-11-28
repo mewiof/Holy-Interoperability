@@ -844,10 +844,11 @@ Notes describe the platform, never a title.
   tables of the tests' own.
 - *assumed*: queue slots 5 `EnqueueSignal(fence, value)` and 6 `Submit()`, status array slots 3
   `IsComplete(index)` and 4 `GetHResult(index)`, in the desktop order (not yet called by titles).
-- Implementation: requests are carried out when enqueued (reads through the title's path translation, zlib
-  inflated by the project's decoder straight into the destination, Adler-32 checked), so they complete earlier
-  than on the console; a status entry gets the first failure since the previous one. Partial: requests are
-  processed one at a time on the calling thread; other request kinds and queue slots report themselves.
+- Implementation: a queue carries out what was submitted on a worker of its own, in order; the requests between
+  two status or signal operations are shared out over a pool of threads (they may complete in any order), reads
+  through the title's path translation, zlib inflated by the project's decoder (Adler-32 checked) and the
+  texture codec into memory of the thread's, then delivered. A status entry gets the first failure since the
+  previous one. Other request kinds and queue slots report themselves.
 
 ## Graphics shaders
 
@@ -1138,9 +1139,12 @@ Notes describe the platform, never a title.
   the library's rule, also used when a description leaves the layout to the driver). The tiling query answers
   for 64 KiB layouts only (*assumed* as on the console). Allocation sizes (device slots 25 and 108) are the
   console layout's, at its alignment (4 KiB for 4 KiB layouts) unless more is asked.
+- *observed*: command-list slot 129 is `DispatchMesh(x, y, z)` (34 x 1 x 1 seen in a title's loading). Not
+  implemented: such dispatches are dropped and counted (`d3d12.mesh_dispatches_dropped`).
 - The graphics library detiles textures out of title memory into its host copies on the CPU (sample-title
-  check: a texel read at (5, 3) where only detiling finds it). Open: detiling on the GPU, and reading only the
-  levels a streamed texture has (its smaller levels lie first).
+  check: a texel read at (5, 3) where only detiling finds it); after the first fill only the rows of blocks the
+  title's writes reached are detiled again, into upload memory reused for every list. Open: detiling on the GPU,
+  and reading only the levels a streamed texture has (its smaller levels lie first).
 - *observed*: computers are not COM objects in the desktop's slot order. Titles release them through slot 1 (their
   wrappers' destructors, and after one-off queries) and call slot 2 with a structure to fill: room for 0x1b38
   bytes, a header of 0x18, then plane records of 0x6c8 bytes; titles copy one plane record out by plane index and

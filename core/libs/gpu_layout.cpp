@@ -334,15 +334,17 @@ namespace {
 
 // Copies one level of one slice between the layout and rows, in the
 // direction `to_rows` says.
-bool walk(const Layout& l, uint8_t* tiled, uint64_t tiled_size, uint32_t mip, uint32_t slice, uint8_t* rows,
-          uint64_t row_pitch, uint64_t depth_pitch, bool to_rows) {
+bool walk(const Layout& l, uint8_t* tiled, uint64_t tiled_size, uint32_t mip, uint32_t slice, uint32_t y0,
+          uint32_t y1, uint8_t* rows, uint64_t row_pitch, uint64_t depth_pitch, bool to_rows) {
   if (!l.addressable || mip >= l.surface.mips) return false;
   const Level& level = l.levels[mip];
   const bool is3d = l.surface.dimension == Dimension::k3D;
   if (is3d ? slice != 0 : slice >= l.slices) return false;
   const uint32_t element = 1u << l.surface.element_log2;
   const uint64_t row_bytes = static_cast<uint64_t>(level.width) * element;
-  if (row_pitch < row_bytes || (level.depth > 1 && depth_pitch < row_pitch * (level.height - 1) + row_bytes)) {
+  y1 = std::min(y1, level.height);
+  if (y0 >= y1) return false;
+  if (row_pitch < row_bytes || (level.depth > 1 && depth_pitch < row_pitch * (y1 - y0 - 1) + row_bytes)) {
     return false;
   }
   // Every address of the level lies below bytes_from (whole blocks).
@@ -372,9 +374,9 @@ bool walk(const Layout& l, uint8_t* tiled, uint64_t tiled_size, uint32_t mip, ui
   }
   for (uint32_t z = 0; z < (is3d ? level.depth : 1); ++z) {
     const uint32_t zc = is3d ? z : slice;
-    for (uint32_t y = 0; y < level.height; ++y) {
+    for (uint32_t y = y0; y < y1; ++y) {
       const uint64_t start = element_offset(l, mip, 0, y, zc);
-      uint8_t* out = rows + z * depth_pitch + y * row_pitch;
+      uint8_t* out = rows + z * depth_pitch + (y - y0) * row_pitch;
       if (to_rows) {
         for (const Run& run : runs) std::memcpy(out + run.linear, tiled + start + run.tiled, run.bytes);
       } else {
@@ -389,12 +391,17 @@ bool walk(const Layout& l, uint8_t* tiled, uint64_t tiled_size, uint32_t mip, ui
 
 bool detile(const Layout& l, const uint8_t* tiled, uint64_t tiled_size, uint32_t mip, uint32_t slice, uint8_t* rows,
             uint64_t row_pitch, uint64_t depth_pitch) {
-  return walk(l, const_cast<uint8_t*>(tiled), tiled_size, mip, slice, rows, row_pitch, depth_pitch, true);
+  return walk(l, const_cast<uint8_t*>(tiled), tiled_size, mip, slice, 0, ~0u, rows, row_pitch, depth_pitch, true);
+}
+
+bool detile_rows(const Layout& l, const uint8_t* tiled, uint64_t tiled_size, uint32_t mip, uint32_t slice, uint32_t y0,
+                 uint32_t y1, uint8_t* rows, uint64_t row_pitch, uint64_t depth_pitch) {
+  return walk(l, const_cast<uint8_t*>(tiled), tiled_size, mip, slice, y0, y1, rows, row_pitch, depth_pitch, true);
 }
 
 bool tile(const Layout& l, uint8_t* tiled, uint64_t tiled_size, uint32_t mip, uint32_t slice, const uint8_t* rows,
           uint64_t row_pitch, uint64_t depth_pitch) {
-  return walk(l, tiled, tiled_size, mip, slice, const_cast<uint8_t*>(rows), row_pitch, depth_pitch, false);
+  return walk(l, tiled, tiled_size, mip, slice, 0, ~0u, const_cast<uint8_t*>(rows), row_pitch, depth_pitch, false);
 }
 
 bool format_planes(uint32_t f, FormatPlanes* out) {

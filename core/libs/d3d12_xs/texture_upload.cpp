@@ -62,7 +62,18 @@ struct Uploader {
   HANDLE event = nullptr;
   std::atomic<uint64_t> value{0};
   std::vector<ID3D12Resource*> staging;  // released once the work submitted with them is done
+  // Upload memory reused for every list: mapped chunks of an upload heap,
+  // handed out in order and free again once the list's work is done.
+  struct Chunk {
+    ID3D12Resource* buffer;
+    uint8_t* cpu;
+  };
+  std::vector<Chunk> chunks;
+  size_t chunk = 0;
+  uint64_t used = 0;
 };
+
+constexpr uint64_t kChunkBytes = 32ull << 20;
 
 // A host texture views by address find: filled from title memory
 // (texture_at), or the host texture of a resource the title placed or
@@ -81,6 +92,10 @@ struct Record {
   bool protected_watch = false;  // its memory is watched by page protection (write_watch.h)
   bool tracked = false;          // its allocation's writes are tracked by the host
   bool dirty = false;
+  // What changed since the last fill, as byte spans from the texture's start;
+  // `whole`: all of it (or not known).
+  bool whole = true;
+  std::vector<std::pair<uint64_t, uint64_t>> spans;
 };
 
 // Allocations holding textures filled from their memory whose writes the host
@@ -197,8 +212,23 @@ bool allocation_of(uint64_t address, uint64_t* base, uint64_t* size, bool* watch
   return true;
 }
 
-void mark(Record* record) {
-  if (record->dirty || !record->texture || !record->from_memory) return;
+// Marks the bytes [begin, end) of title memory changed in `record`'s texture.
+void mark(Record* record, uint64_t begin, uint64_t end) {
+  if (!record->texture || !record->from_memory) return;
+  if (!record->whole) {
+    const uint64_t from = begin > record->address ? begin - record->address : 0;
+    const uint64_t to = std::min(end - record->address, record->size);
+    auto& spans = record->spans;
+    if (!spans.empty() && from <= spans.back().second && to >= spans.back().first) {
+      spans.back() = {std::min(spans.back().first, from), std::max(spans.back().second, to)};
+    } else if (spans.size() < 64) {
+      spans.emplace_back(from, to);
+    } else {
+      record->whole = true;  // too many pieces to be worth keeping apart
+      spans.clear();
+    }
+  }
+  if (record->dirty) return;
   record->dirty = true;
   g_dirty.push_back(record);
 }
@@ -208,7 +238,7 @@ void mark_range(uint64_t begin, uint64_t end) {
   auto it = textures().lower_bound(Key{begin > g_largest ? begin - g_largest : 0, 0, 0, 0, 0, 0, 0});
   for (; it != textures().end() && std::get<0>(it->first) < end; ++it) {
     Record* record = it->second;
-    if (record->from_memory && record->address + record->size > begin) mark(record);
+    if (record->from_memory && record->address + record->size > begin) mark(record, begin, end);
   }
 }
 
@@ -229,7 +259,9 @@ void scan_range(Tracked& allocation, uint64_t begin, uint64_t end) {
       const auto page = reinterpret_cast<uint64_t>(pages[i]);
       page_cache_written(page, granularity);  // the reset hides it from the page cache's own scan
       for (Record* record : allocation.records) {
-        if (record->address < page + granularity && page < record->address + record->size) mark(record);
+        if (record->address < page + granularity && page < record->address + record->size) {
+          mark(record, page, page + granularity);
+        }
       }
     }
     if (count < sizeof(pages) / sizeof(pages[0])) return;
@@ -406,6 +438,8 @@ void begin_upload(Uploader* up) {
   }
   for (ID3D12Resource* buffer : up->staging) buffer->Release();
   up->staging.clear();
+  up->chunk = 0;
+  up->used = 0;
   up->allocator->Reset();
   up->list->Reset(up->allocator, nullptr);
 }
@@ -507,61 +541,185 @@ ID3D12Resource* upload_buffer(Device* device, uint64_t size) {
   return buffer;
 }
 
-// Every subresource of a texture in the console's layout at `address`, into
-// `staging` as the desktop's footprints (lib::subresource_layout).
-bool detile_all(const gpu::Layout& layout, uint64_t address, uint64_t size, const lib::TextureShape& shape,
-                uint8_t* staging) {
-  const uint32_t count = lib::subresource_count(shape);
-  for (uint32_t index = 0; index < count; ++index) {
-    lib::SubresourceLayout footprint;
-    if (!lib::subresource_layout(shape, index, &footprint)) return false;
-    const uint32_t mip = index % shape.mips, slice = index / shape.mips;
-    if (!gpu::detile(layout, reinterpret_cast<const uint8_t*>(address), size, mip,
-                     shape.dimension == 4 ? 0 : slice, staging + footprint.offset, footprint.row_pitch,
-                     static_cast<uint64_t>(footprint.row_pitch) * footprint.rows)) {
+// Upload memory for `size` bytes (512-byte aligned) in the uploader's
+// chunks, or a buffer of its own when large; released with the list's work.
+bool upload_space(Device* device, Uploader* up, uint64_t size, ID3D12Resource** buffer, uint64_t* offset,
+                  uint8_t** cpu) {
+  size = lib::align_up(size, 512);
+  if (size > kChunkBytes / 4) {
+    ID3D12Resource* own = upload_buffer(device, size);
+    void* mapped = nullptr;
+    if (!own || FAILED(own->Map(0, nullptr, &mapped))) {
+      if (own) own->Release();
       return false;
     }
+    own->SetName(L"holy large texture staging");
+    up->staging.push_back(own);
+    *buffer = own;
+    *offset = 0;
+    *cpu = static_cast<uint8_t*>(mapped);
+    return true;
   }
+  if (up->chunk < up->chunks.size() && up->used + size > kChunkBytes) {
+    ++up->chunk;
+    up->used = 0;
+  }
+  if (up->chunk == up->chunks.size()) {
+    ID3D12Resource* made = upload_buffer(device, kChunkBytes);
+    void* mapped = nullptr;
+    if (!made || FAILED(made->Map(0, nullptr, &mapped))) {
+      if (made) made->Release();
+      return false;
+    }
+    made->SetName(L"holy texture upload memory");
+    up->chunks.push_back({made, static_cast<uint8_t*>(mapped)});
+  }
+  *buffer = up->chunks[up->chunk].buffer;
+  *offset = up->used;
+  *cpu = up->chunks[up->chunk].cpu + up->used;
+  up->used += size;
   return true;
 }
 
-// detile_all, false when the title memory cannot be read (the access faults;
-// memory committed on first touch is committed by the runtime's handler
-// first). No C++ objects here (structured exception handling); the call is
-// opaque so the handler stays around it.
-bool (*volatile g_detile_all)(const gpu::Layout&, uint64_t, uint64_t, const lib::TextureShape&, uint8_t*) =
-    &detile_all;
-bool detile_title_memory(const gpu::Layout& layout, uint64_t address, uint64_t size, const lib::TextureShape& shape,
-                         uint8_t* staging) {
+// Rows [y0, y1) of one subresource of a texture in the console's layout at
+// `address`, into `out` (gpu::detile_rows); false when the title memory
+// cannot be read (the access faults; memory committed on first touch is
+// committed by the runtime's handler first). No C++ objects here
+// (structured exception handling); the call is opaque so the handler stays
+// around it.
+bool (*volatile g_detile_rows)(const gpu::Layout&, const uint8_t*, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                               uint8_t*, uint64_t, uint64_t) = &gpu::detile_rows;
+bool detile_title_rows(const gpu::Layout& layout, uint64_t address, uint64_t size, uint32_t mip, uint32_t slice,
+                       uint32_t y0, uint32_t y1, uint8_t* out, uint64_t row_pitch, uint64_t depth_pitch) {
   __try {
-    return g_detile_all(layout, address, size, shape, staging);
+    return g_detile_rows(layout, reinterpret_cast<const uint8_t*>(address), size, mip, slice, y0, y1, out, row_pitch,
+                         depth_pitch);
   } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
                                                                : EXCEPTION_CONTINUE_SEARCH) {
     return false;
   }
 }
 
-// An upload buffer holding the texture at `address` (in the console's
-// layout) as the desktop's footprints.
-ID3D12Resource* detiled_copy(Device* device, const gpu::Texture& t, uint64_t address, const lib::TextureShape& shape) {
-  const uint64_t footprints = lib::texture_size(shape);
-  if (!footprints) return nullptr;
-  ID3D12Resource* buffer = upload_buffer(device, footprints);
-  if (!buffer) return nullptr;
-  void* mapped = nullptr;
-  if (FAILED(buffer->Map(0, nullptr, &mapped))) {
-    buffer->Release();
-    return nullptr;
+// The element rows of level `mip`, array slice `slice` that the record's
+// changed spans reach, as [*y0, *y1); false if none. Rows of whole blocks
+// (a block is a run of rows in a level); levels in the mip tail, linear
+// levels' partial rows and 3D textures are taken whole.
+bool changed_rows(const Record& record, const gpu::Layout& l, uint32_t mip, uint32_t slice, uint32_t* y0,
+                  uint32_t* y1) {
+  const gpu::Level& level = l.levels[mip];
+  if (record.whole || l.surface.dimension == gpu::Dimension::k3D) {
+    *y0 = 0;
+    *y1 = level.height;
+    return record.whole || !record.spans.empty();
   }
-  const bool copied = detile_title_memory(t.planes[0], address, t.size, shape, static_cast<uint8_t*>(mapped));
-  buffer->Unmap(0, nullptr);
-  if (!copied) {
-    buffer->Release();
-    return nullptr;
+  const uint64_t slice_base = static_cast<uint64_t>(slice) * l.slice_size;
+  const uint64_t element = 1ull << l.surface.element_log2;
+  const uint64_t start = slice_base + level.offset;
+  const uint64_t end = level.in_tail ? slice_base + l.alignment
+                                     : start + static_cast<uint64_t>(level.pitch) * level.rows * element;
+  bool any = false;
+  uint32_t first = level.height, last = 0;
+  for (const auto& [from, to] : record.spans) {
+    const uint64_t b = std::max(from, start), e = std::min(to, end);
+    if (b >= e) continue;
+    any = true;
+    if (level.in_tail) {
+      first = 0;
+      last = level.height;
+      break;
+    }
+    uint64_t row_b, row_e;  // element rows the bytes [b, e) cover
+    if (l.block_log2 == 0) {
+      const uint64_t row_bytes = static_cast<uint64_t>(level.pitch) * element;
+      row_b = (b - start) / row_bytes;
+      row_e = (e - 1 - start) / row_bytes + 1;
+    } else {
+      const uint64_t per_row = std::max<uint64_t>(1, level.pitch / l.block_w);
+      row_b = ((b - start) >> l.block_log2) / per_row * l.block_h;
+      row_e = (((e - 1 - start) >> l.block_log2) / per_row + 1) * l.block_h;
+    }
+    first = std::min<uint32_t>(first, static_cast<uint32_t>(row_b));
+    last = std::max<uint32_t>(last, static_cast<uint32_t>(std::min<uint64_t>(row_e, level.height)));
   }
+  if (!any || first >= last) return false;
+  *y0 = first;
+  *y1 = last;
+  return true;
+}
+
+// Records the copies filling `texture` from a texture in the console's
+// layout: the subresource rows that changed (all of them when `first` or
+// unknown), detiled by the CPU into upload memory first; no command is
+// recorded unless every part could be read. False when none could be.
+bool record_tiled_fill(Device* device, Uploader* up, const Record& record, const gpu::Texture& console,
+                       ID3D12Resource* texture, bool first) {
+  const lib::TextureShape shape = shape_of(record.desc);
+  const gpu::Layout& l = console.planes[0];
+  const lib::FormatInfo f = lib::format_info(shape.format);
+  if (!f.block_bytes) return false;
+  struct Part {
+    uint32_t index, mip, y0, y1, depth, row_pitch;
+    ID3D12Resource* buffer;
+    uint64_t offset;
+  };
+  thread_local std::vector<Part> parts;
+  parts.clear();
+  const uint32_t count = lib::subresource_count(shape);
+  const bool is3d = shape.dimension == 4;
+  uint64_t bytes = 0;
+  for (uint32_t index = 0; index < count; ++index) {
+    const uint32_t mip = index % shape.mips, slice = index / shape.mips;
+    if (mip >= l.surface.mips) continue;
+    uint32_t y0 = 0, y1 = 0;
+    if (first) {
+      y1 = l.levels[mip].height;
+    } else if (!changed_rows(record, l, mip, is3d ? 0 : slice, &y0, &y1)) {
+      continue;
+    }
+    const gpu::Level& level = l.levels[mip];
+    Part part{index, mip, y0, y1, is3d ? level.depth : 1u,
+              static_cast<uint32_t>(lib::align_up(static_cast<uint64_t>(level.width) * f.block_bytes, 256)), nullptr, 0};
+    const uint64_t size = static_cast<uint64_t>(part.row_pitch) * (y1 - y0) * part.depth;
+    uint8_t* cpu = nullptr;
+    if (!upload_space(device, up, size, &part.buffer, &part.offset, &cpu) ||
+        !detile_title_rows(l, record.address, console.size, mip, is3d ? 0 : slice, y0, y1, cpu, part.row_pitch,
+                           static_cast<uint64_t>(part.row_pitch) * (y1 - y0))) {
+      return false;
+    }
+    bytes += size;
+    parts.push_back(part);
+  }
+  if (parts.empty()) return !first;
   c_detiled().add(1);
-  c_detiled_bytes().add(static_cast<int64_t>(footprints));
-  return buffer;
+  c_detiled_bytes().add(static_cast<int64_t>(bytes));
+  D3D12_RESOURCE_BARRIER barrier{};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = texture;
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barrier.Transition.StateBefore = record.rest;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  if (!first) up->list->ResourceBarrier(1, &barrier);
+  for (const Part& part : parts) {
+    const uint32_t texel_height = std::max(1u, shape.height >> part.mip);
+    const uint32_t top = part.y0 * f.block_size;
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = part.buffer;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint.Offset = part.offset;
+    source.PlacedFootprint.Footprint.Format = record.desc.Format;
+    source.PlacedFootprint.Footprint.Width = static_cast<UINT>(std::max<uint64_t>(1, shape.width >> part.mip));
+    source.PlacedFootprint.Footprint.Height = std::min(part.y1 * f.block_size, texel_height) - top;
+    source.PlacedFootprint.Footprint.Depth = part.depth;
+    source.PlacedFootprint.Footprint.RowPitch = part.row_pitch;
+    D3D12_TEXTURE_COPY_LOCATION target{};
+    target.pResource = texture;
+    target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    target.SubresourceIndex = part.index;
+    up->list->CopyTextureRegion(&target, 0, top, 0, &source, nullptr);
+  }
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  up->list->ResourceBarrier(1, &barrier);
+  return true;
 }
 
 // An upload buffer holding a copy of `size` bytes of title memory.
@@ -601,13 +759,19 @@ bool record_fill(Device* device, Uploader* up, const Record& record, ID3D12Resou
   // desktop's footprints on the way.
   gpu::Texture console;
   const bool tiled = console_layout(record.desc, &console);
-  const bool located = !tiled && locate(device, record.address, &backing, record.size);
-  bool is_readable = false;
   if (tiled) {
-    source_buffer = detiled_copy(device, console, record.address, shape);
-    is_readable = source_buffer != nullptr;
-    if (source_buffer) up->staging.push_back(source_buffer);
-  } else if (located && backing.whole && backing.contiguous >= record.size) {
+    if (record_tiled_fill(device, up, record, console, texture, first)) return true;
+    if (first) {
+      LIB_LOG(lib::kError, "d3d12", "texture dim %u %llux%ux%u, %u mips, format %u at %p (0x%llx bytes): no copy (its "
+              "memory cannot be read)", shape.dimension, static_cast<unsigned long long>(shape.width), shape.height,
+              shape.depth_or_array, shape.mips, shape.format, reinterpret_cast<void*>(record.address),
+              static_cast<unsigned long long>(record.size));
+    }
+    return false;
+  }
+  const bool located = locate(device, record.address, &backing, record.size);
+  bool is_readable = false;
+  if (located && backing.whole && backing.contiguous >= record.size) {
     source_buffer = backing.whole;
     source_offset = backing.heap_offset;
   } else {
@@ -739,6 +903,7 @@ ID3D12Resource* memory_texture(Device* device, const D3D12_RESOURCE_DESC& desc, 
     up->list->ResourceBarrier(1, &barrier);
   }
   record->texture = texture;
+  record->whole = false;  // changes from now on are tracked by span
   const uint64_t value = submit_upload(up);
   up->fence->SetEventOnCompletion(value, up->event);
   WaitForSingleObject(up->event, INFINITE);
@@ -798,6 +963,7 @@ ID3D12Resource* placed_texture(Device* device, const D3D12_RESOURCE_DESC& desc, 
   if (FAILED(hr)) return nullptr;
   auto* record = new Record();
   record->texture = texture;
+  record->whole = false;  // changes from now on are tracked by span
   record->address = address;
   record->desc = desc;
   std::lock_guard<std::mutex> guard(g_lock);
@@ -812,6 +978,7 @@ void register_texture(const D3D12_RESOURCE_DESC& desc, uint64_t address, ID3D12R
   texture->AddRef();
   auto* record = new Record();
   record->texture = texture;
+  record->whole = false;  // changes from now on are tracked by span
   record->address = address;
   record->desc = desc;
   std::lock_guard<std::mutex> guard(g_lock);
@@ -910,6 +1077,7 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
     up->list->ResourceBarrier(1, &barrier);
   }
   record->texture = texture;
+  record->whole = false;  // changes from now on are tracked by span
   const uint64_t value = submit_upload(up);
   up->fence->SetEventOnCompletion(value, up->event);
   WaitForSingleObject(up->event, INFINITE);
@@ -956,6 +1124,8 @@ void refresh_textures(Device* device, ID3D12CommandQueue* queue) {
     if (record->protected_watch) watch_memory(record->address, record->size, reinterpret_cast<WatchToken>(record));
     track(record);
     if (record_fill(device, up, *record, record->texture, false)) ++refreshed;
+    record->whole = false;
+    record->spans.clear();
   }
   const uint64_t value = submit_upload(up);
   // Work submitted after this on the title's queue sees the new contents.

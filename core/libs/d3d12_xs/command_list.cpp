@@ -31,6 +31,7 @@
 #include "core/libs/d3d12_xs/texture_dump.h"
 #include "core/libs/d3d12_xs/texture_upload.h"
 #include "core/libs/d3d12_xs/views.h"
+#include "core/libs/d3d12_xs/pipeline_cache.h"
 #include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/support.h"
 
@@ -39,7 +40,7 @@ namespace {
 
 // Recorded work, for recorded_work_summary.
 struct WorkCounts {
-  std::atomic<uint64_t> draws{0}, indexed{0}, ngg{0}, dispatches{0}, no_pipeline{0}, unbound{0};
+  std::atomic<uint64_t> draws{0}, indexed{0}, ngg{0}, dispatches{0}, no_pipeline{0}, unbound{0}, mesh{0};
   std::atomic<uint64_t> clears{0}, depth_clears{0}, nonblack_clears{0};
 };
 WorkCounts g_work;
@@ -1079,6 +1080,26 @@ void STDMETHODCALLTYPE list_dispatch(CommandList* self, UINT x, UINT y, UINT z) 
   self->host->Dispatch(x, y, z);
 }
 
+// Observed: slot 129 DispatchMesh(x, y, z), the desktop's mesh-program
+// dispatch (34 x 1 x 1 seen during a title's loading). Not implemented yet:
+// the dispatch is dropped and counted (d3d12.mesh_dispatches_dropped, and in
+// each frame's work summary), the first ones logged with their pipeline.
+void STDMETHODCALLTYPE list_dispatch_mesh(CommandList* self, UINT x, UINT y, UINT z) {
+  static const lib::Counter dropped("d3d12.mesh_dispatches_dropped");
+  dropped.add(1);
+  g_work.mesh.fetch_add(1, std::memory_order_relaxed);
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 8) {
+    const Pipeline* pipeline = as_pipeline(self->pipeline);
+    LIB_LOG(lib::kError, "d3d12",
+            "mesh dispatch %u x %u x %u with pipeline %p (content key %016llx, NGG group %u, record stride %u): not "
+            "implemented, dropped",
+            x, y, z, self->pipeline,
+            static_cast<unsigned long long>(pipeline && pipeline->recipe ? pipeline->recipe->key : 0),
+            pipeline ? pipeline->ngg.group : 0, pipeline ? pipeline->ngg.stride : 0);
+  }
+}
+
 // Observed (call shapes): slot 85 CopyTextureRegionX and slot 86
 // CopyResourceX take the desktop CopyTextureRegion and CopyResource
 // arguments and a trailing flags word (0 seen); the copies are the same.
@@ -1135,6 +1156,7 @@ const auto kListVtable = [] {
   HOLY_D3D_SLOT(table, kCommandListObject, 62, list_copy_memory_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 85, list_copy_texture_region_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 86, list_copy_resource_x);
+  HOLY_D3D_SLOT(table, kCommandListObject, 129, list_dispatch_mesh);
   HOLY_D3D_SLOT(table, kCommandListObject, 71, list_write_value_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 72, list_write_timestamp_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 74, list_write_fence_value_x);
@@ -1152,13 +1174,13 @@ std::string recorded_work_summary() {
   auto take = [](std::atomic<uint64_t>& counter) {
     return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed));
   };
-  char text[256];
+  char text[320];
   std::snprintf(text, sizeof(text),
                 "%llu draws (%llu NGG), %llu indexed draws, %llu dispatches, %llu colour clears (%llu not black), "
-                "%llu depth clears; dropped: %llu without a host pipeline, %llu unbound",
+                "%llu depth clears; dropped: %llu without a host pipeline, %llu unbound, %llu mesh dispatches",
                 take(g_work.draws), take(g_work.ngg), take(g_work.indexed), take(g_work.dispatches),
                 take(g_work.clears), take(g_work.nonblack_clears), take(g_work.depth_clears),
-                take(g_work.no_pipeline), take(g_work.unbound));
+                take(g_work.no_pipeline), take(g_work.unbound), take(g_work.mesh));
   return text;
 }
 

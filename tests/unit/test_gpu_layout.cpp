@@ -214,3 +214,18 @@ TEST(gpu_layout_textures) {
   EXPECT(t.plane_count == 1 && t.planes[0].surface.mips == 10 && t.alignment == 4096);
   EXPECT(!make_texture(Dimension::k3D, 16, 16, 16, 1, 28, 1, k256D, &t));  // 3D cannot use 256-byte blocks
 }
+
+// A range of rows detiles as the same rows of the whole level.
+TEST(gpu_layout_row_ranges) {
+  Layout l;
+  EXPECT(make_layout(surface(Dimension::k2D, k4KS, 16, 4, 520, 300, 1, 3), &l));
+  std::vector<uint8_t> tiled(l.size);
+  for (size_t i = 0; i < tiled.size(); ++i) tiled[i] = static_cast<uint8_t>(i * 7 + (i >> 12));
+  const Level& level = l.levels[0];
+  const uint64_t pitch = static_cast<uint64_t>(level.width) * 16;
+  std::vector<uint8_t> all(pitch * level.height), part(pitch * 20);
+  EXPECT(detile(l, tiled.data(), tiled.size(), 0, 0, all.data(), pitch, all.size()));
+  EXPECT(detile_rows(l, tiled.data(), tiled.size(), 0, 0, 30, 50, part.data(), pitch, part.size()));
+  EXPECT(std::memcmp(part.data(), all.data() + 30 * pitch, part.size()) == 0);
+  EXPECT(!detile_rows(l, tiled.data(), tiled.size(), 0, 0, 80, 80, part.data(), pitch, part.size()));  // empty
+}

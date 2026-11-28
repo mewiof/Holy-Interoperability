@@ -796,6 +796,22 @@ void test_fast_storage() {
           "fast storage writes into the physical pages a destination list names");
     XMemMapPhysicalPages(shown, 2, nullptr);
   }
+  // Many requests before one status, carried out together (in any order):
+  // every destination gets its bytes and the status the run's result.
+  {
+    constexpr int kMany = 64;
+    std::vector<char> many(kMany * 8, 0);
+    std::vector<std::vector<uint8_t>> requests;
+    for (int i = 0; i < kMany; ++i) {
+      requests.push_back(request((1ull << 22) | 1, many.data() + i * 8, 6, packed, 0, sizeof(packed)));
+      reinterpret_cast<EnqueueFn>(q[3])(queue, requests.back().data());
+    }
+    reinterpret_cast<StatusFn>(q[4])(queue, status, 1);
+    reinterpret_cast<SubmitFn>(q[6])(queue);
+    bool all = wait_for(1) && reinterpret_cast<ResultFn>(st[4])(status, 1) == S_OK;
+    for (int i = 0; i < kMany; ++i) all = all && std::memcmp(many.data() + i * 8, "packed", 6) == 0;
+    check(all, "fast storage carries out many requests before a status together");
+  }
   // A request in the other compression format titles use (bit 1, not zlib;
   // not implemented): its status reports the failure, and the destination is
   // left as it was rather than given the compressed bytes.

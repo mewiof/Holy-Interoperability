@@ -1172,6 +1172,8 @@ Notes describe the platform, never a title.
   page fault at address 0 (no breadcrumbs captured); seen in most runs past three minutes, about 8 s after the
   dropped mesh dispatches (lead: later GPU work depends on what they would have written). Vertex and index
   buffers whose memory is not located are now bound empty (they were bound with their size at address 0).
+  Running the mesh dispatches through the NGG path instead (`HOLY_MESH_AS_NGG=1`) did not avoid it (removed at
+  178 s): not confirmed.
 - *observed*: command-list slot 129 is `DispatchMesh(x, y, z)` (34 x 1 x 1 seen in a title's loading). Not
   implemented: such dispatches are dropped and counted (`d3d12.mesh_dispatches_dropped`).
 - The graphics library detiles textures out of title memory into its host copies on the CPU (sample-title

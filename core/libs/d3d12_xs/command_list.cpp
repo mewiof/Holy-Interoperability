@@ -1181,6 +1181,22 @@ void STDMETHODCALLTYPE list_execute_indirect(CommandList* self, void* signature,
 // the dispatch is dropped and counted (d3d12.mesh_dispatches_dropped, and in
 // each frame's work summary), the first ones logged with their pipeline.
 void STDMETHODCALLTYPE list_dispatch_mesh(CommandList* self, UINT x, UINT y, UINT z) {
+  // HOLY_MESH_AS_NGG=1 (experimental): through the NGG path, one NGG group of
+  // the program per mesh workgroup; the program's inputs are not checked yet.
+  static const bool as_ngg = GetEnvironmentVariableW(L"HOLY_MESH_AS_NGG", nullptr, 0) > 0;
+  NggPipeline ngg;
+  if (as_ngg && self->pipeline && self->translated && ngg_pipeline(self->pipeline, &ngg) && ngg.info.group) {
+    static const lib::Counter run("d3d12.mesh_dispatches_as_ngg");
+    run.add(1);
+    mark_work(self);
+    const uint64_t groups = static_cast<uint64_t>(x) * y * z;
+    if (groups && groups * ngg.info.group < 0x7FFFFFFF &&
+        !draw_ngg(self, ngg, static_cast<UINT>(groups * ngg.info.group), 1, 0, 0)) {
+      report_unbound("a mesh dispatch");
+    }
+    self->bound = nullptr;  // the NGG passes set their own pipelines
+    return;
+  }
   static const lib::Counter dropped("d3d12.mesh_dispatches_dropped");
   dropped.add(1);
   g_work.mesh.fetch_add(1, std::memory_order_relaxed);

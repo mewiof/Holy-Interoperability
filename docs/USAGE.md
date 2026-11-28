@@ -77,6 +77,7 @@ Debugging aids, set in the environment:
 | `HOLY_XMEM_TRACE=1` | every physical page mapping and unmapping, title memory reservation and large allocation in the log |
 | `HOLY_XG_TRACE=1` | the tiling the texture layout library reports to titles, in the log |
 | `HOLY_TEXTURE_CODEC_TABLES=<file>` | the console texture codec's constant tables (77,982 bytes), which this project does not ship; also read from `texture-codec-tables.bin` next to the `titles` data directory. Without them streamed texture tiles stay empty and their requests fail |
+| `HOLY_MESH_AS_NGG=1` | experimental: mesh dispatches run through the NGG path (one NGG group per mesh workgroup; inputs not checked) instead of being dropped |
 | `HOLY_TEXTURE_DETILE=0` | read textures in title memory as desktop footprints instead of detiling them from the console GPU's layout (for comparisons) |
 | `HOLY_CONSOLE_SIZES=0` | report the host's texture sizes to titles instead of the console layout's (for comparisons) |
 | `HOLY_TRACE_DUMP=<symbol>:<argument>:<bytes>` | with `--trace`, a traced call of `symbol` also logs `bytes` (up to 1024) of the memory its register argument `argument` (0-3) points to |

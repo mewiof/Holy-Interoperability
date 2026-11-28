@@ -1163,7 +1163,13 @@ Notes describe the platform, never a title.
   removal.
 - Host copies of new textures are uploaded with the title's next submission (which waits for them) instead of
   each view creation waiting for the GPU. Measured during loading: the GPU's 3D engine about 29% busy, pipeline
-  waits 0; loading runs at under 10 frames a second for other reasons (open).
+  waits 0, no asynchronous operation over 1 s; the time went to this project's texture work on the title's
+  threads: 8.9 s of every 10 s refreshing copies at submissions (6-7 s of it asking the host for written pages
+  of the tracked texture memory every 16 ms) and 7.4 s making copies at view creation (mostly waiting for the
+  same lock). The scan now waits ten times its own duration before the next (at least 16 ms) and finds the
+  copies over a written page through the address index: loading runs at 6-22 frames a second (was 2-8).
+- *observed* (open): during loading the host device is removed as hung, with device-removed data showing a GPU
+  page fault at address 0 (no breadcrumbs captured); seen in most runs past three minutes.
 - *observed*: command-list slot 129 is `DispatchMesh(x, y, z)` (34 x 1 x 1 seen in a title's loading). Not
   implemented: such dispatches are dropped and counted (`d3d12.mesh_dispatches_dropped`).
 - The graphics library detiles textures out of title memory into its host copies on the CPU (sample-title

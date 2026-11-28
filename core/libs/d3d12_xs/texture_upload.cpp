@@ -26,6 +26,24 @@ namespace {
 
 namespace gpu = lib::gpu;
 
+// Microseconds the title's threads spend in this file's work (measurement).
+struct TimeIn {
+  const lib::Counter& counter;
+  LARGE_INTEGER start;
+  explicit TimeIn(const lib::Counter& c) : counter(c) { QueryPerformanceCounter(&start); }
+  ~TimeIn() {
+    static const int64_t frequency = [] {
+      LARGE_INTEGER f;
+      QueryPerformanceFrequency(&f);
+      return f.QuadPart;
+    }();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    counter.add((now.QuadPart - start.QuadPart) * 1000000 / frequency);
+  }
+};
+
+
 // The layout a texture has in title memory: the console GPU's
 // (gpu_layout.h), as the layout library reports it to titles and titles
 // stream textures in. False where it does not cover the description (formats
@@ -257,7 +275,7 @@ void mark_range(uint64_t begin, uint64_t end) {
 // Asks the host which pages of [begin, end) in a tracked allocation were
 // written since they were last asked about, and marks the textures over them
 // (g_lock held).
-void scan_range(Tracked& allocation, uint64_t begin, uint64_t end) {
+void scan_range(uint64_t begin, uint64_t end) {
   static void* pages[4096];
   begin &= ~0xFFFull;
   for (;;) {
@@ -270,11 +288,11 @@ void scan_range(Tracked& allocation, uint64_t begin, uint64_t end) {
     for (ULONG_PTR i = 0; i < count; ++i) {
       const auto page = reinterpret_cast<uint64_t>(pages[i]);
       page_cache_written(page, granularity);  // the reset hides it from the page cache's own scan
-      for (Record* record : allocation.records) {
-        if (record->address < page + granularity && page < record->address + record->size) {
-          mark(record, page, page + granularity);
-        }
-      }
+      // The records over the page, from the address-ordered index (a walk
+      // of the allocation's records per page was quadratic: tens of
+      // thousands of texture copies in one pool, measured at most of the
+      // submission thread's time during loading).
+      mark_range(page, page + granularity);
     }
     if (count < sizeof(pages) / sizeof(pages[0])) return;
   }
@@ -345,9 +363,19 @@ void apply_changes() {
 void scan() {
   apply_changes();
   release_retired();
+  // Asking the host which pages were written costs time in proportion to the
+  // memory asked about (measured: 6.8 s of every 10 s on the submitting
+  // thread during a title's loading, with copies over a large texture pool
+  // scanned every 16 ms): the next scan waits ten times as long as this one
+  // took, at least 16 ms, so scanning takes at most a tenth of the time.
+  static uint64_t interval_ms = 16;
   const ULONGLONG now = GetTickCount64();
-  if (now - g_last_scan < 16) return;
+  if (now - g_last_scan < interval_ms) return;
   g_last_scan = now;
+  struct Interval {
+    ULONGLONG started;
+    ~Interval() { interval_ms = std::max<uint64_t>(16, (GetTickCount64() - started) * 10); }
+  } adapt{now};
   std::vector<std::pair<uint64_t, uint64_t>> stretches;
   for (auto& [base, allocation] : tracked()) {
     if (allocation.records.empty()) continue;
@@ -361,11 +389,11 @@ void scan() {
         last = std::max(last, stretches[i].second);
         continue;
       }
-      scan_range(allocation, first, last);
+      scan_range(first, last);
       first = stretches[i].first;
       last = stretches[i].second;
     }
-    scan_range(allocation, first, last);
+    scan_range(first, last);
   }
 }
 
@@ -382,7 +410,7 @@ void track(Record* record) {
     Tracked& allocation = tracked()[base];
     allocation.size = allocation_size;
     // Writes to its pages so far go to the textures already there.
-    scan_range(allocation, record->address, record->address + record->size);
+    scan_range(record->address, record->address + record->size);
     allocation.records.push_back(record);
     record->tracked = true;
   } else if (mapped && watch_memory(record->address, record->size, reinterpret_cast<WatchToken>(record))) {
@@ -823,6 +851,8 @@ ID3D12Resource* staged_copy(Device* device, uint64_t address, uint64_t size) {
 // copy-destination state); otherwise it is a shader resource. False (logged
 // for new textures) when the memory cannot be read.
 bool record_fill(Device* device, Uploader* up, const Record& record, ID3D12Resource* texture, bool first) {
+  static const lib::Counter filling("d3d12.texture_fill_us");
+  const TimeIn timing_fill(filling);
   const lib::TextureShape shape = shape_of(record.desc);
   Backing backing;
   ID3D12Resource* source_buffer = nullptr;
@@ -1069,6 +1099,18 @@ void unregister_texture(const D3D12_RESOURCE_DESC& desc, uint64_t address, ID3D1
 }
 
 ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address) {
+  static const lib::Counter spent("d3d12.texture_view_copy_us");
+  LARGE_INTEGER started;
+  QueryPerformanceCounter(&started);
+  struct Done {
+    LARGE_INTEGER started;
+    ~Done() {
+      LARGE_INTEGER now, f;
+      QueryPerformanceCounter(&now);
+      QueryPerformanceFrequency(&f);
+      spent.add((now.QuadPart - started.QuadPart) * 1000000 / f.QuadPart);
+    }
+  } done{started};
   const lib::TextureShape shape = shape_of(desc);
   const Key key = key_of(address, shape);
 
@@ -1134,8 +1176,13 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   D3D12_HEAP_PROPERTIES heap{};
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   ID3D12Resource* texture = nullptr;
-  HRESULT hr = device->host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &host_desc,
-                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture));
+  HRESULT hr;
+  {
+    static const lib::Counter creating("d3d12.texture_create_us");
+    const TimeIn timing_create(creating);
+    hr = device->host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &host_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                               nullptr, IID_PPV_ARGS(&texture));
+  }
   if (SUCCEEDED(hr)) texture->SetName(L"holy texture viewed in title memory");
   if (FAILED(hr)) {
     LIB_LOG(lib::kError, "d3d12", "host texture of format %u %llux%u refused (0x%08lX)", shape.format,
@@ -1204,9 +1251,15 @@ void set_video_memory_pressure(bool over_budget) {
 }
 
 void refresh_textures(Device* device, ID3D12CommandQueue* queue) {
+  static const lib::Counter spent("d3d12.texture_refresh_us");
+  const TimeIn timing(spent);
   std::lock_guard<std::mutex> guard(g_lock);
   retire_superseded();
-  if (tracking()) scan();
+  if (tracking()) {
+    static const lib::Counter scanning("d3d12.texture_scan_us");
+    const TimeIn timing_scan(scanning);
+    scan();
+  }
   Uploader* up = uploader(device);
   if (!up) return;
   if (g_dirty.empty() && !up->open) {

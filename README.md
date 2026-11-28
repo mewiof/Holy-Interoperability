@@ -25,8 +25,9 @@ much of the work toward that goal each area has, not test coverage.
 - Memory held within the card: copies of textures whose memory the title reused are released under video memory
   pressure (22,000 in seven minutes of loading; 12 GB used instead of 15.8 GB; no device removal in that run).
   New texture copies upload with the next submission instead of a GPU round trip per view.
-- Open: loading runs at under 10 frames a second while the GPU is about 30% busy (the title's job threads wait
-  on something; profiling continues).
+- Loading frame rate up from 2-8 to 6-22 a second: the time was this project's own texture tracking (asking the
+  host which texture pages were written, every 16 ms over gigabytes of texture pool); measured with new timers.
+- Open: a GPU fault at address 0 removes the device in most runs past three minutes of loading.
 - Unattended runs are robust to slow start-ups: scripted input counts from the title's first gamepad reading.
 
 - Loading reaches past five minutes. New console command-list methods: ExecuteIndirect (slot 61), a dispatch

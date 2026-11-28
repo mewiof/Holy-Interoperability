@@ -430,6 +430,7 @@ struct AsyncState {
   AsyncProvider provider = nullptr;
   void* context = nullptr;
   const char* identity_name = nullptr;
+  uint64_t begun_ms = 0;     // when it began (slow operations are logged)
   AsyncWork work = nullptr;  // XAsyncRun
   QueueState* queue = nullptr;
   HANDLE done = nullptr;  // manual reset, set once waiters may return
@@ -566,6 +567,18 @@ void complete(AsyncState* state, HRESULT result, size_t required) {
     Lock lock(state->lock);
     if (state->completed) return;
     state->completed = true;
+  }
+  // Operations that take long hold up titles that wait for them: the first
+  // ones logged (by identity), and counted.
+  if (state->begun_ms && GetTickCount64() - state->begun_ms >= 1000) {
+    static const holy::lib::Counter slow("xgameruntime.async_operations_over_1s");
+    slow.add(1);
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 16) {
+      LIB_LOG(holy::lib::kWarn, "async", "an asynchronous operation (%s) took %llu ms (0x%08lX)",
+              state->identity_name ? state->identity_name : "unnamed",
+              static_cast<unsigned long long>(GetTickCount64() - state->begun_ms), static_cast<unsigned long>(result));
+    }
   }
   BlockInternal* internal = internal_of(state->block);
   internal->required = SUCCEEDED(result) ? required : 0;
@@ -895,6 +908,7 @@ HRESULT begin(AsyncBlock* block, void* context, const void* identity, const char
   state->provider = provider;
   state->context = context;
   state->identity_name = identity_name;
+  state->begun_ms = GetTickCount64();
   state->work = work;
   state->queue = queue;
   state->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);

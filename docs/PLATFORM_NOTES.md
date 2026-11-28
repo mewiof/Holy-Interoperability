@@ -420,6 +420,15 @@ Notes describe the platform, never a title.
   the stencil once a frame (an experiment, not kept) brings the shapes back, black: their colours are wrong as
   well (the program reads its draw data from title memory). How the console resets the stencil is not
   established.
+- *measured* (open): a title's intro video comes out too bright: its blacks at 42-53 of 255. Followed through
+  a frame's textures (`HOLY_DUMP_TARGETS`): the video's planes and its RGB texture (format 29, sRGB, written
+  through a render target view of format 28) hold blacks at 6-9 of 255; the pass that puts the video into the
+  menu's target samples it and encodes the result to sRGB itself (12.92, 1/2.4, 1.055, -0.055 in its program),
+  and its blacks are exactly that encoding of the raw texel (1.055 x 0.0353^(1/2.4) - 0.055 = 53/255): the
+  sample returns the stored value, not its sRGB decoding. The only view the title makes of that texture is of
+  format 29, which decodes. Ruled out: textures created castable between the UNORM and sRGB siblings, and
+  UNORM views of sRGB textures made sRGB (no change either way). Which descriptor that draw samples through is
+  not established yet.
 - *observed*: titles write the stencil reference into the command list's memory themselves when the list has
   room (a type-3 packet header 0xC000B800 and the value), and call slot 24 with the one value when it has none
   (always, with this runtime's lists, whose cursor and limit are equal).

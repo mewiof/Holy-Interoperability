@@ -11,6 +11,7 @@
 #include <iterator>
 #include <unordered_set>
 
+#include "core/libs/d3d12_xs/shader/dxbc.h"
 #include "core/libs/d3d12_xs/shader/geometry.h"
 #include "core/libs/d3d12_xs/shader_dump.h"
 #include "core/libs/d3d12_xs/translation_cache.h"
@@ -427,7 +428,73 @@ uint64_t fnv(const std::vector<uint8_t>& bytes) {
 constexpr size_t kHeavyProgram = 256 * 1024;
 std::mutex g_heavy_compile;
 
-HRESULT compile_now(HostPipeline* p, ID3D12PipelineState** out) {
+// HOLY_CHECKER_PROGRAMS=<pixel program hashes, comma separated>|all:
+// pipelines with those pixel programs (the hashes traces name,
+// HOLY_D3D_TRACE) compile with a pixel program drawing a purple and black
+// checkerboard in screen space instead, so a draw its shading makes invisible
+// shows where its geometry lands. Pipelines the host refuses are compiled
+// that way as well (missing programs show on screen; logged).
+bool checker_program(uint64_t hash) {
+  static const std::string wanted = [] {
+    char text[4096] = {};
+    GetEnvironmentVariableA("HOLY_CHECKER_PROGRAMS", text, sizeof(text));
+    return std::string(text);
+  }();
+  if (wanted.empty()) return false;
+  if (wanted == "all") return true;
+  char text[24];
+  std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+  return wanted.find(text) != std::string::npos;
+}
+
+// The checkerboard pixel program for `targets` render targets, reading the
+// screen position at the register `vertex` outputs it at (the linkage must
+// match); solid purple when it outputs none.
+std::shared_ptr<const std::vector<uint8_t>> checker_bytes(uint32_t targets,
+                                                           const std::shared_ptr<const std::vector<uint8_t>>& vertex) {
+  namespace dx = dxbc;
+  uint32_t position = UINT32_MAX;
+  std::vector<SignatureEntry> outputs;
+  if (vertex && read_output_signature(vertex->data(), vertex->size(), &outputs)) {
+    for (const SignatureEntry& e : outputs) {
+      if (e.system_value == dx::kPosition) position = e.reg;
+    }
+  }
+  dx::Program program(dx::ProgramType::Pixel);
+  program.dcl_global_flags(1);
+  std::vector<dx::SignatureElement> inputs, signature;
+  if (position != UINT32_MAX) {
+    program.dcl_input_ps_siv(position, 0x3, dx::kLinearNoPerspective, dx::kPosition);
+    inputs.push_back({"SV_Position", 0, dx::kPosition, 3, position, 0xF, 0x3});
+  }
+  for (uint32_t i = 0; i < targets; ++i) {
+    program.dcl_output(i, 0xF);
+    signature.push_back({"SV_Target", i, 0, 3, i, 0xF, 0});
+  }
+  program.dcl_temps(1);
+  if (position != UINT32_MAX) {
+    // r0.x = ((x >> 5) ^ (y >> 5)) & 1, as a float: 32-pixel squares.
+    program.emit(dx::kFtou, {dx::temp_dst_mask(0, 0x1), dx::input_register(position, 0)});
+    program.emit(dx::kFtou, {dx::temp_dst_mask(0, 0x2), dx::input_register(position, 1)});
+    program.emit(dx::kUshr, {dx::temp_dst_mask(0, 0x1), dx::temp(0, 0), dx::imm(5)});
+    program.emit(dx::kUshr, {dx::temp_dst_mask(0, 0x2), dx::temp(0, 1), dx::imm(5)});
+    program.emit(dx::kXor, {dx::temp_dst_mask(0, 0x1), dx::temp(0, 0), dx::temp(0, 1)});
+    program.emit(dx::kAnd, {dx::temp_dst_mask(0, 0x1), dx::temp(0, 0), dx::imm(1)});
+    program.emit(dx::kUtof, {dx::temp_dst_mask(0, 0x1), dx::temp(0, 0)});
+  } else {
+    program.emit(dx::kMov, {dx::temp_dst_mask(0, 0x1), dx::immf(1.0f)});
+  }
+  for (uint32_t i = 0; i < targets; ++i) {
+    program.emit(dx::kMov, {dx::output_register(i, 0x1), dx::temp(0, 0)});
+    program.emit(dx::kMov, {dx::output_register(i, 0x2), dx::immf(0.0f)});
+    program.emit(dx::kMov, {dx::output_register(i, 0x4), dx::temp(0, 0)});
+    program.emit(dx::kMov, {dx::output_register(i, 0x8), dx::immf(1.0f)});
+  }
+  program.emit(dx::kRet);
+  return std::make_shared<const std::vector<uint8_t>>(program.container(inputs, signature));
+}
+
+HRESULT compile_now(HostPipeline* p, ID3D12PipelineState** out, bool checker = false) {
   const Recipe& recipe = *p->recipe;
   std::vector<uint8_t> stream = recipe.stream;
   std::vector<std::shared_ptr<const std::vector<uint8_t>>> held;
@@ -440,6 +507,17 @@ HRESULT compile_now(HostPipeline* p, ID3D12PipelineState** out) {
     if (!code.BytecodeLength) return;
     auto bytes = program < recipe.programs.size() && recipe.programs[program] ? recipe.programs[program]->bytes()
                                                                                : nullptr;
+    if (bytes && type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS &&
+        (checker || checker_program(recipe.programs[program]->hash()))) {
+      uint32_t targets = 1;
+      walk(stream, [&](uint32_t t, size_t at, size_t) {
+        if (t != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS) return;
+        D3D12_RT_FORMAT_ARRAY formats{};
+        std::memcpy(&formats, stream.data() + at, sizeof(formats));
+        targets = formats.NumRenderTargets ? formats.NumRenderTargets : 1;
+      });
+      bytes = checker_bytes(targets, program > 0 && recipe.programs[0] ? recipe.programs[0]->bytes() : nullptr);
+    }
     ++program;
     if (!bytes) {
       complete = false;
@@ -481,10 +559,18 @@ void compile_and_publish(HostPipeline* p) {
   if (FAILED(hr) || !state) {
     discard_host_caches_after_run(hr);
     c_refused().add(1);
-    LIB_LOG(lib::kError, "d3d12", "the host refused pipeline %016llx (0x%08lX)", static_cast<unsigned long long>(p->key),
-            static_cast<unsigned long>(hr));
     if (state) state->Release();
     state = nullptr;
+    // With a checkerboard for a pixel program: its draws show where they
+    // land instead of nothing (a pipeline refused for its pixel program).
+    const HRESULT again = compile_now(p, &state, true);
+    if (FAILED(again) && state) {
+      state->Release();
+      state = nullptr;
+    }
+    LIB_LOG(lib::kError, "d3d12", "the host refused pipeline %016llx (0x%08lX)%s",
+            static_cast<unsigned long long>(p->key), static_cast<unsigned long>(hr),
+            state ? "; drawn with a checkerboard pixel program instead" : "");
   }
   AcquireSRWLockExclusive(&p->lock);
   if (state) {

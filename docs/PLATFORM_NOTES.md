@@ -220,6 +220,13 @@ Notes describe the platform, never a title.
   triangles (rectangle lists are drawn as triangles, geometry.h); the runtime's root signature for translated
   pipelines allows input layouts. Dropping the input layouts instead made every translated draw empty. Not yet
   covered by a sample-title check (host pipelines compile at first use).
+- *observed*: pipeline streams with an empty geometry subobject, and streams that test and write depth with the
+  depth format `UNKNOWN` (a menu's brightness calibration symbol). *measured* host behaviour (debug layer): a
+  second geometry subobject is refused ("duplicate subobject type"), and so is a depth test without a depth
+  format. *assumed*: the console takes the depth format from the depth target bound when drawing.
+  Implementation: the rectangle-list variant's geometry program goes into the empty subobject; such pipelines are
+  made without the depth test, and draws with a depth target use a variant with the described state and the
+  target's format, as native pipelines' do. Sample-title check: a rectangle list drawn with such a stream.
 - *assumed*: command-list slots 131 and 132 program GPU state by register offset, value and mask; they are
   recorded and not applied, since the host driver owns its GPU's state.
 - *observed*: device slots that keep the desktop arguments: 27 `CreateCommittedResource`, 39
@@ -403,6 +410,19 @@ Notes describe the platform, never a title.
   masks; the reference is 0, titles set it with the command list's stencil reference). Partial: the desktop has one
   pair of masks for both faces (the front's are used) and no stencil operations ONES, REPLACE_OP or the logical
   ones (logged, kept).
+- *observed* (open): a title's menu draws its opaque shapes (panels, the focused item's fill, a full-screen
+  background) with one program and `DB_DEPTH_CONTROL` 0x2002F1 / `DB_STENCIL_CONTROL` 0x80080: stencil test EQUAL
+  against reference 0 on both faces, depth-pass operation ADD_WRAP by 1, no depth test: front to back, each pixel
+  takes the first shape over it. That needs the stencil at 0 when each frame starts, and nothing the title calls
+  clears it (no depth-stencil clear, barrier, copy or dispatch touches the 3840x2160 depth target in a frame; the
+  frame's first draw, full screen, tests and writes depth LESS against it too). On the host the stencil is 1
+  wherever a shape was drawn once, so the shapes are never drawn again (the focused item shows no fill). Clearing
+  the stencil once a frame (an experiment, not kept) brings the shapes back, black: their colours are wrong as
+  well (the program reads its draw data from title memory). How the console resets the stencil is not
+  established.
+- *observed*: titles write the stencil reference into the command list's memory themselves when the list has
+  room (a type-3 packet header 0xC000B800 and the value), and call slot 24 with the one value when it has none
+  (always, with this runtime's lists, whose cursor and limit are equal).
 - *measured* host behaviour: the host's vertex index (`SV_VertexID`) does not include a draw's first vertex (a point
   drawn from vertex 5 has index 0). *observed*: native vertex programs add s2 to their vertex index; draws without
   indices pass the first vertex there (indexed draws: the base vertex).

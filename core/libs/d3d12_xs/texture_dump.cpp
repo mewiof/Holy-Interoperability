@@ -133,8 +133,8 @@ bool decode(DXGI_FORMAT format, const uint8_t* p, float out[4], int* channels) {
       out[0] = format == 57 ? u16[0] : u16[0] / 65535.0f;
       *channels = 1;
       return true;
-    case 60: case 61: case 62: case 65:  // R8 / A8
-      out[0] = format == 62 ? p[0] : p[0] / 255.0f;
+    case 60: case 61: case 62: case 65:  // R8 / A8 (typeless: stencil planes, as integers)
+      out[0] = format == 62 || format == 60 ? p[0] : p[0] / 255.0f;
       *channels = 1;
       return true;
     case 87: case 88: case 90: case 91:  // B8G8R8A8
@@ -172,7 +172,21 @@ struct Pending {
   ID3D12Resource* readback;
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
   D3D12_BARRIER_LAYOUT layout;
+  UINT plane;
 };
+
+// Planes of a host texture format: depth and stencil formats have two.
+UINT plane_count(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      return 2;
+    default:
+      return 1;
+  }
+}
 
 }  // namespace
 
@@ -199,7 +213,58 @@ uint64_t texture_dump_frame() {
   return frame;
 }
 
+// Logs each depth-stencil texture in title memory with the other live
+// resources over the same memory (sizes as the host lays them out, so
+// approximate): a texture the title clears or writes through another
+// resource on the console does not see those writes on the host.
+void report_depth_aliases(Device* device) {
+  struct Span {
+    Resource* resource;
+    uint64_t begin, end;
+  };
+  std::vector<Span> spans;
+  {
+    std::lock_guard<std::mutex> guard(g_lock);
+    for (Resource* r : live()) {
+      if (!r->title_va) continue;
+      if (!r->host) {
+        if (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
+          LIB_LOG(lib::kInfo, "d3d12", "  depth texture at 0x%llx: %llux%u format %u with no host texture",
+                  static_cast<unsigned long long>(r->title_va), static_cast<unsigned long long>(r->desc.Width),
+                  r->desc.Height, static_cast<unsigned>(r->desc.Format));
+        }
+        continue;
+      }
+      const D3D12_RESOURCE_DESC desc = r->host->GetDesc();
+      const uint64_t bytes = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                                 ? r->desc.Width
+                                 : device->host->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+      spans.push_back({r, r->title_va, r->title_va + bytes});
+    }
+  }
+  for (const Span& d : spans) {
+    if (!(d.resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) continue;
+    const D3D12_RESOURCE_DESC& desc = d.resource->desc;
+    LIB_LOG(lib::kInfo, "d3d12", "  depth texture at 0x%llx-0x%llx: %llux%u format %u, %u samples, flags 0x%x",
+            static_cast<unsigned long long>(d.begin), static_cast<unsigned long long>(d.end),
+            static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<unsigned>(desc.Format),
+            desc.SampleDesc.Count, static_cast<unsigned>(desc.Flags));
+    int shown = 0;
+    for (const Span& o : spans) {
+      if (o.resource == d.resource || o.begin >= d.end || o.end <= d.begin) continue;
+      if (++shown > 16) continue;
+      const D3D12_RESOURCE_DESC& other = o.resource->desc;
+      LIB_LOG(lib::kInfo, "d3d12", "    overlapped by 0x%llx-0x%llx: dim %d %llux%u format %u, %u samples, flags 0x%x",
+              static_cast<unsigned long long>(o.begin), static_cast<unsigned long long>(o.end), other.Dimension,
+              static_cast<unsigned long long>(other.Width), other.Height, static_cast<unsigned>(other.Format),
+              other.SampleDesc.Count, static_cast<unsigned>(other.Flags));
+    }
+    if (shown > 16) LIB_LOG(lib::kInfo, "d3d12", "    and %d more", shown - 16);
+  }
+}
+
 void dump_textures(Device* device, ID3D12CommandQueue* queue, uint64_t present) {
+  report_depth_aliases(device);
   std::vector<Resource*> resources;
   {
     std::lock_guard<std::mutex> guard(g_lock);
@@ -225,53 +290,66 @@ void dump_textures(Device* device, ID3D12CommandQueue* queue, uint64_t present) 
   std::vector<Pending> pending;
   for (Resource* r : resources) {
     const D3D12_RESOURCE_DESC desc = r->host->GetDesc();
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-    UINT64 total = 0;
-    host->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
-    if (!total || total > (256ull << 20)) continue;
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC buffer{};
-    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buffer.Width = total;
-    buffer.Height = 1;
-    buffer.DepthOrArraySize = 1;
-    buffer.MipLevels = 1;
-    buffer.SampleDesc.Count = 1;
-    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ID3D12Resource* readback = nullptr;
-    if (FAILED(host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
-                                             nullptr, IID_PPV_ARGS(&readback)))) {
-      continue;
+    for (UINT plane = 0; plane < plane_count(desc.Format); ++plane) {
+      // Mip 0 of slice 0 of the plane.
+      const UINT subresource = plane * desc.MipLevels * desc.DepthOrArraySize;
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+      UINT64 total = 0;
+      host->GetCopyableFootprints(&desc, subresource, 1, 0, &footprint, nullptr, nullptr, &total);
+      if (!total || total > (256ull << 20)) {
+        LIB_LOG(lib::kInfo, "d3d12", "  texture at 0x%llx (%llux%u format %u, %u mips, plane %u): not copied (%llu bytes)",
+                static_cast<unsigned long long>(r->title_va), static_cast<unsigned long long>(desc.Width),
+                desc.Height, static_cast<unsigned>(desc.Format), desc.MipLevels, plane,
+                static_cast<unsigned long long>(total));
+        continue;
+      }
+      D3D12_HEAP_PROPERTIES heap{};
+      heap.Type = D3D12_HEAP_TYPE_READBACK;
+      D3D12_RESOURCE_DESC buffer{};
+      buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      buffer.Width = total;
+      buffer.Height = 1;
+      buffer.DepthOrArraySize = 1;
+      buffer.MipLevels = 1;
+      buffer.SampleDesc.Count = 1;
+      buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      ID3D12Resource* readback = nullptr;
+      if (FAILED(host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                                               nullptr, IID_PPV_ARGS(&readback)))) {
+        LIB_LOG(lib::kInfo, "d3d12", "  texture at 0x%llx: no readback buffer of %llu bytes",
+                static_cast<unsigned long long>(r->title_va), static_cast<unsigned long long>(total));
+        continue;
+      }
+      const int known = r->layout.load(std::memory_order_relaxed);
+      const auto layout = known >= 0 ? static_cast<D3D12_BARRIER_LAYOUT>(known) : D3D12_BARRIER_LAYOUT_COMMON;
+      D3D12_TEXTURE_BARRIER barrier{};
+      barrier.SyncBefore = D3D12_BARRIER_SYNC_ALL;
+      barrier.SyncAfter = D3D12_BARRIER_SYNC_COPY;
+      barrier.AccessBefore = D3D12_BARRIER_ACCESS_COMMON;
+      barrier.AccessAfter = D3D12_BARRIER_ACCESS_COPY_SOURCE;
+      barrier.LayoutBefore = layout;
+      barrier.LayoutAfter = D3D12_BARRIER_LAYOUT_COPY_SOURCE;
+      barrier.pResource = r->host;
+      barrier.Subresources = {0, 1, 0, 1, plane, 1};
+      D3D12_BARRIER_GROUP group{};
+      group.Type = D3D12_BARRIER_TYPE_TEXTURE;
+      group.NumBarriers = 1;
+      group.pTextureBarriers = &barrier;
+      list->Barrier(1, &group);
+      D3D12_TEXTURE_COPY_LOCATION source{}, target{};
+      source.pResource = r->host;
+      source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      source.SubresourceIndex = subresource;
+      target.pResource = readback;
+      target.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      target.PlacedFootprint = footprint;
+      list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+      std::swap(barrier.SyncBefore, barrier.SyncAfter);
+      std::swap(barrier.AccessBefore, barrier.AccessAfter);
+      std::swap(barrier.LayoutBefore, barrier.LayoutAfter);
+      list->Barrier(1, &group);
+      pending.push_back({r, readback, footprint, layout, plane});
     }
-    const int known = r->layout.load(std::memory_order_relaxed);
-    const auto layout = known >= 0 ? static_cast<D3D12_BARRIER_LAYOUT>(known) : D3D12_BARRIER_LAYOUT_COMMON;
-    D3D12_TEXTURE_BARRIER barrier{};
-    barrier.SyncBefore = D3D12_BARRIER_SYNC_ALL;
-    barrier.SyncAfter = D3D12_BARRIER_SYNC_COPY;
-    barrier.AccessBefore = D3D12_BARRIER_ACCESS_COMMON;
-    barrier.AccessAfter = D3D12_BARRIER_ACCESS_COPY_SOURCE;
-    barrier.LayoutBefore = layout;
-    barrier.LayoutAfter = D3D12_BARRIER_LAYOUT_COPY_SOURCE;
-    barrier.pResource = r->host;
-    barrier.Subresources = {0, 1, 0, 1, 0, 1};
-    D3D12_BARRIER_GROUP group{};
-    group.Type = D3D12_BARRIER_TYPE_TEXTURE;
-    group.NumBarriers = 1;
-    group.pTextureBarriers = &barrier;
-    list->Barrier(1, &group);
-    D3D12_TEXTURE_COPY_LOCATION source{}, target{};
-    source.pResource = r->host;
-    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    target.pResource = readback;
-    target.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    target.PlacedFootprint = footprint;
-    list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
-    std::swap(barrier.SyncBefore, barrier.SyncAfter);
-    std::swap(barrier.AccessBefore, barrier.AccessAfter);
-    std::swap(barrier.LayoutBefore, barrier.LayoutAfter);
-    list->Barrier(1, &group);
-    pending.push_back({r, readback, footprint, layout});
   }
   list->Close();
   ID3D12CommandList* lists[] = {list};
@@ -381,16 +459,19 @@ void dump_textures(Device* device, ID3D12CommandQueue* queue, uint64_t present) 
       }
     }
     LIB_LOG(lib::kInfo, "d3d12",
-            "  texture %zu at 0x%llx: %ux%u format %u (title %u) layout %d flags 0x%x: %s; memory: %llu of %llu "
-            "sampled bytes not zero, protection 0x%lx type 0x%lx",
-            index, static_cast<unsigned long long>(item.resource->title_va), f.Width, f.Height,
-            static_cast<unsigned>(f.Format), static_cast<unsigned>(item.resource->desc.Format),
+            "  texture %zu%s at 0x%llx: %ux%u format %u (host %u, title %u) layout %d flags 0x%x: %s; memory: %llu of "
+            "%llu sampled bytes not zero, protection 0x%lx type 0x%lx",
+            index, item.plane ? " (stencil)" : "", static_cast<unsigned long long>(item.resource->title_va), f.Width,
+            f.Height, static_cast<unsigned>(f.Format),
+            item.resource->host ? static_cast<unsigned>(item.resource->host->GetDesc().Format) : 0u,
+            static_cast<unsigned>(item.resource->desc.Format),
             static_cast<int>(item.layout), static_cast<unsigned>(item.resource->desc.Flags), stats,
             static_cast<unsigned long long>(nonzero), static_cast<unsigned long long>(sampled), protection.Protect,
             protection.Type);
     if (decodable && !dir.empty() && out_height) {
       wchar_t name[96];
-      std::swprintf(name, 96, L"\\t%03zu-%ux%u-f%u.bmp", index, f.Width, f.Height, static_cast<unsigned>(f.Format));
+      std::swprintf(name, 96, L"\\t%03zu-%ux%u-f%u%ls.bmp", index, f.Width, f.Height, static_cast<unsigned>(f.Format),
+                    item.plane ? L"-stencil" : L"");
       write_bmp(dir + name, out_width, out_height, bgra);
     }
     ++index;

@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cwchar>
 #include <mutex>
 
 #include "core/libs/d3d12_xs/device.h"
@@ -21,14 +22,29 @@ bool removal_check_enabled() {
   return enabled;
 }
 
-// The present HOLY_D3D_TRACE names (0: none).
-uint64_t traced_present() {
-  static const uint64_t present = [] {
+// The presents HOLY_D3D_TRACE names: `<n>` or `<n>+<count>` (the calls up
+// to present n, and through the count-1 presents after it; recording a frame
+// can outlast a present interval while every call is logged). 0: none.
+struct TracedPresents {
+  uint64_t last = 0, count = 1;
+};
+
+const TracedPresents& traced_presents() {
+  static const TracedPresents presents = [] {
+    TracedPresents out;
     wchar_t text[32] = {};
-    return GetEnvironmentVariableW(L"HOLY_D3D_TRACE", text, 32) ? static_cast<uint64_t>(_wtoi64(text)) : 0ull;
+    if (!GetEnvironmentVariableW(L"HOLY_D3D_TRACE", text, 32)) return out;
+    out.last = static_cast<uint64_t>(_wtoi64(text));
+    if (const wchar_t* plus = wcschr(text, L'+')) {
+      const int64_t count = _wtoi64(plus + 1);
+      if (count > 1) out.count = static_cast<uint64_t>(count);
+    }
+    return out;
   }();
-  return present;
+  return presents;
 }
+
+uint64_t traced_present() { return traced_presents().last; }
 
 }  // namespace
 
@@ -50,12 +66,15 @@ bool call_check_enabled() {
 void trace_present(uint64_t present) {
   const uint64_t wanted = traced_present();
   if (!wanted) return;
+  const uint64_t end = wanted + traced_presents().count - 1;
   if (present + 1 == wanted || (wanted == 1 && present == 0)) {
-    LIB_LOG(lib::kInfo, "trace", "tracing the calls up to present %llu", static_cast<unsigned long long>(wanted));
+    LIB_LOG(lib::kInfo, "trace", "tracing the calls up to present %llu", static_cast<unsigned long long>(end));
     g_frame_traced.store(true);
-  } else if (present == wanted) {
+  } else if (present == end) {
     g_frame_traced.store(false);
     LIB_LOG(lib::kInfo, "trace", "end of the trace (present %llu)", static_cast<unsigned long long>(present));
+  } else if (present >= wanted && present < end) {
+    LIB_LOG(lib::kInfo, "trace", "present %llu (traced)", static_cast<unsigned long long>(present));
   }
 }
 

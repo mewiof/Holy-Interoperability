@@ -76,6 +76,8 @@ struct NativeGraphicsDescription {
   uint32_t stencil_control = 0;  // DB_STENCIL_CONTROL
   uint32_t stencil_masks = 0;    // DB_STENCILREFMASK (front faces)
   uint32_t stencil_masks_back = 0;  // DB_STENCILREFMASK_BF
+  const uint32_t* state = nullptr;  // the render state block, for descriptions
+  size_t state_bytes = 0;
 };
 // The render state block has been seen at 0x17C, 0x184 and 0x18C bytes with
 // the same dwords up to the blend controls; only those are required (in the

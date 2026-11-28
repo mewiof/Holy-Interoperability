@@ -494,9 +494,104 @@ std::shared_ptr<const std::vector<uint8_t>> checker_bytes(uint32_t targets,
   return std::make_shared<const std::vector<uint8_t>>(program.container(inputs, signature));
 }
 
+// Logs the fixed-function state of a pipeline stream (what decides whether
+// and how its draws reach the targets), for pipelines drawn with a
+// checkerboard.
+void describe_stream(uint64_t key, const Recipe& recipe, const std::vector<uint8_t>& stream) {
+  std::string programs;
+  for (const ProgramRef& program : recipe.programs) {
+    char text[24];
+    std::snprintf(text, sizeof(text), " %016llx", program ? static_cast<unsigned long long>(program->hash()) : 0ull);
+    programs += text;
+  }
+  LIB_LOG(lib::kInfo, "d3d12", "pipeline %016llx: programs%s", static_cast<unsigned long long>(key), programs.c_str());
+  // The host programs too, as <data>/logs/programs/<hash>.dxbc (for the
+  // host compiler's disassembler).
+  if (const wchar_t* data = HolyDataDir(); data && *data) {
+    const std::wstring dir = std::wstring(data) + L"\\logs\\programs";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    for (const ProgramRef& program : recipe.programs) {
+      const auto bytes = program ? program->bytes() : nullptr;
+      if (!bytes) continue;
+      wchar_t name[40];
+      std::swprintf(name, 40, L"\\%016llx.dxbc", static_cast<unsigned long long>(program->hash()));
+      const HANDLE file = CreateFileW((dir + name).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+      if (file == INVALID_HANDLE_VALUE) continue;
+      DWORD written = 0;
+      WriteFile(file, bytes->data(), static_cast<DWORD>(bytes->size()), &written, nullptr);
+      CloseHandle(file);
+    }
+  }
+  walk(stream, [&](uint32_t type, size_t at, size_t) {
+    const uint8_t* data = stream.data() + at;
+    if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND) {
+      D3D12_BLEND_DESC b;
+      std::memcpy(&b, data, sizeof(b));
+      for (int i = 0; i < (b.IndependentBlendEnable ? 8 : 1); ++i) {
+        const D3D12_RENDER_TARGET_BLEND_DESC& t = b.RenderTarget[i];
+        LIB_LOG(lib::kInfo, "d3d12",
+                "pipeline %016llx target %d blend %d logic %d: colour %d*src %d*dst op %d, alpha %d*src %d*dst op %d, "
+                "write mask 0x%x; alpha to coverage %d",
+                static_cast<unsigned long long>(key), i, t.BlendEnable, t.LogicOpEnable, t.SrcBlend, t.DestBlend,
+                t.BlendOp, t.SrcBlendAlpha, t.DestBlendAlpha, t.BlendOpAlpha, t.RenderTargetWriteMask,
+                b.AlphaToCoverageEnable);
+      }
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL ||
+               type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) {
+      // DESC1 starts with the DESC fields.
+      D3D12_DEPTH_STENCIL_DESC d;
+      std::memcpy(&d, data, sizeof(d));
+      LIB_LOG(lib::kInfo, "d3d12",
+              "pipeline %016llx depth %d write %d func %d; stencil %d read 0x%x write 0x%x front fail %d depth fail %d "
+              "pass %d func %d, back fail %d depth fail %d pass %d func %d",
+              static_cast<unsigned long long>(key), d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable,
+              d.StencilReadMask, d.StencilWriteMask, d.FrontFace.StencilFailOp, d.FrontFace.StencilDepthFailOp,
+              d.FrontFace.StencilPassOp, d.FrontFace.StencilFunc, d.BackFace.StencilFailOp, d.BackFace.StencilDepthFailOp,
+              d.BackFace.StencilPassOp, d.BackFace.StencilFunc);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER) {
+      D3D12_RASTERIZER_DESC r;
+      std::memcpy(&r, data, sizeof(r));
+      LIB_LOG(lib::kInfo, "d3d12", "pipeline %016llx fill %d cull %d front ccw %d depth clip %d bias %d",
+              static_cast<unsigned long long>(key), r.FillMode, r.CullMode, r.FrontCounterClockwise,
+              r.DepthClipEnable, r.DepthBias);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS) {
+      D3D12_RT_FORMAT_ARRAY f;
+      std::memcpy(&f, data, sizeof(f));
+      LIB_LOG(lib::kInfo, "d3d12", "pipeline %016llx %u targets, first format %d", static_cast<unsigned long long>(key),
+              f.NumRenderTargets, f.RTFormats[0]);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT) {
+      DXGI_FORMAT f;
+      std::memcpy(&f, data, sizeof(f));
+      LIB_LOG(lib::kInfo, "d3d12", "pipeline %016llx depth format %d", static_cast<unsigned long long>(key), f);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK) {
+      UINT m;
+      std::memcpy(&m, data, sizeof(m));
+      LIB_LOG(lib::kInfo, "d3d12", "pipeline %016llx sample mask 0x%x", static_cast<unsigned long long>(key), m);
+    }
+  });
+}
+
+// Whether a pipeline stream enables the stencil test.
+bool uses_stencil(const std::vector<uint8_t>& stream) {
+  bool stencil = false;
+  walk(stream, [&](uint32_t type, size_t at, size_t) {
+    if (type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL &&
+        type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) {
+      return;
+    }
+    D3D12_DEPTH_STENCIL_DESC d;
+    std::memcpy(&d, stream.data() + at, sizeof(d));
+    stencil = stencil || d.StencilEnable;
+  });
+  return stencil;
+}
+
 HRESULT compile_now(HostPipeline* p, ID3D12PipelineState** out, bool checker = false) {
   const Recipe& recipe = *p->recipe;
   std::vector<uint8_t> stream = recipe.stream;
+  if (!checker && (describe_pipeline(recipe) || (describe_stencil_pipelines() && uses_stencil(stream)))) {
+    describe_stream(p->key, recipe, stream);
+  }
   std::vector<std::shared_ptr<const std::vector<uint8_t>>> held;
   size_t program_bytes = 0, program = 0;
   bool complete = true;
@@ -517,6 +612,7 @@ HRESULT compile_now(HostPipeline* p, ID3D12PipelineState** out, bool checker = f
         targets = formats.NumRenderTargets ? formats.NumRenderTargets : 1;
       });
       bytes = checker_bytes(targets, program > 0 && recipe.programs[0] ? recipe.programs[0]->bytes() : nullptr);
+      if (!describe_pipeline(recipe)) describe_stream(p->key, recipe, stream);
     }
     ++program;
     if (!bytes) {
@@ -751,7 +847,8 @@ HRESULT create_from_recipe(Device* device, std::shared_ptr<Recipe> recipe, const
 
 HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream, std::vector<ProgramRef> programs,
                                  bool translated, const lib::VtableInfo* info, void* const* vtable, void** pipeline,
-                                 uint32_t depth_control, uint32_t stencil_control, uint32_t stencil_masks) {
+                                 uint32_t depth_control, uint32_t stencil_control, uint32_t stencil_masks,
+                                 const D3D12_DEPTH_STENCIL_DESC* target_depth) {
   if (!pipeline) return E_POINTER;
   *pipeline = nullptr;
   auto recipe = std::make_shared<Recipe>();
@@ -761,6 +858,10 @@ HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream, st
   recipe->depth_control = depth_control;
   recipe->stencil_control = stencil_control;
   recipe->stencil_masks = stencil_masks;
+  if (target_depth) {
+    recipe->depth_from_target = true;
+    recipe->target_depth = *target_depth;
+  }
   for (const ProgramRef& program : recipe->programs) {
     if (!program) return E_INVALIDARG;
   }
@@ -950,8 +1051,29 @@ ID3D12PipelineState* pipeline_host_rectangles(const void* object) {
         ProgramRef geometry = intern_program(rectangle_list_program(outputs));
         auto recipe = std::make_shared<Recipe>(base);
         const D3D12_SHADER_BYTECODE code{nullptr, geometry->size()};  // patched in when compiling
-        stream_append(&recipe->stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, &code, sizeof(code));
-        recipe->programs.push_back(std::move(geometry));
+        // Observed: titles' streams with an empty geometry subobject; the
+        // host refuses a second one, so the program goes there (programs are
+        // in subobject order).
+        size_t empty_at = 0, before = 0;
+        bool found = false;
+        walk(recipe->stream, [&](uint32_t type, size_t inner, size_t) {
+          if (found || !is_shader(type)) return;
+          if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS) {
+            empty_at = inner;
+            found = true;
+            return;
+          }
+          D3D12_SHADER_BYTECODE present;
+          std::memcpy(&present, recipe->stream.data() + inner, sizeof(present));
+          if (present.BytecodeLength) ++before;
+        });
+        if (found) {
+          std::memcpy(recipe->stream.data() + empty_at, &code, sizeof(code));
+          recipe->programs.insert(recipe->programs.begin() + static_cast<std::ptrdiff_t>(before), std::move(geometry));
+        } else {
+          stream_append(&recipe->stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, &code, sizeof(code));
+          recipe->programs.push_back(std::move(geometry));
+        }
         std::vector<uint8_t> content = content_of(*recipe);
         recipe->key = fnv(content);
         pipeline->rectangles = host_pipeline_for(pipeline->shared->device, recipe, std::move(content));
@@ -969,7 +1091,7 @@ ID3D12PipelineState* pipeline_host_depth(const void* object, DXGI_FORMAT format)
   if (!pipeline || !pipeline->recipe || !pipeline->shared || format == DXGI_FORMAT_UNKNOWN) return nullptr;
   const uint32_t control = pipeline->recipe->depth_control;
   const bool test = (control >> 1) & 1, write = (control >> 2) & 1, stencil = control & 1;
-  if (!test && !write && !stencil) return nullptr;
+  if (!test && !write && !stencil && !pipeline->recipe->depth_from_target) return nullptr;
   std::shared_ptr<HostPipeline> variant;
   {
     std::lock_guard<std::mutex> guard(g_variant_lock);
@@ -1027,10 +1149,14 @@ ID3D12PipelineState* pipeline_host_depth(const void* object, DXGI_FORMAT format)
     depth.FrontFace = face(0, control >> 8);
     const bool back = (control >> 7) & 1;
     depth.BackFace = back ? face(12, control >> 20) : depth.FrontFace;
+    if (pipeline->recipe->depth_from_target) depth = pipeline->recipe->target_depth;
     auto recipe = std::make_shared<Recipe>(*pipeline->recipe);
     bool has_depth = false, has_format = false;
     walk(recipe->stream, [&](uint32_t type, size_t inner, size_t size) {
-      if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL && size >= sizeof(depth)) {
+      if ((type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL ||
+           type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) &&
+          size >= sizeof(depth)) {
+        // DEPTH_STENCIL_DESC1 starts with the DEPTH_STENCIL_DESC fields.
         std::memcpy(recipe->stream.data() + inner, &depth, sizeof(depth));
         has_depth = true;
       } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT && size >= sizeof(format)) {
@@ -1071,6 +1197,37 @@ HRESULT pipeline_set_name(const void* object, const wchar_t* name) {
   if (state) state->SetName(p->name.c_str());
   ReleaseSRWLockExclusive(&p->lock);
   return S_OK;
+}
+
+const std::string& described_programs() {
+  static const std::string wanted = [] {
+    char text[4096] = {};
+    GetEnvironmentVariableA("HOLY_DESCRIBE_PIPELINES", text, sizeof(text));
+    return std::string(text);
+  }();
+  return wanted;
+}
+
+bool describe_pipeline(const std::vector<uint64_t>& programs) {
+  const std::string& wanted = described_programs();
+  if (wanted.empty()) return false;
+  if (wanted == "all") return true;
+  for (uint64_t hash : programs) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+    if (wanted.find(text) != std::string::npos) return true;
+  }
+  return false;
+}
+
+bool describe_stencil_pipelines() { return described_programs().find("stencil") != std::string::npos; }
+
+bool describe_pipeline(const Recipe& recipe) {
+  std::vector<uint64_t> hashes;
+  for (const ProgramRef& program : recipe.programs) {
+    if (program) hashes.push_back(program->hash());
+  }
+  return describe_pipeline(hashes);
 }
 
 std::wstring pipeline_label(const void* object) {

@@ -84,6 +84,12 @@ struct Recipe {
   uint32_t depth_control = 0;
   uint32_t stencil_control = 0;  // DB_STENCIL_CONTROL
   uint32_t stencil_masks = 0;    // DB_STENCILREFMASK
+  // Pipelines whose description tests depth or stencil without naming a
+  // depth format (the console takes it from the bound target): the stream
+  // has no depth test, and draws with a depth target bound use a variant
+  // with this state and the target's format (pipeline_host_depth).
+  bool depth_from_target = false;
+  D3D12_DEPTH_STENCIL_DESC target_depth{};
 };
 
 struct HostPipeline;
@@ -104,6 +110,15 @@ struct Pipeline : Wrapper {
   std::vector<std::pair<DXGI_FORMAT, std::shared_ptr<HostPipeline>>> depth_variants;
 };
 
+// HOLY_DESCRIBE_PIPELINES=<program hashes, comma separated>|all: pipelines
+// with those programs are described in the log when compiled (their
+// fixed-function state, as pipelines drawn with a checkerboard are), and
+// console pipelines' render state blocks when made. The word `stencil` in the
+// list adds the console pipelines that use the stencil or write depth.
+bool describe_pipeline(const std::vector<uint64_t>& programs);
+bool describe_stencil_pipelines();
+bool describe_pipeline(const Recipe& recipe);
+
 // The pipeline behind a title object, or null if it is not one.
 Pipeline* as_pipeline(const void* object);
 
@@ -115,7 +130,8 @@ void stream_append(std::vector<uint8_t>* stream, uint32_t type, const void* data
 // can be derived from it.
 HRESULT create_recorded_pipeline(Device* device, std::vector<uint8_t> stream, std::vector<ProgramRef> programs,
                                  bool translated, const lib::VtableInfo* info, void* const* vtable, void** pipeline,
-                                 uint32_t depth_control = 0, uint32_t stencil_control = 0, uint32_t stencil_masks = 0);
+                                 uint32_t depth_control = 0, uint32_t stencil_control = 0, uint32_t stencil_masks = 0,
+                                 const D3D12_DEPTH_STENCIL_DESC* target_depth = nullptr);
 
 // A title pipeline around a host pipeline made elsewhere (taking over the
 // reference); it cannot be derived from.

@@ -166,6 +166,15 @@ ULONG STDMETHODCALLTYPE resource_add_ref(Resource* self) {
 ULONG STDMETHODCALLTYPE resource_release(Resource* self) {
   const long left = self->refs.fetch_sub(1) - 1;
   if (left == 0) {
+    if (self->desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 64) {
+        LIB_LOG(lib::kDebug, "d3d12", "released target texture %llux%u format %u flags 0x%x at 0x%llx",
+                static_cast<unsigned long long>(self->desc.Width), self->desc.Height,
+                static_cast<unsigned>(self->desc.Format), static_cast<unsigned>(self->desc.Flags),
+                static_cast<unsigned long long>(self->title_va));
+      }
+    }
     if (self->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) unregister_texture(self->desc, self->title_va, self->host);
     if (self->host) self->host->Release();
     self->host = nullptr;

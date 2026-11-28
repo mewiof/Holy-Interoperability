@@ -127,7 +127,15 @@ bool tracking() {
     wchar_t text[8] = {};
     const bool off = GetEnvironmentVariableW(L"HOLY_TEXTURE_TRACKING", text, 8) && text[0] == L'0';
     if (!off) {
-      start_write_watch(&texture_memory_changed);
+      start_write_watch(&texture_memory_changed, [](uint64_t page) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 8) {
+          LIB_LOG(lib::kWarn, "d3d12",
+                  "a write to %p faulted on a read-only page no watch holds (a watch's protection left behind): made "
+                  "writable and taken as a write",
+                  reinterpret_cast<void*>(page));
+        }
+      });
       // Writes that do not fault (the kernel's): watches over the memory go
       // now, before the write (a read-only page would make it fail).
       HolySetWriteHook([](const void* address, size_t size) {

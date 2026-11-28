@@ -920,7 +920,12 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
 // colour through the vertex buffer table (s[0:1]) by vertex index, the pixel
 // program exports the colour, flat. A native compute program then reads the
 // target through a view and stores the pixel at (0, 0).
-void test_native_draw(void* device, void* queue) {
+// `quirks`: the stream as some titles write it, which the host refuses as it
+// is: an empty geometry subobject, and a depth test with no depth format (the
+// console takes it from the bound target; none is bound here); drawn as a
+// rectangle list (the runtime completes the rectangles with a geometry
+// program of its own).
+void test_native_draw(void* device, void* queue, bool quirks) {
   void* allocator = nullptr;
   void* list = nullptr;
   void* fence = nullptr;
@@ -993,6 +998,14 @@ void test_native_draw(void* device, void* queue) {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
     D3D12_RT_FORMAT_ARRAY value{{DXGI_FORMAT_R8G8B8A8_UNORM}, 1};
   };
+  struct alignas(void*) DepthSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
+    D3D12_DEPTH_STENCIL_DESC value{TRUE, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_COMPARISON_FUNC_LESS};
+  };
+  struct alignas(void*) DepthFormatSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT;
+    DXGI_FORMAT value = DXGI_FORMAT_UNKNOWN;
+  };
   struct Stream {
     RootSubobject root;
     ShaderSubobject vs;
@@ -1000,10 +1013,25 @@ void test_native_draw(void* device, void* queue) {
     TopologySubobject topology;
     FormatsSubobject formats;
   } stream{};
+  struct QuirksStream {
+    RootSubobject root;
+    ShaderSubobject vs;
+    ShaderSubobject gs;  // empty
+    ShaderSubobject ps;
+    TopologySubobject topology;
+    FormatsSubobject formats;
+    DepthSubobject depth;
+    DepthFormatSubobject depth_format;
+  } quirks_stream{};
   stream.root.value = graphics_root;
   stream.vs = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {native_vs.data(), native_vs.size()}};
   stream.ps = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {native_ps.data(), native_ps.size()}};
+  quirks_stream.root.value = graphics_root;
+  quirks_stream.vs = stream.vs;
+  quirks_stream.gs = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, {nullptr, 0}};
+  quirks_stream.ps = stream.ps;
   D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+  if (quirks) stream_desc = {sizeof(quirks_stream), &quirks_stream};
   if (graphics_root) call<HRESULT>(device, 86, &stream_desc, __uuidof(ID3D12PipelineState), &draw_pipeline);
   const std::vector<uint8_t> read_cs = native_only_container(
       {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE880304u, 0xBE890380u, 0xF40C0304u, 0xFA000000u, 0xBF8CC07Fu,
@@ -1071,7 +1099,8 @@ void test_native_draw(void* device, void* queue) {
   bool recorded = call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
   call<void>(list, 25, draw_pipeline);
   call<void>(list, 34, graphics_root);
-  call<void>(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  // The console's rectangle list is topology 17.
+  call<void>(list, 20, quirks ? static_cast<D3D_PRIMITIVE_TOPOLOGY>(17) : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   const D3D12_VERTEX_BUFFER_VIEW vertex_buffer{reinterpret_cast<uint64_t>(memory), sizeof(vertices), 32};
   call<void>(list, 48, 0u, 1u, &vertex_buffer);
   const D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle{static_cast<SIZE_T>(rtv)};
@@ -1115,8 +1144,10 @@ void test_native_draw(void* device, void* queue) {
               pixel[1], pixel[2], pixel[3], static_cast<unsigned long long>(value ? *value : 0), host_commit_left());
   check(recorded && value && *value == 1 && close_to(pixel[0], 0.25f) && close_to(pixel[1], 0.5f) &&
             close_to(pixel[2], 0.75f) && close_to(pixel[3], 1.0f),
-        "a draw from vertex 3 with native programs fetching vertices through the vertex buffer table colours its "
-        "target");
+        quirks ? "a rectangle list drawn with a pipeline stream holding an empty geometry subobject and a depth test "
+                 "with no depth format colours its target"
+               : "a draw from vertex 3 with native programs fetching vertices through the vertex buffer table colours "
+                 "its target");
 
   if (placed) call<ULONG>(placed, 2);
   call<ULONG>(target, 2);
@@ -2375,7 +2406,8 @@ void test_native_depth(void* device, void* queue, bool stencil) {
 }
 
 void test_graphics_resources(void* device, void* queue) {
-  if (queue) test_native_draw(device, queue);
+  if (queue) test_native_draw(device, queue, false);
+  if (queue) test_native_draw(device, queue, true);
   if (queue) test_draw_recording_cost(device, queue);
   if (queue) test_memory_read_cost(device, queue);
   if (queue) test_root_arguments_outlive_later_recording(device, queue);

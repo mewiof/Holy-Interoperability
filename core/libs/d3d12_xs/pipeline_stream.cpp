@@ -258,8 +258,53 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
     LIB_LOG(lib::kDebug, "d3d12", "translated vertex shader exports 0x%x; pixel shader reads 0x%x, writes targets 0x%x",
             vs_link.params, ps_link.params, ps_link.targets);
   }
+  // Observed: a title's pipeline testing and writing depth with no depth
+  // format (DSV format UNKNOWN), which the host refuses. The console takes
+  // the format from the depth target bound when drawing: the pipeline is made
+  // without the depth test, and draws with a depth target use a variant with
+  // the described state and the target's format (pipeline_host_depth).
+  D3D12_DEPTH_STENCIL_DESC target_depth{};
+  bool depth_from_target = false;
+  {
+    bool tests = false, has_format = false;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    std::vector<size_t> depth_at;
+    for (size_t at = 0; at + 4 <= copy.size();) {
+      uint32_t type;
+      std::memcpy(&type, copy.data() + at, 4);
+      SubobjectLayout layout;
+      if (!layout_of(type, &layout)) break;
+      const size_t inner = align_up(at + 4, layout.align);
+      if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL ||
+          type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) {
+        D3D12_DEPTH_STENCIL_DESC d;
+        std::memcpy(&d, copy.data() + inner, sizeof(d));
+        if (d.DepthEnable || d.StencilEnable) {
+          tests = true;
+          target_depth = d;
+          depth_at.push_back(inner);
+        }
+      } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT) {
+        std::memcpy(&format, copy.data() + inner, sizeof(format));
+        has_format = true;
+      }
+      at = align_up(inner + layout.size, sizeof(void*));
+    }
+    if (tests && (!has_format || format == DXGI_FORMAT_UNKNOWN)) {
+      depth_from_target = true;
+      for (size_t inner : depth_at) {
+        D3D12_DEPTH_STENCIL_DESC d;
+        std::memcpy(&d, copy.data() + inner, sizeof(d));
+        d.DepthEnable = FALSE;
+        d.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        d.StencilEnable = FALSE;
+        std::memcpy(copy.data() + inner, &d, sizeof(d));
+      }
+      LIB_LOG(lib::kDebug, "d3d12", "pipeline stream tests depth with no depth format: the bound target's is used");
+    }
+  }
   const HRESULT hr = create_recorded_pipeline(device, std::move(copy), std::move(shaders), translated, info, vtable,
-                                              pipeline);
+                                              pipeline, 0, 0, 0, depth_from_target ? &target_depth : nullptr);
   LIB_LOG(lib::kDebug, "d3d12", "pipeline stream of %llu bytes (subobjects %s) -> 0x%08lX",
           static_cast<unsigned long long>(desc->SizeInBytes), summary.c_str(), static_cast<unsigned long>(hr));
   if (FAILED(hr)) discard_host_caches_after_run(hr);

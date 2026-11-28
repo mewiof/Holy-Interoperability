@@ -1294,6 +1294,21 @@ HRESULT STDMETHODCALLTYPE create_native_graphics_pipeline(Device* self, const ui
   const HRESULT hr = create_recorded_pipeline(self, std::move(stream), std::move(programs), true, &kPipelineInfo,
                                               kPipelineVtable.data(), out, native.depth_control,
                                               native.stencil_control, native.stencil_masks);
+  if (SUCCEEDED(hr) && native.state &&
+      (describe_pipeline({vs->hash(), ps ? ps->hash() : 0}) ||
+       ((native.depth_control & 5) != 0 && describe_stencil_pipelines()))) {
+    // The console render state block, 8 dwords a line, for studying it.
+    const Pipeline* made = as_pipeline(*out);
+    const unsigned long long key = made && made->recipe ? made->recipe->key : 0ull;
+    LIB_LOG(lib::kInfo, "d3d12", "native pipeline %016llx: programs %016llx %016llx, render state 0x%zx bytes", key,
+            static_cast<unsigned long long>(vs->hash()), ps ? static_cast<unsigned long long>(ps->hash()) : 0ull,
+            native.state_bytes);
+    for (size_t i = 0; i + 8 <= native.state_bytes / 4; i += 8) {
+      const uint32_t* d = native.state + i;
+      LIB_LOG(lib::kInfo, "d3d12", "  %02zx: %08x %08x %08x %08x %08x %08x %08x %08x", i, d[0], d[1], d[2], d[3], d[4],
+              d[5], d[6], d[7]);
+    }
+  }
   if (SUCCEEDED(hr) && ngg) {
     // The graphics pipeline holds the compute pass's reference.
     Pipeline* graphics = as_pipeline(*out);

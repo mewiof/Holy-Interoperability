@@ -28,6 +28,7 @@ std::unordered_map<uint64_t, std::vector<WatchToken>>* g_pages = nullptr;  // pa
 // as a write to the watched page.
 std::unordered_map<uint64_t, std::vector<std::pair<WatchToken, uint64_t>>>* g_aliases = nullptr;
 std::atomic<void (*)(uint64_t, uint64_t)> g_written{nullptr};
+std::atomic<void (*)(uint64_t)> g_stale{nullptr};
 
 void lock() {
   AcquireSRWLockExclusive(&g_lock);
@@ -128,9 +129,25 @@ LONG CALLBACK on_write_fault(EXCEPTION_POINTERS* info) {
     // Another thread may have dropped the watch since the write faulted: the
     // page is writable again and the write can be retried.
     MEMORY_BASIC_INFORMATION query{};
-    const bool writable = VirtualQuery(reinterpret_cast<void*>(page), &query, sizeof(query)) &&
-                          query.State == MEM_COMMIT && query.Protect == PAGE_READWRITE;
-    return writable ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    if (!VirtualQuery(reinterpret_cast<void*>(page), &query, sizeof(query)) || query.State != MEM_COMMIT) {
+      return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (query.Protect == PAGE_READWRITE) return EXCEPTION_CONTINUE_EXECUTION;
+    // Observed once (a video decoder writing frames through one view of
+    // physical pages a texture is placed at through another): a read-only
+    // page no watch holds, in a view mapped read-write. Only this file
+    // makes such views read-only (titles' own protection goes through
+    // their allocations, and the memory library maps views read-write), so
+    // the protection is a watch's left behind: the page becomes writable,
+    // the write is reported like any other, and the case is logged.
+    if (query.Type != MEM_MAPPED || query.AllocationProtect != PAGE_READWRITE || query.Protect != PAGE_READONLY) {
+      return EXCEPTION_CONTINUE_SEARCH;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(page), kPage, PAGE_READWRITE, &old)) return EXCEPTION_CONTINUE_SEARCH;
+    if (const auto stale = g_stale.load(std::memory_order_acquire)) stale(page);
+    if (const auto written = g_written.load(std::memory_order_acquire)) written(page, kPage);
+    return EXCEPTION_CONTINUE_EXECUTION;
   }
   if (const auto written = g_written.load(std::memory_order_acquire)) {
     written(page, kPage);
@@ -141,7 +158,8 @@ LONG CALLBACK on_write_fault(EXCEPTION_POINTERS* info) {
 
 }  // namespace
 
-void start_write_watch(void (*written)(uint64_t begin, uint64_t size)) {
+void start_write_watch(void (*written)(uint64_t begin, uint64_t size), void (*stale)(uint64_t page)) {
+  g_stale.store(stale, std::memory_order_release);
   g_written.store(written, std::memory_order_release);
   static const bool installed = [] {
     // First in line: a write to a watched page is ours whatever else handles

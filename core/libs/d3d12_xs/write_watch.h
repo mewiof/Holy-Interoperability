@@ -23,9 +23,11 @@ namespace holy::d3d12 {
 using WatchToken = uintptr_t;
 
 // Installs the fault handler (once) and the callback written pages are
-// reported to. The callback runs in the faulting thread, inside the fault
-// handler: it must only take leaf locks.
-void start_write_watch(void (*written)(uint64_t begin, uint64_t size));
+// reported to. The callbacks run in the faulting thread, inside the fault
+// handler: they must only take leaf locks. `stale` (optional) hears of a
+// write that faulted on a page this file left read-only without a watch
+// holding it (made writable and reported as written; see on_write_fault).
+void start_write_watch(void (*written)(uint64_t begin, uint64_t size), void (*stale)(uint64_t page) = nullptr);
 
 // Watches [begin, begin + size) for `token` (an earlier watch of the token
 // goes first); false if no page could be watched.

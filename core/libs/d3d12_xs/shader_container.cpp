@@ -512,6 +512,8 @@ bool native_graphics_description(const uint64_t* desc, NativeGraphicsDescription
     *error = text;
     return false;
   }
+  out->state = state;
+  out->state_bytes = static_cast<size_t>(desc[2]);
   out->target_mask = state[0x1E + shift];
   out->mode_control = state[0x28 + shift];
   out->depth_control = state[0x2E + shift];

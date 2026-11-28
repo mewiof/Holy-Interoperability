@@ -739,9 +739,15 @@ void STDMETHODCALLTYPE list_set_scissors(CommandList* self, UINT count, const D3
   self->host->RSSetScissorRects(count, rects);
 }
 void STDMETHODCALLTYPE list_set_blend_factor(CommandList* self, const FLOAT* factor) {
+  if (factor) HOLY_TRACE("list %u blend factor %g %g %g %g", self->number, factor[0], factor[1], factor[2], factor[3]);
   self->host->OMSetBlendFactor(factor);
 }
+// Observed (the title's own code): the stencil reference is the one argument
+// (titles write it into the list's command memory themselves when there is
+// room, calling this slot when there is none: always, with this runtime's
+// lists).
 void STDMETHODCALLTYPE list_set_stencil_ref(CommandList* self, UINT reference) {
+  HOLY_TRACE("list %u stencil reference %u", self->number, reference);
   self->host->OMSetStencilRef(reference);
 }
 void STDMETHODCALLTYPE list_set_depth_bounds(CommandList* self, FLOAT min, FLOAT max) {

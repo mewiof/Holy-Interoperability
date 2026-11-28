@@ -106,3 +106,35 @@ TEST(rewatching_forgetting_and_other_threads) {
   EXPECT(!watch_memory(base + 0x8000, 0x1000, 11));
   VirtualFree(const_cast<uint8_t*>(memory), 0, MEM_RELEASE);
 }
+
+namespace {
+std::atomic<int> g_stale_count{0};
+void stale(uint64_t) { g_stale_count.store(g_stale_count.load() + 1); }
+}  // namespace
+
+// A read-only page no watch holds, in a view mapped read-write (the case of a
+// watch's protection left behind), is made writable by a write to it, which
+// is reported as written and to the `stale` callback; read-only memory of any
+// other kind stays someone else's (the write is not taken here).
+TEST(a_protection_left_behind_is_lifted_by_a_write) {
+  start_write_watch(&record, &stale);
+  g_count.store(0);
+  g_stale_count.store(0);
+  const HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 0x10000, nullptr);
+  EXPECT(section != nullptr);
+  if (!section) return;
+  auto* view = static_cast<volatile uint8_t*>(MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0x10000));
+  EXPECT(view != nullptr);
+  if (view) {
+    DWORD old = 0;
+    EXPECT(VirtualProtect(const_cast<uint8_t*>(view + 0x2000), 0x1000, PAGE_READONLY, &old));
+    write(view + 0x2010, 5);
+    EXPECT(view[0x2010] == 5 && writable(view + 0x2000));
+    EXPECT(reports() == 1 && reported(0) == reinterpret_cast<uint64_t>(view) + 0x2000);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    EXPECT(g_stale_count.load() == 1);
+    UnmapViewOfFile(const_cast<uint8_t*>(view));
+  }
+  CloseHandle(section);
+  start_write_watch(&record);
+}

@@ -352,6 +352,39 @@ bool fit_dsv(ID3D12Resource* texture, D3D12_DEPTH_STENCIL_VIEW_DESC* v) {
   return ok;
 }
 
+// Shader-resource and unordered-access descriptors and what they view, kept
+// only while calls are wrapped (call_check.h), for traces (describe_view).
+std::mutex g_views_lock;
+std::unordered_map<uint64_t, std::string>& view_notes() {
+  static auto* map = new std::unordered_map<uint64_t, std::string>();
+  return *map;
+}
+
+void note_view(SIZE_T dest, const char* kind, uint64_t address, uint64_t width, uint32_t height,
+               uint32_t resource_format, uint32_t view_format) {
+  if (!call_check_enabled()) return;
+  char text[160];
+  std::snprintf(text, sizeof(text), "%s of 0x%llx (%llux%u format %u) as format %u", kind,
+                static_cast<unsigned long long>(address), static_cast<unsigned long long>(width), height,
+                resource_format, view_format);
+  std::lock_guard<std::mutex> guard(g_views_lock);
+  view_notes()[dest] = text;
+}
+
+void copy_view_notes(SIZE_T dest, SIZE_T source, UINT count, UINT stride) {
+  if (!call_check_enabled()) return;
+  std::lock_guard<std::mutex> guard(g_views_lock);
+  auto& notes = view_notes();
+  for (UINT i = 0; i < count; ++i) {
+    const auto found = notes.find(source + static_cast<SIZE_T>(i) * stride);
+    if (found == notes.end()) {
+      notes.erase(dest + static_cast<SIZE_T>(i) * stride);
+    } else {
+      notes[dest + static_cast<SIZE_T>(i) * stride] = found->second;
+    }
+  }
+}
+
 // Render-target and depth-stencil descriptors and what they view, kept only
 // while calls are wrapped (call_check.h), for traces.
 struct TargetView {
@@ -381,6 +414,12 @@ void note_target(SIZE_T dest, const void* resource, DXGI_FORMAT view_format) {
 }
 
 }  // namespace
+
+std::string describe_view(uint64_t handle) {
+  std::lock_guard<std::mutex> guard(g_views_lock);
+  const auto found = view_notes().find(handle);
+  return found == view_notes().end() ? std::string() : found->second;
+}
 
 DXGI_FORMAT depth_view_format(SIZE_T handle) {
   std::lock_guard<std::mutex> guard(g_depth_lock);
@@ -442,8 +481,15 @@ void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_
     write_indexed_descriptor(dest, kKindShaderResource);
     return;
   }
+  HOLY_TRACE("shader resource view at 0x%llx: resource dim %d %llux%u, %u mips, format %u, layout %d; view format %u "
+             "dim %u, mapping 0x%x", static_cast<unsigned long long>(view->address), resource->Dimension,
+             static_cast<unsigned long long>(resource->Width), resource->Height, resource->MipLevels,
+             resource->Format, resource->Layout, view->srv.Format, view->srv.ViewDimension,
+             view->srv.Shader4ComponentMapping);
   if (resource->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
     // A texture in title memory: viewed through a host copy (texture_upload.h).
+    note_view(dest, "shader resource view at an address", view->address, resource->Width, resource->Height,
+              resource->Format, view->srv.Format);
     ID3D12Resource* texture = texture_at(self, *resource, view->address);
     if (texture) {
       D3D12_SHADER_RESOURCE_VIEW_DESC fitted = view->srv;
@@ -532,6 +578,10 @@ void STDMETHODCALLTYPE create_shader_resource_view(Device* self, void* resource,
     }
   }
   ID3D12Resource* texture = host_resource(resource);
+  if (object) {
+    note_view(dest, "shader resource view", object->title_va, object->desc.Width, object->desc.Height,
+              object->desc.Format, desc ? desc->Format : object->desc.Format);
+  }
   if (texture && desc && !fit_srv(texture, &host)) texture = nullptr;
   self->host->CreateShaderResourceView(texture, desc ? &host : nullptr, host_cpu_handle(dest));
   publish_descriptors(dest);
@@ -725,6 +775,7 @@ void STDMETHODCALLTYPE copy_descriptors(Device* self, UINT dest_ranges, const SI
     }
     const uint64_t stride = title_descriptor_bytes(type);
     copy_descriptor_memory(dest_starts[d] + d_at * stride, source_starts[s] + s_at * stride, 1);
+    copy_view_notes(dest_starts[d] + d_at * stride, source_starts[s] + s_at * stride, 1, static_cast<UINT>(stride));
     ++d_at;
     ++s_at;
   }
@@ -735,6 +786,7 @@ void STDMETHODCALLTYPE copy_descriptors_simple(Device* self, UINT count, SIZE_T 
   self->host->CopyDescriptorsSimple(count, host_cpu_handle(dest), host_cpu_handle(source), type);
   publish_descriptors(dest, count);
   copy_descriptor_memory(dest, source, count);
+  copy_view_notes(dest, source, count, title_descriptor_bytes(type));
 }
 
 }  // namespace holy::d3d12

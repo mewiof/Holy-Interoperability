@@ -32,6 +32,10 @@ DXGI_FORMAT depth_view_format(SIZE_T handle);
 // For traces (HOLY_D3D_TRACE): the texture a render-target or depth-stencil
 // descriptor views, as its title address, size and formats.
 std::string describe_target(SIZE_T handle);
+// What the view descriptor at title CPU handle `handle` was made as
+// (resource address, size, formats), kept while calls are wrapped
+// (call_check.h) and carried along by descriptor copies; empty if unknown.
+std::string describe_view(uint64_t handle);
 
 void STDMETHODCALLTYPE copy_descriptors_simple(Device* self, UINT count, SIZE_T dest, SIZE_T source,
                                                D3D12_DESCRIPTOR_HEAP_TYPE type);

@@ -425,10 +425,15 @@ Notes describe the platform, never a title.
   through a render target view of format 28) hold blacks at 6-9 of 255; the pass that puts the video into the
   menu's target samples it and encodes the result to sRGB itself (12.92, 1/2.4, 1.055, -0.055 in its program),
   and its blacks are exactly that encoding of the raw texel (1.055 x 0.0353^(1/2.4) - 0.055 = 53/255): the
-  sample returns the stored value, not its sRGB decoding. The only view the title makes of that texture is of
-  format 29, which decodes. Ruled out: textures created castable between the UNORM and sRGB siblings, and
-  UNORM views of sRGB textures made sRGB (no change either way). Which descriptor that draw samples through is
-  not established yet.
+  sample returns the stored value, not its sRGB decoding (pixel for pixel over the whole frame: the menu's
+  target is the sRGB encoding of the video texture's stored values, mean error 0.0009). That draw samples the
+  title's one view of the texture, of format 29 (the frame trace lists the descriptors behind its root
+  arguments: slot 11679, that view; giving the view a red-only swizzle turned the video grey, so it is the
+  view read). Measured on the host in isolation (sample-title check): a texture of format 29 drawn through a
+  format-28 view and read through a format-29 view reads back decoded, at 64x64 and at 3840x2160. Ruled out:
+  textures created castable between the UNORM and sRGB siblings (the host supports relaxed casting), typeless
+  textures (the frame broke), sRGB views for UNORM ones. Still open: what differs for the title's pixel
+  program's sampling (the check reads with a compute program's load).
 - *observed*: titles write the stencil reference into the command list's memory themselves when the list has
   room (a type-3 packet header 0xC000B800 and the value), and call slot 24 with the one value when it has none
   (always, with this runtime's lists, whose cursor and limit are equal).

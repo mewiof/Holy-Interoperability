@@ -21,6 +21,7 @@
 
 #include "core/libs/d3d12_xs/bindings.h"
 #include "core/libs/d3d12_xs/descriptors.h"
+#include "core/libs/d3d12_xs/shader/descriptor_layout.h"
 #include "core/libs/d3d12_xs/call_check.h"
 #include "core/libs/d3d12_xs/device.h"
 #include "core/libs/d3d12_xs/forward.h"
@@ -822,6 +823,26 @@ void trace_draw_inputs(const CommandList* self) {
     root += word;
   }
   HOLY_TRACE("list %u   graphics root arguments:%s", self->number, root.c_str());
+  // The image views behind each packed root argument that is a 32-bit
+  // address in a shader-visible heap (titles pass descriptor tables so, and
+  // native code reads descriptors there): the heap slot a translated program
+  // samples (dword 0 of the descriptor, in the bound heap) and what the view
+  // there was made as; a descriptor whose dword 0 is not its own slot is
+  // marked (descriptor memory copied without the copy calls).
+  const DescriptorHeap* bound = self->heaps[0];
+  for (int a = 0; bound && a < 16; ++a) {
+    DescriptorLocation where;
+    if (!self->graphics.packed[a] || !find_gpu_descriptor(self->graphics.packed[a], &where)) continue;
+    const uint32_t count = std::min<uint32_t>(8, where.heap->host_count - where.index);
+    for (uint32_t i = 0; i < count; ++i) {
+      const auto* words = reinterpret_cast<const uint32_t*>(where.title + static_cast<uint64_t>(i) * where.heap->stride);
+      if (words[1] != kDescriptorMarker) continue;
+      const std::string view = describe_view(bound->title_cpu + static_cast<uint64_t>(words[0]) * bound->stride);
+      HOLY_TRACE("list %u   argument %d descriptor %u: slot %u%s, kind %u: %s", self->number, a, i, words[0],
+                 words[0] == where.index + i ? "" : " (not its own slot)", words[2],
+                 view.empty() ? "(view not known)" : view.c_str());
+    }
+  }
 }
 
 // The host pipeline a draw needs: the title pipeline's, or its rectangle

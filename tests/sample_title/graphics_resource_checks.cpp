@@ -7,6 +7,7 @@
 #include <psapi.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -924,8 +925,10 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
 // is: an empty geometry subobject, and a depth test with no depth format (the
 // console takes it from the bound target; none is bound here); drawn as a
 // rectangle list (the runtime completes the rectangles with a geometry
-// program of its own).
-void test_native_draw(void* device, void* queue, bool quirks) {
+// program of its own). `srgb`: the target is of an sRGB format, drawn through
+// a render target view of its UNORM sibling (the colour stored as it is) and
+// read through an sRGB view (decoded), as titles' video passes do.
+void test_native_draw(void* device, void* queue, bool quirks, bool srgb = false) {
   void* allocator = nullptr;
   void* list = nullptr;
   void* fence = nullptr;
@@ -1045,13 +1048,16 @@ void test_native_draw(void* device, void* queue, bool quirks) {
   // The render target.
   D3D12_HEAP_PROPERTIES local{};
   local.Type = D3D12_HEAP_TYPE_DEFAULT;
+  // (Measured: the sRGB case behaves the same at 3840x2160, where drivers
+  // compress targets.)
+  const UINT size_x = 64, size_y = 64;
   D3D12_RESOURCE_DESC texture{};
   texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  texture.Width = 64;
-  texture.Height = 64;
+  texture.Width = size_x;
+  texture.Height = size_y;
   texture.DepthOrArraySize = 1;
   texture.MipLevels = 1;
-  texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture.Format = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
   texture.SampleDesc.Count = 1;
   texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
   // Slot 127 (the shape of CreateCommittedResource3), as titles create their
@@ -1088,9 +1094,12 @@ void test_native_draw(void* device, void* queue, bool quirks) {
                 __uuidof(ID3D12Resource), &placed);
 
   const uint64_t rtv = call<uint64_t>(targets, 9);
-  call<void>(device, 20, target, static_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(nullptr), rtv);
+  D3D12_RENDER_TARGET_VIEW_DESC unorm_rtv{};
+  unorm_rtv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  unorm_rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+  call<void>(device, 20, target, srgb ? &unorm_rtv : static_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(nullptr), rtv);
   D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-  srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  srv.Format = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
   srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
   srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   srv.Texture2D.MipLevels = 1;
@@ -1105,8 +1114,8 @@ void test_native_draw(void* device, void* queue, bool quirks) {
   call<void>(list, 48, 0u, 1u, &vertex_buffer);
   const D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle{static_cast<SIZE_T>(rtv)};
   call<void>(list, 50, 1u, &rtv_handle, FALSE, static_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(nullptr));
-  const D3D12_VIEWPORT viewport{0, 0, 64, 64, 0, 1};
-  const D3D12_RECT scissor{0, 0, 64, 64};
+  const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(size_x), static_cast<float>(size_y), 0, 1};
+  const D3D12_RECT scissor{0, 0, static_cast<LONG>(size_x), static_cast<LONG>(size_y)};
   call<void>(list, 21, 1u, &viewport);
   call<void>(list, 22, 1u, &scissor);
   call<void>(list, 12, 3u, 1u, 3u, 0u);
@@ -1142,9 +1151,15 @@ void test_native_draw(void* device, void* queue, bool quirks) {
   const float pixel[4] = {output[0], output[1], output[2], output[3]};
   std::printf("    (pixel the draw left: %.3f %.3f %.3f %.3f; fence %llu; host commit left %.1f GiB)\n", pixel[0],
               pixel[1], pixel[2], pixel[3], static_cast<unsigned long long>(value ? *value : 0), host_commit_left());
-  check(recorded && value && *value == 1 && close_to(pixel[0], 0.25f) && close_to(pixel[1], 0.5f) &&
-            close_to(pixel[2], 0.75f) && close_to(pixel[3], 1.0f),
-        quirks ? "a rectangle list drawn with a pipeline stream holding an empty geometry subobject and a depth test "
+  // Stored as drawn; through the sRGB view, decoded.
+  auto decoded = [srgb](float v) {
+    return !srgb ? v : v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+  };
+  check(recorded && value && *value == 1 && close_to(pixel[0], decoded(0.25f)) && close_to(pixel[1], decoded(0.5f)) &&
+            close_to(pixel[2], decoded(0.75f)) && close_to(pixel[3], 1.0f),
+        srgb ? "a target of an sRGB format drawn through a UNORM view stores the colour as drawn and reads back "
+               "decoded through an sRGB view"
+        : quirks ? "a rectangle list drawn with a pipeline stream holding an empty geometry subobject and a depth test "
                  "with no depth format colours its target"
                : "a draw from vertex 3 with native programs fetching vertices through the vertex buffer table colours "
                  "its target");
@@ -2408,6 +2423,7 @@ void test_native_depth(void* device, void* queue, bool stencil) {
 void test_graphics_resources(void* device, void* queue) {
   if (queue) test_native_draw(device, queue, false);
   if (queue) test_native_draw(device, queue, true);
+  if (queue) test_native_draw(device, queue, false, true);
   if (queue) test_draw_recording_cost(device, queue);
   if (queue) test_memory_read_cost(device, queue);
   if (queue) test_root_arguments_outlive_later_recording(device, queue);

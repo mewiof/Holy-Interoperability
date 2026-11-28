@@ -1,4 +1,5 @@
 #include "core/loader/launch.h"
+#include "core/loader/audio_recorder.h"
 #include "core/loader/profiler.h"
 
 #include <windows.h>
@@ -477,6 +478,11 @@ LaunchResult launch(const LaunchOptions& options) {
             options.sandbox ? " (low integrity)" : "");
   ResumeThread(thread.value);
 
+  std::unique_ptr<AudioRecorder> recorder;
+  if (options.record_audio) {
+    recorder = std::make_unique<AudioRecorder>(process_info.dwProcessId,
+                                               join_path(join_path(data_dir, L"logs"), L"audio.wav"));
+  }
   std::unique_ptr<Profiler> profiler;
   if (options.profile_interval_ms) {
     profiler = std::make_unique<Profiler>(process.value, options.profile_interval_ms,
@@ -484,6 +490,7 @@ LaunchResult launch(const LaunchOptions& options) {
   }
   const DWORD wait = WaitForSingleObject(process.value, options.timeout_ms ? options.timeout_ms : INFINITE);
   profiler.reset();  // the final report
+  recorder.reset();  // the file completed
   if (wait == WAIT_TIMEOUT) {
     if (job) TerminateJobObject(job.value, 1);
     TerminateProcess(process.value, 1);

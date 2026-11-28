@@ -47,6 +47,9 @@ struct LaunchOptions {
   // Sample the title's threads every this many milliseconds into
   // <data>/logs/profile.txt (core/loader/profiler.h); 0 does not profile.
   uint32_t profile_interval_ms = 0;
+  // Record what the title plays into <data>/logs/audio.wav
+  // (core/loader/audio_recorder.h).
+  bool record_audio = false;
 };
 
 enum class LaunchStatus { Exited, TimedOut, Failed };

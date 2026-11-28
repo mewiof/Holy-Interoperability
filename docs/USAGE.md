@@ -45,6 +45,7 @@ holy run <package-dir> [options] [-- <title arguments>]
 | `--log-level <level>` | `trace`, `debug`, `info` (default), `warn`, `error` |
 | `--timeout <seconds>` | stop the title after this long |
 | `--profile [ms]` | sample the title's threads (default every 2 ms) into `<data>/logs/profile.txt` |
+| `--record-audio` | record what the title's process tree plays (the host's process loopback capture, 48 kHz stereo) into `<data>/logs/audio.wav`; `python tools/audio_report/audio_report.py <wav>` reports loudness, silence and sound/silence changes per second (a starved stream shows as sound broken by short silences many times a second) |
 
 Environment: `HOLY_PIPELINES=eager|warm|lazy` chooses when host pipelines are compiled: `warm` (default) at first
 use, and at creation for pipelines used in an earlier run; `eager` all at creation; `lazy` only at first use.

@@ -54,6 +54,7 @@ void print_usage() {
       "      --timeout <seconds>   stop the title after this long\n"
       "      --profile [ms]        sample the title's threads (default every 2 ms) into\n"
       "                            <data>/logs/profile.txt\n"
+      "      --record-audio        record what the title plays into <data>/logs/audio.wav\n"
       "\n"
       "  holy version\n");
 }
@@ -295,6 +296,8 @@ int cmd_run(const std::vector<std::wstring>& args) {
         return kUsage;
       }
       options.timeout_ms = static_cast<uint32_t>(seconds * 1000);
+    } else if (arg == L"--record-audio") {
+      options.record_audio = true;
     } else if (arg == L"--profile") {
       options.profile_interval_ms = 2;
       if (i + 1 < args.size() && !args[i + 1].empty() && iswdigit(args[i + 1][0])) {

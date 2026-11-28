@@ -679,6 +679,13 @@ void test_released_texture_memory(void* device) {
   // The next view applies the releases.
   void* last = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
   if (last) view_at(last);
+  // Copies are let go of once the GPU is done with work that names them
+  // (their uploads are submitted with the title's next submission, or when
+  // they go): later views see the GPU done.
+  for (int i = 0; i < 100 && last && *live - before != 1; ++i) {
+    Sleep(10);
+    view_at(last);
+  }
   const int64_t after = *live - before;
   if (last) VirtualFree(last, 0, MEM_RELEASE);
   std::printf("    (host textures from title memory: %+lld after %d views, %+lld once the memory was released and "

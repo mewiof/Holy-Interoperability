@@ -85,4 +85,9 @@ void refresh_textures(Device* device, ID3D12CommandQueue* queue);
 // How many host textures there are and their bytes in title memory, for the log.
 void host_texture_totals(uint64_t* count, uint64_t* bytes);
 
+// Whether the host GPU's local memory use is over its budget (present.cpp,
+// measured every 30 presents): copies of textures whose memory the title has
+// reused are let go of then.
+void set_video_memory_pressure(bool over_budget);
+
 }  // namespace holy::d3d12

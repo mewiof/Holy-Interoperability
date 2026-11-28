@@ -22,9 +22,11 @@ much of the work toward that goal each area has, not test coverage.
 
 **Latest** (newest first):
 
-- Measured the memory problem behind late-loading failures: host copies of textures outgrow the title's own
-  texture memory (7.5 GB against 6 GB) because copies of memory the title reused for other textures stay alive
-  (2.3 GB of them); the 12 GB card overflows. Retiring superseded copies is next.
+- Memory held within the card: copies of textures whose memory the title reused are released under video memory
+  pressure (22,000 in seven minutes of loading; 12 GB used instead of 15.8 GB; no device removal in that run).
+  New texture copies upload with the next submission instead of a GPU round trip per view.
+- Open: loading runs at under 10 frames a second while the GPU is about 30% busy (the title's job threads wait
+  on something; profiling continues).
 - Unattended runs are robust to slow start-ups: scripted input counts from the title's first gamepad reading.
 
 - Loading reaches past five minutes. New console command-list methods: ExecuteIndirect (slot 61), a dispatch

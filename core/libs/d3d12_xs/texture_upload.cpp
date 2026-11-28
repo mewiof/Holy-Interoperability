@@ -71,6 +71,9 @@ struct Uploader {
   std::vector<Chunk> chunks;
   size_t chunk = 0;
   uint64_t used = 0;
+  // The list takes copies of new textures until the title's next submission
+  // (refresh_textures), which submits it and has the title's queue wait.
+  bool open = false;
 };
 
 constexpr uint64_t kChunkBytes = 32ull << 20;
@@ -96,6 +99,9 @@ struct Record {
   // `whole`: all of it (or not known).
   bool whole = true;
   std::vector<std::pair<uint64_t, uint64_t>> spans;
+  // When a copy of another shape was made over its memory (0: not): the
+  // title reused the memory, so this copy is likely stale.
+  uint64_t superseded_at = 0;
 };
 
 // Allocations holding textures filled from their memory whose writes the host
@@ -137,6 +143,12 @@ struct Retired {
   uint64_t bytes;  // in title memory (the live count's share)
 };
 std::vector<Retired> g_retired;  // under g_lock, oldest first
+std::vector<Record*> g_superseded;  // under g_lock, oldest first
+struct Uploader;
+Uploader* g_uploader = nullptr;  // once made
+uint64_t submit_upload(Uploader* up);
+bool upload_open();
+std::atomic<bool> g_memory_pressure{false};
 std::atomic<bool> g_any_change{false};
 
 const lib::Counter& c_refreshes() {
@@ -381,6 +393,15 @@ void track(Record* record) {
 // The registry lets go of a record (g_lock held); `later`: its host texture
 // goes once the GPU finished the work submitted until now.
 void drop(Record* record, bool later) {
+  // Copies into it may wait in the open upload list: submitted first, and
+  // the texture let go of once that work is done.
+  if (record->texture && record->from_memory && upload_open()) {
+    submit_upload(g_uploader);
+    later = true;
+  }
+  if (record->superseded_at) {
+    g_superseded.erase(std::remove(g_superseded.begin(), g_superseded.end(), record), g_superseded.end());
+  }
   if (record->protected_watch) unwatch(reinterpret_cast<WatchToken>(record));
   g_dirty.erase(std::remove(g_dirty.begin(), g_dirty.end(), record), g_dirty.end());
   for (auto& [base, allocation] : tracked()) {
@@ -397,6 +418,47 @@ void drop(Record* record, bool later) {
     record->texture->Release();
   }
   delete record;
+}
+
+lib::TextureShape shape_of(const D3D12_RESOURCE_DESC& desc);
+Key key_of(uint64_t address, const lib::TextureShape& shape);
+
+// Marks the copies over [address, address + size) superseded by a new copy
+// there (g_lock held); copies of exactly the same memory (another format of
+// it) are not.
+void supersede_over(uint64_t address, uint64_t size) {
+  auto it = textures().lower_bound(Key{address > g_largest ? address - g_largest : 0, 0, 0, 0, 0, 0, 0});
+  for (; it != textures().end() && std::get<0>(it->first) < address + size; ++it) {
+    Record* other = it->second;
+    if (!other->from_memory || other->superseded_at || other->address + other->size <= address) continue;
+    if (other->address == address && other->size == size) continue;
+    other->superseded_at = GetTickCount64();
+    g_superseded.push_back(other);
+  }
+}
+
+// Under video memory pressure, lets go of copies superseded a while ago
+// (g_lock held): the title reused their memory, and a descriptor still naming
+// one would read memory the console would show the new texture in. Released
+// once the GPU is done with work recorded so far.
+void retire_superseded() {
+  constexpr uint64_t kGraceMs = 3000;
+  if (!g_memory_pressure.load(std::memory_order_relaxed) || g_superseded.empty()) return;
+  static const lib::Counter retired("d3d12.host_textures_superseded_released");
+  const uint64_t now = GetTickCount64();
+  size_t done = 0;
+  while (done < g_superseded.size() && done < 512 && now - g_superseded[done]->superseded_at > kGraceMs) ++done;
+  if (!done) return;
+  std::vector<Record*> going(g_superseded.begin(), g_superseded.begin() + static_cast<std::ptrdiff_t>(done));
+  g_superseded.erase(g_superseded.begin(), g_superseded.begin() + static_cast<std::ptrdiff_t>(done));
+  for (Record* record : going) {
+    record->superseded_at = 0;  // off the list already
+    auto found = textures().find(key_of(record->address, shape_of(record->desc)));
+    if (found == textures().end() || found->second != record) continue;
+    textures().erase(found);
+    drop(record, true);
+    retired.add(1);
+  }
 }
 
 bool make_uploader(Device* device, Uploader* out) {
@@ -425,6 +487,7 @@ Uploader* uploader(Device* device) {
       LIB_LOG(lib::kError, "d3d12", "cannot create the texture upload queue");
       return static_cast<Uploader*>(nullptr);
     }
+    g_uploader = made;
     return made;
   }();
   return instance;
@@ -444,8 +507,20 @@ void begin_upload(Uploader* up) {
   up->list->Reset(up->allocator, nullptr);
 }
 
+bool upload_open() {
+  return g_uploader && g_uploader->open;
+}
+
+// Opens the uploader's list for recording if it is not open (g_lock held).
+void open_upload(Uploader* up) {
+  if (up->open) return;
+  begin_upload(up);
+  up->open = true;
+}
+
 // Submits the uploader's list; returns the fence value it signals.
 uint64_t submit_upload(Uploader* up) {
+  up->open = false;
   up->list->Close();
   ID3D12CommandList* lists[] = {up->list};
   up->queue->ExecuteCommandLists(1, lists);
@@ -877,7 +952,7 @@ ID3D12Resource* memory_texture(Device* device, const D3D12_RESOURCE_DESC& desc, 
   }
   track(record);
   if (!record->tracked && !record->protected_watch) c_untracked().add(1);
-  begin_upload(up);
+  open_upload(up);
   D3D12_HEAP_PROPERTIES heap{};
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   ID3D12Resource* texture = nullptr;
@@ -890,7 +965,6 @@ ID3D12Resource* memory_texture(Device* device, const D3D12_RESOURCE_DESC& desc, 
           desc.Dimension, static_cast<unsigned long long>(desc.Width), desc.Height, desc.DepthOrArraySize,
           desc.MipLevels, desc.Format, desc.Flags, reinterpret_cast<void*>(address), static_cast<unsigned long>(hr));
   if (FAILED(hr)) {
-    up->list->Close();
     drop(record);
     return nullptr;
   }
@@ -904,9 +978,7 @@ ID3D12Resource* memory_texture(Device* device, const D3D12_RESOURCE_DESC& desc, 
   }
   record->texture = texture;
   record->whole = false;  // changes from now on are tracked by span
-  const uint64_t value = submit_upload(up);
-  up->fence->SetEventOnCompletion(value, up->event);
-  WaitForSingleObject(up->event, INFINITE);
+  // Submitted with the title's next submission, which waits for it.
   if (size >= (1u << 20)) {
     LIB_LOG(lib::kDebug, "d3d12", "placed texture %llux%u format %u at %p follows its memory: tracked %d, watched %d",
             static_cast<unsigned long long>(desc.Width), desc.Height, desc.Format, reinterpret_cast<void*>(address),
@@ -1005,8 +1077,16 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   // released and reused is a new one.
   apply_changes();
   release_retired();
+  retire_superseded();
   auto found = textures().find(key);
-  if (found != textures().end()) return found->second->texture;
+  if (found != textures().end()) {
+    Record* existing = found->second;
+    if (existing->superseded_at) {  // viewed again: in use after all
+      existing->superseded_at = 0;
+      g_superseded.erase(std::remove(g_superseded.begin(), g_superseded.end(), existing), g_superseded.end());
+    }
+    return existing->texture;
+  }
 
   const uint64_t size = memory_size(desc);
   if (!size) return nullptr;
@@ -1050,7 +1130,7 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
     }
   }
 
-  begin_upload(up);
+  open_upload(up);
   D3D12_HEAP_PROPERTIES heap{};
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   ID3D12Resource* texture = nullptr;
@@ -1062,7 +1142,6 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
             static_cast<unsigned long long>(shape.width), shape.height, static_cast<unsigned long>(hr));
   }
   if (FAILED(hr)) {
-    up->list->Close();
     drop(record);
     return nullptr;
   }
@@ -1078,9 +1157,7 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   }
   record->texture = texture;
   record->whole = false;  // changes from now on are tracked by span
-  const uint64_t value = submit_upload(up);
-  up->fence->SetEventOnCompletion(value, up->event);
-  WaitForSingleObject(up->event, INFINITE);
+  // Submitted with the title's next submission, which waits for it.
 
   LIB_LOG(lib::kDebug, "d3d12", "host texture for format %u %llux%ux%u, %u mips at %p", shape.format,
           static_cast<unsigned long long>(shape.width), shape.height, shape.depth_or_array, shape.mips,
@@ -1100,6 +1177,7 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
       }
     }
   }
+  supersede_over(address, size);
   textures().emplace(key, record);
   g_largest = std::max(g_largest, size);
   c_live_textures().add(1);
@@ -1121,15 +1199,25 @@ void texture_memory_changed(uint64_t address, uint64_t size) {
   g_any_change.store(true, std::memory_order_release);
 }
 
+void set_video_memory_pressure(bool over_budget) {
+  g_memory_pressure.store(over_budget, std::memory_order_relaxed);
+}
+
 void refresh_textures(Device* device, ID3D12CommandQueue* queue) {
   std::lock_guard<std::mutex> guard(g_lock);
+  retire_superseded();
   if (tracking()) scan();
-  if (g_dirty.empty()) return;
   Uploader* up = uploader(device);
   if (!up) return;
+  if (g_dirty.empty() && !up->open) {
+    // Uploads submitted outside a submission (a texture let go of): the
+    // title's work waits for them too.
+    if (queue && up->value) queue->Wait(up->fence, up->value);
+    return;
+  }
   std::vector<Record*> dirty;
   dirty.swap(g_dirty);
-  begin_upload(up);
+  open_upload(up);
   uint32_t refreshed = 0;
   for (Record* record : dirty) {
     record->dirty = false;
@@ -1143,8 +1231,9 @@ void refresh_textures(Device* device, ID3D12CommandQueue* queue) {
     record->spans.clear();
   }
   const uint64_t value = submit_upload(up);
-  // Work submitted after this on the title's queue sees the new contents.
-  if (queue && refreshed) queue->Wait(up->fence, value);
+  // Work submitted after this on the title's queue sees the new contents
+  // (refreshed, and new copies recorded since the last submission).
+  if (queue) queue->Wait(up->fence, value);
   if (refreshed) {
     c_refreshes().add(refreshed);
     LIB_LOG(lib::kDebug, "d3d12", "%u host textures copied again from title memory written since", refreshed);

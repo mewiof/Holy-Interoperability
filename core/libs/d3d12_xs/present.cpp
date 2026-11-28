@@ -98,6 +98,7 @@ void count_present(ID3D12Device* device) {
     DXGI_QUERY_VIDEO_MEMORY_INFO info{};
     if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
       local.set(static_cast<int64_t>(info.CurrentUsage >> 20));
+      set_video_memory_pressure(info.CurrentUsage > info.Budget / 10 * 9);
     }
     if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) {
       non_local.set(static_cast<int64_t>(info.CurrentUsage >> 20));

@@ -1155,8 +1155,15 @@ Notes describe the platform, never a title.
   live, 7.5 GB, against 6 GB of committed physical pages; host video memory then exceeds a 12 GB card, pipeline
   compiles fail for lack of memory and the device has been removed as hung). 11,988 of them (2.26 GB) were made
   over memory another copy already covers: titles reuse texture memory for other textures, and the earlier
-  copies stay. Views rarely say which levels are resident (322 of 18,225 2D views start past level 0). Next:
-  retiring copies superseded at the same memory, safely for descriptors that still name them.
+  copies stay. Views rarely say which levels are resident (322 of 18,225 2D views start past level 0).
+  Implementation: a copy is marked superseded when a copy of another shape is made over its memory (not when
+  only the format differs over the same range), unmarked if viewed again, and under video memory pressure
+  (usage over 90% of the host's budget) released after 3 s, once the GPU is done with work naming it. Measured:
+  22,191 released in 7 minutes of loading; host video memory held at the 12 GB budget (was 15.8 GB), no device
+  removal.
+- Host copies of new textures are uploaded with the title's next submission (which waits for them) instead of
+  each view creation waiting for the GPU. Measured during loading: the GPU's 3D engine about 29% busy, pipeline
+  waits 0; loading runs at under 10 frames a second for other reasons (open).
 - *observed*: command-list slot 129 is `DispatchMesh(x, y, z)` (34 x 1 x 1 seen in a title's loading). Not
   implemented: such dispatches are dropped and counted (`d3d12.mesh_dispatches_dropped`).
 - The graphics library detiles textures out of title memory into its host copies on the CPU (sample-title

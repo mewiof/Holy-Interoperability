@@ -972,8 +972,14 @@ HRESULT create_compute_pipeline_from_code(Device* self, const uint8_t* code, siz
   stream_append(&stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &cs, sizeof(cs));
   std::vector<ProgramRef> programs{cached ? stored_program(key, stored_size)
                                           : intern_program(std::move(bytecode), on_disk ? key : 0)};
-  return create_recorded_pipeline(self, std::move(stream), std::move(programs), true, &kPipelineInfo,
-                                  kPipelineVtable.data(), pipeline);
+  const HRESULT hr = create_recorded_pipeline(self, std::move(stream), std::move(programs), true, &kPipelineInfo,
+                                              kPipelineVtable.data(), pipeline);
+  if (SUCCEEDED(hr)) {
+    if (Pipeline* made = as_pipeline(*pipeline)) {
+      for (int axis = 0; axis < 3; ++axis) made->threads[axis] = info.threads[axis];
+    }
+  }
+  return hr;
 }
 
 // A compute pipeline from the native code inside a shader container.

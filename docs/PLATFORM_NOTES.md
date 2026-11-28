@@ -1139,6 +1139,12 @@ Notes describe the platform, never a title.
   the library's rule, also used when a description leaves the layout to the driver). The tiling query answers
   for 64 KiB layouts only (*assumed* as on the console). Allocation sizes (device slots 25 and 108) are the
   console layout's, at its alignment (4 KiB for 4 KiB layouts) unless more is asked.
+- *observed*: command-list slot 101 is a driver hint `(feature, value)` ((2, 1, 4) seen), accepted and unused; slot
+  80 `DispatchX(x, y, z, flags)`, flag 0x20 *assumed* to make the counts threads (converted with the program's
+  group size). Neither is checked end to end yet.
+- *measured*: GPU heaps over physical-page storage were opened over 64 MiB blocks committed whole; titles map
+  their page pools sparsely and this charged 7.5 GiB of commit by three and a half minutes of loading (the host's
+  commit ran out). 8 MiB blocks: 2.1 GiB at the same point, 1,335 memory slots.
 - *observed*: command-list slot 129 is `DispatchMesh(x, y, z)` (34 x 1 x 1 seen in a title's loading). Not
   implemented: such dispatches are dropped and counted (`d3d12.mesh_dispatches_dropped`).
 - The graphics library detiles textures out of title memory into its host copies on the CPU (sample-title

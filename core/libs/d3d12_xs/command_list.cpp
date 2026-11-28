@@ -1080,6 +1080,42 @@ void STDMETHODCALLTYPE list_dispatch(CommandList* self, UINT x, UINT y, UINT z) 
   self->host->Dispatch(x, y, z);
 }
 
+// Observed (call shapes; slot numbers as an established map of the console
+// list gives them): slot 80 DispatchX(x, y, z, flags), a dispatch with
+// console flags; flag 0x20 makes the counts threads rather than groups
+// (*assumed* from that map), converted with the program's group size. Other
+// flags are logged once and ignored.
+void STDMETHODCALLTYPE list_dispatch_x(CommandList* self, UINT x, UINT y, UINT z, UINT flags) {
+  constexpr UINT kThreadCounts = 0x20;
+  if (flags & ~kThreadCounts) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 4) LIB_LOG(lib::kWarn, "d3d12", "console dispatch flags 0x%x not followed", flags);
+  }
+  if (flags & kThreadCounts) {
+    const Pipeline* pipeline = as_pipeline(self->pipeline);
+    if (!pipeline || !pipeline->threads[0]) {
+      HolyUnimplementedFrom(kLibrary, "ID3D12GraphicsCommandListX#80(thread counts, group size not known)",
+                            _ReturnAddress());
+      return;
+    }
+    x = (x + pipeline->threads[0] - 1) / pipeline->threads[0];
+    y = (y + pipeline->threads[1] - 1) / pipeline->threads[1];
+    z = (z + pipeline->threads[2] - 1) / pipeline->threads[2];
+  }
+  list_dispatch(self, x, y, z);
+}
+
+// Slot 101 DriverHintX(feature, value) (call shape (2, 1, 4) seen): a hint to
+// the console's driver; the host's has no use for it.
+uint64_t STDMETHODCALLTYPE list_driver_hint(CommandList*, uint64_t feature, uint64_t value) {
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 4) {
+    LIB_LOG(lib::kDebug, "d3d12", "driver hint %llu = %llu: not used", static_cast<unsigned long long>(feature),
+            static_cast<unsigned long long>(value));
+  }
+  return 0;
+}
+
 // Observed: slot 129 DispatchMesh(x, y, z), the desktop's mesh-program
 // dispatch (34 x 1 x 1 seen during a title's loading). Not implemented yet:
 // the dispatch is dropped and counted (d3d12.mesh_dispatches_dropped, and in
@@ -1157,6 +1193,8 @@ const auto kListVtable = [] {
   HOLY_D3D_SLOT(table, kCommandListObject, 85, list_copy_texture_region_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 86, list_copy_resource_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 129, list_dispatch_mesh);
+  HOLY_D3D_SLOT(table, kCommandListObject, 80, list_dispatch_x);
+  HOLY_D3D_SLOT(table, kCommandListObject, 101, list_driver_hint);
   HOLY_D3D_SLOT(table, kCommandListObject, 71, list_write_value_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 72, list_write_timestamp_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 74, list_write_fence_value_x);

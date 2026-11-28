@@ -220,7 +220,10 @@ void map_pages(uint64_t begin, uint64_t end, uint32_t first_slot, uint64_t heap_
 // heap opened from the section handle itself (OpenExistingHeapFromFileMapping)
 // leaves the whole section's commit charged to the system after the process
 // ends, and the host opens it only over fully committed sections.
-constexpr uint64_t kBlock = 64ull << 20;
+// 8 MiB: titles map their page pools sparsely (27 GiB reserved during a
+// title's loading), and 64 MiB blocks charged 7.5 GiB of commit, most of it
+// never touched (measured).
+constexpr uint64_t kBlock = 8ull << 20;
 
 struct SectionRecord {
   uint8_t* view = nullptr;  // the whole section

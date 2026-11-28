@@ -102,6 +102,8 @@ struct Pipeline : Wrapper {
   // reference held), and what it writes.
   Pipeline* ngg_compute = nullptr;
   NggInfo ngg{};
+  // Translated compute pipelines: the threads of a group (0: not known).
+  uint32_t threads[3] = {0, 0, 0};
   // The same pipeline drawing rectangle lists (a geometry program adds each
   // rectangle's fourth corner; shader/geometry.h), made at first such draw.
   std::shared_ptr<HostPipeline> rectangles;

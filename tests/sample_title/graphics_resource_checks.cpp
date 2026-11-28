@@ -716,13 +716,17 @@ double host_commit_left() {
 // it (the texture leaves the layout to the library: 4 KiB standard blocks;
 // 4-byte texels, x0 x1 y0 y1 y2 x2 in address bits 2-7: byte 180), so the
 // host copy is right only when detiled.
-enum class TextureMemory { Plain, Reserved, Physical, Unmapped, Placed, Aliased, Swizzled };
+// `Indirect`: plain memory, dispatched through a command signature of the
+// console's dispatch type and ExecuteIndirect (command-list slot 61) with the
+// group counts in title memory.
+enum class TextureMemory { Plain, Reserved, Physical, Unmapped, Placed, Aliased, Swizzled, Indirect };
 
 // The command list interface titles ask for.
 constexpr GUID kListIid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
 
 void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory kind) {
-  const bool after = kind != TextureMemory::Plain && kind != TextureMemory::Swizzled;
+  const bool indirect = kind == TextureMemory::Indirect;
+  const bool after = kind != TextureMemory::Plain && kind != TextureMemory::Swizzled && !indirect;
   const bool swizzled = kind == TextureMemory::Swizzled;
   void* allocator = nullptr;
   void* list = nullptr;
@@ -814,6 +818,7 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
                             : kind == TextureMemory::Placed   ? 0x30
                             : kind == TextureMemory::Aliased  ? 0x70
                             : swizzled                        ? 0xD0
+                            : indirect                        ? 0xE0
                                                               : 0xC0;
   const uint8_t texel_bytes[4] = {base_byte, static_cast<uint8_t>(base_byte + 0x10),
                                   static_cast<uint8_t>(base_byte + 0x20), 0xFF};
@@ -871,7 +876,21 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   call<void>(list, 35, 0u, table);
   call<void>(list, 39, 1u, 2u, static_cast<const void*>(constants), 0u);
   call<void>(list, 25, pipeline);
-  call<void>(list, 14, 1u, 1u, 1u);
+  void* indirect_signature = nullptr;
+  if (indirect) {
+    D3D12_INDIRECT_ARGUMENT_DESC dispatch{};
+    dispatch.Type = static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(105);  // the console's dispatch type
+    D3D12_COMMAND_SIGNATURE_DESC signature_desc{12, 1, &dispatch, 0};
+    call<HRESULT>(device, 41, &signature_desc, static_cast<void*>(nullptr), __uuidof(ID3D12CommandSignature),
+                  &indirect_signature);
+    auto* groups = reinterpret_cast<volatile uint32_t*>(reinterpret_cast<volatile uint8_t*>(output) + 0x100);
+    groups[0] = 1;
+    groups[1] = 1;
+    groups[2] = 1;
+    call<void>(list, 61, indirect_signature, 1u, placed, UINT64{0x100}, static_cast<void*>(nullptr), UINT64{0});
+  } else {
+    call<void>(list, 14, 1u, 1u, 1u);
+  }
   recorded = recorded && call<HRESULT>(list, 9) == S_OK;
   void* lists[] = {list};
   call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
@@ -903,6 +922,7 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
         : kind == TextureMemory::Aliased  ? "a placed texture shows what the title writes into its physical page at "
                                             "another address"
         : swizzled                        ? "a texture in title memory is read in the console GPU's layout (texel 5, 3)"
+        : indirect                        ? "indirect execution dispatches a native compute program"
                                           : "a texture viewed before its physical page was mapped shows what the title "
                                             "wrote there");
   if (kind == TextureMemory::Placed || kind == TextureMemory::Aliased) {
@@ -911,6 +931,7 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   if (placed_texture) call<ULONG>(placed_texture, 2);
 
   if (placed) call<ULONG>(placed, 2);
+  if (indirect_signature) call<ULONG>(indirect_signature, 2);
   call<ULONG>(pipeline, 2);
   call<ULONG>(signature, 2);
   call<ULONG>(heap, 2);
@@ -2565,6 +2586,7 @@ void test_graphics_resources(void* device, void* queue) {
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Placed);
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Aliased);
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Swizzled);
+    test_compute_reads_a_texture_view(device, queue, TextureMemory::Indirect);
   }
   test_allocation_hooks();
   test_placeholders();

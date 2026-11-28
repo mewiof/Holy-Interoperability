@@ -25,6 +25,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -803,6 +804,15 @@ const auto kCommandSignatureVtable = [] {
 // 105, seen alone with a 12-byte stride, is a dispatch.
 constexpr uint32_t kConsoleDispatchArgument = 105;
 
+// What each command signature does per command (its last argument's type),
+// and whether it also changes root arguments or buffers; for indirect
+// execution (command_list.cpp).
+std::mutex g_signatures_lock;
+std::unordered_map<const void*, std::pair<int, bool>>& signature_kinds() {
+  static auto* kinds = new std::unordered_map<const void*, std::pair<int, bool>>();
+  return *kinds;
+}
+
 HRESULT STDMETHODCALLTYPE create_command_signature(Device* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
                                                    const void* root_signature, REFIID, void** signature) {
   if (!signature || !desc) return E_POINTER;
@@ -832,8 +842,25 @@ HRESULT STDMETHODCALLTYPE create_command_signature(Device* self, const D3D12_COM
     return hr;
   }
   *signature = wrap(host, &kCommandSignatureInfo, kCommandSignatureVtable.data());
+  if (!arguments.empty()) {
+    std::lock_guard<std::mutex> hold(g_signatures_lock);
+    signature_kinds()[*signature] = {static_cast<int>(arguments.back().Type), arguments.size() > 1};
+  }
   return S_OK;
 }
+
+}  // namespace
+
+bool command_signature_kind(const void* signature, int* type, bool* changes_state) {
+  std::lock_guard<std::mutex> hold(g_signatures_lock);
+  auto it = signature_kinds().find(signature);
+  if (it == signature_kinds().end()) return false;
+  *type = it->second.first;
+  *changes_state = it->second.second;
+  return true;
+}
+
+namespace {
 
 const lib::VtableInfo kPipelineInfo{kLibrary, "ID3D12PipelineStateX"};
 

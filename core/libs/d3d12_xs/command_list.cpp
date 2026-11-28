@@ -40,7 +40,8 @@ namespace {
 
 // Recorded work, for recorded_work_summary.
 struct WorkCounts {
-  std::atomic<uint64_t> draws{0}, indexed{0}, ngg{0}, dispatches{0}, no_pipeline{0}, unbound{0}, mesh{0};
+  std::atomic<uint64_t> draws{0}, indexed{0}, ngg{0}, dispatches{0}, no_pipeline{0}, unbound{0}, mesh{0},
+      indirect{0}, indirect_dropped{0};
   std::atomic<uint64_t> clears{0}, depth_clears{0}, nonblack_clears{0};
 };
 WorkCounts g_work;
@@ -1116,6 +1117,59 @@ uint64_t STDMETHODCALLTYPE list_driver_hint(CommandList*, uint64_t feature, uint
   return 0;
 }
 
+// Observed (call shape (signature, 1, argument buffer, ...); the slot by the
+// established map of the console list): slot 61 ExecuteIndirect(signature,
+// max commands, argument buffer, argument offset, count buffer, count
+// offset), the desktop's. The list's state is bound as for the same work
+// recorded directly and the host executes the signature. Partial:
+// signatures that also change root arguments or buffers (the translated
+// programs' root layout is not the title's), NGG and mesh work, are dropped
+// and counted; indirect draws of translated programs see a first vertex and
+// instance of 0 (those live in GPU memory).
+void STDMETHODCALLTYPE list_execute_indirect(CommandList* self, void* signature, UINT max_commands, void* arguments,
+                                             UINT64 argument_offset, void* count, UINT64 count_offset) {
+  int type = -1;
+  bool changes_state = false;
+  auto* host_signature = host_of<ID3D12CommandSignature>(signature);
+  const Resource* args = copied(arguments, "an indirect execution");
+  const Resource* counts = count ? copied(count, "an indirect execution's count") : nullptr;
+  auto drop = [&](const char* why) {
+    g_work.indirect_dropped.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) {
+      LIB_LOG(lib::kError, "d3d12", "indirect execution (argument type %d, %u commands): %s, dropped", type,
+              max_commands, why);
+    }
+  };
+  if (!command_signature_kind(signature, &type, &changes_state) || !host_signature || !args || (count && !counts)) {
+    return drop("unknown signature or buffers");
+  }
+  if (!self->pipeline) return drop("no host pipeline");
+  if (changes_state) return drop("the signature changes root arguments or buffers");
+  g_work.indirect.fetch_add(1, std::memory_order_relaxed);
+  mark_work(self);
+  if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
+    if (self->translated) {
+      if (!bind_translated_compute(self)) return report_unbound("an indirect dispatch");
+    } else {
+      bind_title_root(self, true);
+    }
+  } else if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW || type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED) {
+    NggPipeline ngg;
+    if (self->translated && ngg_pipeline(self->pipeline, &ngg)) return drop("NGG programs");
+    bind_draw_pipeline(self);
+    if (self->translated) {
+      if (!bind_translated_graphics(self, 0, 0)) return report_unbound("an indirect draw");
+    } else {
+      bind_title_root(self, false);
+    }
+  } else {
+    return drop("not a draw or dispatch");
+  }
+  self->host->ExecuteIndirect(host_signature, max_commands, args->host, buffer_slack(args) + argument_offset,
+                              counts ? counts->host : nullptr, counts ? buffer_slack(counts) + count_offset : 0);
+}
+
 // Observed: slot 129 DispatchMesh(x, y, z), the desktop's mesh-program
 // dispatch (34 x 1 x 1 seen during a title's loading). Not implemented yet:
 // the dispatch is dropped and counted (d3d12.mesh_dispatches_dropped, and in
@@ -1194,6 +1248,7 @@ const auto kListVtable = [] {
   HOLY_D3D_SLOT(table, kCommandListObject, 86, list_copy_resource_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 129, list_dispatch_mesh);
   HOLY_D3D_SLOT(table, kCommandListObject, 80, list_dispatch_x);
+  HOLY_D3D_SLOT(table, kCommandListObject, 61, list_execute_indirect);
   HOLY_D3D_SLOT(table, kCommandListObject, 101, list_driver_hint);
   HOLY_D3D_SLOT(table, kCommandListObject, 71, list_write_value_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 72, list_write_timestamp_x);
@@ -1215,10 +1270,11 @@ std::string recorded_work_summary() {
   char text[320];
   std::snprintf(text, sizeof(text),
                 "%llu draws (%llu NGG), %llu indexed draws, %llu dispatches, %llu colour clears (%llu not black), "
-                "%llu depth clears; dropped: %llu without a host pipeline, %llu unbound, %llu mesh dispatches",
+                "%llu depth clears, %llu indirect; dropped: %llu without a host pipeline, %llu unbound, %llu mesh "
+                "dispatches, %llu indirect",
                 take(g_work.draws), take(g_work.ngg), take(g_work.indexed), take(g_work.dispatches),
-                take(g_work.clears), take(g_work.nonblack_clears), take(g_work.depth_clears),
-                take(g_work.no_pipeline), take(g_work.unbound), take(g_work.mesh));
+                take(g_work.clears), take(g_work.nonblack_clears), take(g_work.depth_clears), take(g_work.indirect),
+                take(g_work.no_pipeline), take(g_work.unbound), take(g_work.mesh), take(g_work.indirect_dropped));
   return text;
 }
 

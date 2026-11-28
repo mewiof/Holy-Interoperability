@@ -1139,6 +1139,12 @@ Notes describe the platform, never a title.
   the library's rule, also used when a description leaves the layout to the driver). The tiling query answers
   for 64 KiB layouts only (*assumed* as on the console). Allocation sizes (device slots 25 and 108) are the
   console layout's, at its alignment (4 KiB for 4 KiB layouts) unless more is asked.
+- *observed*: command-list slot 61 is `ExecuteIndirect(signature, max commands, argument buffer, offset, count
+  buffer, offset)` (one dispatch seen 5 minutes into a title's loading). The list's state is bound as for the
+  same work recorded directly and the host executes the signature (sample-title check: a native compute program
+  dispatched with the console's dispatch argument type). Partial: signatures that also change root arguments or
+  buffers, NGG and mesh work are dropped and counted; indirect draws of translated programs see a first vertex
+  and instance of 0.
 - *observed*: command-list slot 101 is a driver hint `(feature, value)` ((2, 1, 4) seen), accepted and unused; slot
   80 `DispatchX(x, y, z, flags)`, flag 0x20 *assumed* to make the counts threads (converted with the program's
   group size). Neither is checked end to end yet.

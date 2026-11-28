@@ -16,6 +16,11 @@
 namespace holy::d3d12 {
 
 inline constexpr char kLibrary[] = "d3d12_xs.dll";
+
+// What a command signature (device slot 41) does per command: the
+// D3D12_INDIRECT_ARGUMENT_TYPE of its last argument, and whether arguments
+// before it change root arguments or buffers. False for unknown objects.
+bool command_signature_kind(const void* signature, int* type, bool* changes_state);
 inline constexpr int kDeviceSlots = 160;
 inline constexpr int kQueueSlots = 64;
 inline constexpr int kCommandListSlots = 200;

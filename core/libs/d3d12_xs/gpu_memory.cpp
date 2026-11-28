@@ -534,6 +534,7 @@ const std::pair<uint64_t, HeapRecord>* section_span(Device* device, HANDLE secti
   const HRESULT hr = d13 ? d13->OpenExistingHeapFromAddress1(record.view + first, last - first, IID_PPV_ARGS(&heap))
                          : E_NOINTERFACE;
   check_point("GPU heap over physical pages");
+  if (SUCCEEDED(hr) && heap) heap->SetName(L"holy heap over physical pages");
   if (FAILED(hr)) {
     LIB_LOG(lib::kError, "d3d12", "cannot open a GPU heap over physical pages (0x%08lX)", static_cast<unsigned long>(hr));
     return nullptr;
@@ -685,6 +686,7 @@ bool locate_range(Device* device, uint64_t title_va, uint64_t size, Backing* out
     hr = d3->OpenExistingHeapFromAddress(reinterpret_cast<void*>(base), IID_PPV_ARGS(&heap));
     if (FAILED(hr)) whole = false;
   }
+  if (SUCCEEDED(hr) && heap) heap->SetName(L"holy heap over title memory");
   bool grown = false;
   if (!whole) {
     // The committed run holding the address, found walking the allocation's

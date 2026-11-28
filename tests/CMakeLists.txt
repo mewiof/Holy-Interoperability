@@ -19,6 +19,10 @@ add_executable(holy_unit_tests
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/shader/translate.cpp
   unit/test_strings.cpp
   unit/test_texture_layout.cpp
+  unit/test_gpu_layout.cpp
+  ${PROJECT_SOURCE_DIR}/core/libs/gpu_layout.cpp
+  unit/test_texture_codec.cpp
+  ${PROJECT_SOURCE_DIR}/core/libs/texture_codec.cpp
   unit/test_vfs.cpp
   unit/test_write_watch.cpp
   ${PROJECT_SOURCE_DIR}/core/libs/d3d12_xs/write_watch.cpp

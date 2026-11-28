@@ -835,6 +835,13 @@ Notes describe the platform, never a title.
 - *measured*: zlib requests whose streams inflate to exactly their destination's size failed when inflated in
   place in title memory (invalid data; the decoder reads its output back) and succeeded into private memory: the
   title then used the unwritten memory. Requests are now inflated into memory of the worker's and copied.
+- *observed*: option bits 1-4 name a block format (1, 5, 6, 7 seen: BC1, BC5, BC6H, BC7) for the console's texture
+  codec, which packs block-compressed data losslessly (12 or 16 interleaved entropy-coded lanes, per-block
+  references to earlier blocks or a dictionary, residuals). Implemented in core/libs/texture_codec.h from the
+  format's description; its constant tables (models, ranks, control words, dictionaries; 77,982 bytes) are not
+  part of this project and are read from a file the user names. Measured: all of a title's codec requests in its
+  first three minutes of loading decode (24.5 MB), about 32 MB/s on one worker. Unit tests on streams made with
+  tables of the tests' own.
 - *assumed*: queue slots 5 `EnqueueSignal(fence, value)` and 6 `Submit()`, status array slots 3
   `IsComplete(index)` and 4 `GetHResult(index)`, in the desktop order (not yet called by titles).
 - Implementation: requests are carried out when enqueued (reads through the title's path translation, zlib
@@ -1113,10 +1120,27 @@ Notes describe the platform, never a title.
 - *observed*: titles fill textures through the computer: slot 8 `CopyIntoSubresource(destination base, plane,
   subresource, source, source row pitch, source slice pitch)`, called per subresource; the result is not
   checked.
-- Implementation: the layout a title follows is the one this library reports, so it is chosen to be the
-  desktop's copyable footprint layout (subresources in order, each at a multiple of 512 bytes, rows 256 bytes
-  apart; core/libs/texture_layout.h); the swizzle mode reported is 0 (*assumed* linear; titles then create the
-  texture with layout 0x100, linear). Other computer slots report themselves.
+- *observed*: titles stream textures from their archives already laid out in the console GPU's own layout (64 KiB
+  tiles land at the level offsets the layout gives, through page lists of the fast-storage API), size their
+  memory by it, and read level ranges out of compressed archive chunks by it: a size 4 KiB short of the
+  console's stopped a title at its own check that a read covers a whole compressed chunk.
+- Implementation: core/libs/gpu_layout.h, the GPU family's surface layout as AMD's public address library
+  (MIT, in Mesa) describes this generation: thin and thick block shapes, the mip tail (at most 8 levels in 4 KiB
+  blocks, 12 in 64 KiB; thick 5 and 10) at the start of each slice with level 0 last, the linear rules, the
+  256-byte micro block patterns of the standard and display modes; depth with stencil as two planes. Unit
+  tests check sizes, tail placement and a hash of every element's address against that library's results for
+  21 descriptions. Not modelled: the pipe and bank XOR modes' addressing (render and depth targets, which the host
+  renders), compression metadata planes.
+- *observed* computer slots: 2 the layout record, 6 an element's offset, 8 `CopyIntoSubresource`, 9
+  `CopyFromSubresource(rows, plane, subresource, sample, texture memory, row pitch, depth pitch)`, 10 the 64 KiB
+  tiling. All follow the console layout. `XGSuggestSwizzleMode` returns 0x100 plus the mode: linear for 1D, the
+  64 KiB Z mode for depth targets, the 64 KiB R mode for render targets, otherwise 4 KiB standard (*assumed*
+  the library's rule, also used when a description leaves the layout to the driver). The tiling query answers
+  for 64 KiB layouts only (*assumed* as on the console). Allocation sizes (device slots 25 and 108) are the
+  console layout's, at its alignment (4 KiB for 4 KiB layouts) unless more is asked.
+- The graphics library detiles textures out of title memory into its host copies on the CPU (sample-title
+  check: a texel read at (5, 3) where only detiling finds it). Open: detiling on the GPU, and reading only the
+  levels a streamed texture has (its smaller levels lie first).
 - *observed*: computers are not COM objects in the desktop's slot order. Titles release them through slot 1 (their
   wrappers' destructors, and after one-off queries) and call slot 2 with a structure to fill: room for 0x1b38
   bytes, a header of 0x18, then plane records of 0x6c8 bytes; titles copy one plane record out by plane index and

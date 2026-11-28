@@ -17,11 +17,40 @@
 #include "core/libs/d3d12_xs/gpu_memory.h"
 #include "core/libs/d3d12_xs/page_cache.h"
 #include "core/libs/d3d12_xs/write_watch.h"
+#include "core/libs/gpu_layout.h"
 #include "core/libs/support.h"
 #include "core/libs/texture_layout.h"
 
 namespace holy::d3d12 {
 namespace {
+
+namespace gpu = lib::gpu;
+
+// The layout a texture has in title memory: the console GPU's
+// (gpu_layout.h), as the layout library reports it to titles and titles
+// stream textures in. False where it does not cover the description (formats
+// of no power-of-two element size, depth with stencil): such memory is read
+// as the desktop's copyable footprints.
+bool console_layout(const D3D12_RESOURCE_DESC& desc, gpu::Texture* out) {
+  static const bool off = [] {
+    wchar_t text[4] = {};
+    return GetEnvironmentVariableW(L"HOLY_TEXTURE_DETILE", text, 4) && text[0] == L'0';
+  }();
+  if (off) return false;
+  return gpu::texture_from_desc(static_cast<uint32_t>(desc.Dimension), desc.Width, desc.Height, desc.DepthOrArraySize,
+                                desc.MipLevels, static_cast<uint32_t>(desc.Format), desc.SampleDesc.Count,
+                                static_cast<uint32_t>(desc.Layout), static_cast<uint32_t>(desc.Flags), out) &&
+         out->plane_count == 1 && out->planes[0].addressable;
+}
+
+const lib::Counter& c_detiled() {
+  static const lib::Counter counter("d3d12.textures_detiled");
+  return counter;
+}
+const lib::Counter& c_detiled_bytes() {
+  static const lib::Counter counter("d3d12.texture_bytes_detiled");
+  return counter;
+}
 
 using Key = std::tuple<uint64_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t>;
 
@@ -391,6 +420,14 @@ uint64_t submit_upload(Uploader* up) {
   return up->value;
 }
 
+lib::TextureShape shape_of(const D3D12_RESOURCE_DESC& desc);
+
+// Bytes the texture takes in title memory.
+uint64_t memory_size(const D3D12_RESOURCE_DESC& desc) {
+  gpu::Texture t;
+  return console_layout(desc, &t) ? t.size : lib::texture_size(shape_of(desc));
+}
+
 lib::TextureShape shape_of(const D3D12_RESOURCE_DESC& desc) {
   lib::TextureShape shape;
   shape.dimension = static_cast<uint32_t>(desc.Dimension);
@@ -450,8 +487,7 @@ bool readable(uint64_t address, uint64_t size) {
   return true;
 }
 
-// An upload buffer holding a copy of `size` bytes of title memory.
-ID3D12Resource* staged_copy(Device* device, uint64_t address, uint64_t size) {
+ID3D12Resource* upload_buffer(Device* device, uint64_t size) {
   D3D12_HEAP_PROPERTIES heap{};
   heap.Type = D3D12_HEAP_TYPE_UPLOAD;
   D3D12_RESOURCE_DESC desc{};
@@ -467,6 +503,72 @@ ID3D12Resource* staged_copy(Device* device, uint64_t address, uint64_t size) {
                                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&buffer)))) {
     return nullptr;
   }
+  buffer->SetName(L"holy detiled texture staging");
+  return buffer;
+}
+
+// Every subresource of a texture in the console's layout at `address`, into
+// `staging` as the desktop's footprints (lib::subresource_layout).
+bool detile_all(const gpu::Layout& layout, uint64_t address, uint64_t size, const lib::TextureShape& shape,
+                uint8_t* staging) {
+  const uint32_t count = lib::subresource_count(shape);
+  for (uint32_t index = 0; index < count; ++index) {
+    lib::SubresourceLayout footprint;
+    if (!lib::subresource_layout(shape, index, &footprint)) return false;
+    const uint32_t mip = index % shape.mips, slice = index / shape.mips;
+    if (!gpu::detile(layout, reinterpret_cast<const uint8_t*>(address), size, mip,
+                     shape.dimension == 4 ? 0 : slice, staging + footprint.offset, footprint.row_pitch,
+                     static_cast<uint64_t>(footprint.row_pitch) * footprint.rows)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// detile_all, false when the title memory cannot be read (the access faults;
+// memory committed on first touch is committed by the runtime's handler
+// first). No C++ objects here (structured exception handling); the call is
+// opaque so the handler stays around it.
+bool (*volatile g_detile_all)(const gpu::Layout&, uint64_t, uint64_t, const lib::TextureShape&, uint8_t*) =
+    &detile_all;
+bool detile_title_memory(const gpu::Layout& layout, uint64_t address, uint64_t size, const lib::TextureShape& shape,
+                         uint8_t* staging) {
+  __try {
+    return g_detile_all(layout, address, size, shape, staging);
+  } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                               : EXCEPTION_CONTINUE_SEARCH) {
+    return false;
+  }
+}
+
+// An upload buffer holding the texture at `address` (in the console's
+// layout) as the desktop's footprints.
+ID3D12Resource* detiled_copy(Device* device, const gpu::Texture& t, uint64_t address, const lib::TextureShape& shape) {
+  const uint64_t footprints = lib::texture_size(shape);
+  if (!footprints) return nullptr;
+  ID3D12Resource* buffer = upload_buffer(device, footprints);
+  if (!buffer) return nullptr;
+  void* mapped = nullptr;
+  if (FAILED(buffer->Map(0, nullptr, &mapped))) {
+    buffer->Release();
+    return nullptr;
+  }
+  const bool copied = detile_title_memory(t.planes[0], address, t.size, shape, static_cast<uint8_t*>(mapped));
+  buffer->Unmap(0, nullptr);
+  if (!copied) {
+    buffer->Release();
+    return nullptr;
+  }
+  c_detiled().add(1);
+  c_detiled_bytes().add(static_cast<int64_t>(footprints));
+  return buffer;
+}
+
+// An upload buffer holding a copy of `size` bytes of title memory.
+ID3D12Resource* staged_copy(Device* device, uint64_t address, uint64_t size) {
+  ID3D12Resource* buffer = upload_buffer(device, size);
+  if (!buffer) return nullptr;
+  buffer->SetName(L"holy texture staging");
   void* mapped = nullptr;
   if (FAILED(buffer->Map(0, nullptr, &mapped))) {
     buffer->Release();
@@ -495,9 +597,17 @@ bool record_fill(Device* device, Uploader* up, const Record& record, ID3D12Resou
   // Observed: titles stream textures into pages of a pool mapped one by one
   // into an address range (queue slot 31), so no host heap backs such a
   // texture as a whole; the CPU reads it through the title's addresses.
-  const bool located = locate(device, record.address, &backing, record.size);
+  // Textures in the console's layout are detiled by the CPU into the
+  // desktop's footprints on the way.
+  gpu::Texture console;
+  const bool tiled = console_layout(record.desc, &console);
+  const bool located = !tiled && locate(device, record.address, &backing, record.size);
   bool is_readable = false;
-  if (located && backing.whole && backing.contiguous >= record.size) {
+  if (tiled) {
+    source_buffer = detiled_copy(device, console, record.address, shape);
+    is_readable = source_buffer != nullptr;
+    if (source_buffer) up->staging.push_back(source_buffer);
+  } else if (located && backing.whole && backing.contiguous >= record.size) {
     source_buffer = backing.whole;
     source_offset = backing.heap_offset;
   } else {
@@ -583,7 +693,7 @@ namespace {
 ID3D12Resource* memory_texture(Device* device, const D3D12_RESOURCE_DESC& desc, uint64_t address) {
   const lib::TextureShape shape = shape_of(desc);
   const Key key = key_of(address, shape);
-  const uint64_t size = lib::texture_size(shape);
+  const uint64_t size = memory_size(desc);
   if (!size) return nullptr;
   std::lock_guard<std::mutex> guard(g_lock);
   apply_changes();
@@ -610,6 +720,7 @@ ID3D12Resource* memory_texture(Device* device, const D3D12_RESOURCE_DESC& desc, 
   const HRESULT hr = device->host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &host_desc,
                                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                            IID_PPV_ARGS(&texture));
+  if (SUCCEEDED(hr)) texture->SetName(L"holy placed texture following its memory");
   LIB_LOG(hr < 0 ? lib::kError : lib::kDebug, "d3d12",
           "placed texture dim %d %llux%ux%u, %u mips, format %u, flags 0x%x at %p, following its memory -> 0x%08lX",
           desc.Dimension, static_cast<unsigned long long>(desc.Width), desc.Height, desc.DepthOrArraySize,
@@ -730,7 +841,7 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   auto found = textures().find(key);
   if (found != textures().end()) return found->second->texture;
 
-  const uint64_t size = lib::texture_size(shape);
+  const uint64_t size = memory_size(desc);
   if (!size) return nullptr;
   Uploader* up = uploader(device);
   if (!up) return nullptr;
@@ -778,6 +889,7 @@ ID3D12Resource* texture_at(Device* device, const D3D12_RESOURCE_DESC& desc, uint
   ID3D12Resource* texture = nullptr;
   HRESULT hr = device->host->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &host_desc,
                                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture));
+  if (SUCCEEDED(hr)) texture->SetName(L"holy texture viewed in title memory");
   if (FAILED(hr)) {
     LIB_LOG(lib::kError, "d3d12", "host texture of format %u %llux%u refused (0x%08lX)", shape.format,
             static_cast<unsigned long long>(shape.width), shape.height, static_cast<unsigned long>(hr));

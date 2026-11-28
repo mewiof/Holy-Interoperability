@@ -46,16 +46,23 @@ inline void name_vtable(void* const* vtable, const VtableInfo* info) {
   if (index < 8) g_named_vtables[index] = {vtable, info};
 }
 
+// Reads `size` bytes at `address` into `out`; false where the memory cannot
+// be read. Used to probe values that may be any number: structured exception
+// handling does not cover plain loads in clang-cl builds (only faults in
+// calls), so the probe goes through the host, which checks the address.
+inline bool probe_read(const void* address, void* out, size_t size) {
+  SIZE_T read = 0;
+  return address && ReadProcessMemory(GetCurrentProcess(), address, out, size, &read) && read == size;
+}
+
 // The named `VtableInfo` of `candidate`'s vtable, or null. Guarded: the
 // candidate may be any value.
 inline const VtableInfo* named_vtable_info(const void* candidate) {
-  __try {
-    void* const* vtable = candidate ? *static_cast<void* const* const*>(candidate) : nullptr;
-    const int count = g_named_vtable_count.load() < 8 ? g_named_vtable_count.load() : 8;
-    for (int i = 0; vtable && i < count; ++i) {
-      if (g_named_vtables[i].vtable == vtable) return g_named_vtables[i].info;
-    }
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  void* const* vtable = nullptr;
+  if (!probe_read(candidate, &vtable, sizeof(vtable)) || !vtable) return nullptr;
+  const int count = g_named_vtable_count.load() < 8 ? g_named_vtable_count.load() : 8;
+  for (int i = 0; i < count; ++i) {
+    if (g_named_vtables[i].vtable == vtable) return g_named_vtables[i].info;
   }
   return nullptr;
 }
@@ -63,12 +70,10 @@ inline const VtableInfo* named_vtable_info(const void* candidate) {
 // True if `candidate` is an object whose vtable has `stub` in `slot`. Guarded:
 // the candidate may be any value.
 inline bool owns_stub(const void* candidate, int slot, const void* stub) {
-  __try {
-    const auto* object = static_cast<const ReportingObject*>(candidate);
-    return object && object->vtable && object->vtable[slot] == stub && object->info;
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return false;
-  }
+  ReportingObject object{};
+  if (!probe_read(candidate, &object, sizeof(object)) || !object.vtable || !object.info) return false;
+  const void* in_slot = nullptr;
+  return probe_read(object.vtable + slot, &in_slot, sizeof(in_slot)) && in_slot == stub;
 }
 
 // Methods that return a structure are called C-style by some console

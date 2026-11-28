@@ -1079,6 +1079,18 @@ void STDMETHODCALLTYPE list_dispatch(CommandList* self, UINT x, UINT y, UINT z) 
   self->host->Dispatch(x, y, z);
 }
 
+// Observed (call shapes): slot 85 CopyTextureRegionX and slot 86
+// CopyResourceX take the desktop CopyTextureRegion and CopyResource
+// arguments and a trailing flags word (0 seen); the copies are the same.
+void STDMETHODCALLTYPE list_copy_texture_region_x(CommandList* self, const D3D12_TEXTURE_COPY_LOCATION* destination,
+                                                  UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* source,
+                                                  const D3D12_BOX* box, UINT) {
+  list_copy_texture_region(self, destination, x, y, z, source, box);
+}
+void STDMETHODCALLTYPE list_copy_resource_x(CommandList* self, void* destination, void* source, UINT) {
+  list_copy_resource(self, destination, source);
+}
+
 const auto kListVtable = [] {
   auto table = lib::make_reporting_vtable<kCommandListSlots>();
   HOLY_D3D_SLOT(table, kCommandListObject, 0, list_query_interface);
@@ -1121,6 +1133,8 @@ const auto kListVtable = [] {
   HOLY_D3D_SLOT(table, kCommandListObject, 32, list_set_descriptor_heaps);
   HOLY_D3D_SLOT(table, kCommandListObject, 52, list_clear_render_target_view);
   HOLY_D3D_SLOT(table, kCommandListObject, 62, list_copy_memory_x);
+  HOLY_D3D_SLOT(table, kCommandListObject, 85, list_copy_texture_region_x);
+  HOLY_D3D_SLOT(table, kCommandListObject, 86, list_copy_resource_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 71, list_write_value_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 72, list_write_timestamp_x);
   HOLY_D3D_SLOT(table, kCommandListObject, 74, list_write_fence_value_x);

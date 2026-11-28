@@ -435,7 +435,7 @@ void test_deferred_commit() {
 }
 
 // The texture layout library: swizzle mode suggestion, and copies into the
-// layout it reports (desktop copyable footprints: rows 256 bytes apart).
+// layout it reports: the console GPU's (core/libs/gpu_layout.h).
 void test_texture_layout() {
   HMODULE xg = LoadLibraryW(L"xg_xs.dll");
   using SuggestFn = HRESULT(WINAPI*)(const void*, uint32_t, uint32_t*);
@@ -459,23 +459,33 @@ void test_texture_layout() {
   std::memcpy(desc + 32, &format, 4);
   std::memcpy(desc + 36, &samples, 4);
   uint32_t mode = 0xFFFFFFFF;
-  check(suggest(desc, 0, &mode) == S_OK && mode == 0, "the layout library suggests a swizzle mode");
+  check(suggest(desc, 0, &mode) == S_OK && mode == 0x105, "the layout library suggests 4 KiB standard swizzle");
   void* computer = nullptr;
   check(create(desc, &computer) == S_OK && computer, "the layout library creates texture computers");
   if (!computer) return;
   using CopyFn = HRESULT(STDMETHODCALLTYPE*)(void*, void*, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
+  // 4 KiB standard blocks of 1-byte texels: x in address bits 0-3, y in 4-7
+  // inside the 256-byte micro block.
   const uint8_t texels[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-  std::vector<uint8_t> memory(512, 0xEE);
+  std::vector<uint8_t> memory(4096, 0xEE);
   const HRESULT copied =
       reinterpret_cast<CopyFn>((*static_cast<void***>(computer))[8])(computer, memory.data(), 0, 0, texels, 4, 8);
-  check(copied == S_OK && memory[0] == 1 && memory[3] == 4 && memory[4] == 0xEE && memory[256] == 5 &&
-            memory[259] == 8,
-        "texture computers copy texels into rows 256 bytes apart");
+  check(copied == S_OK && memory[0] == 1 && memory[3] == 4 && memory[4] == 0xEE && memory[16] == 5 &&
+            memory[19] == 8,
+        "texture computers copy texels into the console's swizzled layout");
+  // Slot 9: and out of it again.
+  using CopyFromFn =
+      HRESULT(STDMETHODCALLTYPE*)(void*, void*, uint32_t, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
+  uint8_t back[8] = {};
+  check(reinterpret_cast<CopyFromFn>((*static_cast<void***>(computer))[9])(computer, back, 0, 0, 0, memory.data(), 4,
+                                                                          8) == S_OK &&
+            std::memcmp(back, texels, 8) == 0,
+        "texture computers copy texels out of the console's layout");
   // Slot 6: the byte offset of a texel, in the same layout.
   using OffsetFn = uint64_t(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t,
                                                 uint32_t*);
   const auto offset = reinterpret_cast<OffsetFn>((*static_cast<void***>(computer))[6]);
-  check(offset(computer, 0, 0, 3, 1, 0, 0, nullptr) == 259 && offset(computer, 0, 0, 0, 0, 0, 0, nullptr) == 0,
+  check(offset(computer, 0, 0, 3, 1, 0, 0, nullptr) == 19 && offset(computer, 0, 0, 0, 0, 0, 0, nullptr) == 0,
         "texture computers give texel offsets in the layout they copy into");
   // Slot 2: the layout, as titles read it (a header of 0x18 bytes, plane
   // records of 0x6c8, level records of 0x70 from 0x38 in a plane: bytes,
@@ -488,13 +498,14 @@ void test_texture_layout() {
   std::memcpy(&level_bytes, layout.data() + 0x18 + 0x38, 8);
   std::memcpy(&row_pitch, layout.data() + 0x18 + 0x38 + 0x1c, 4);
   std::memcpy(&array_pitch, layout.data() + 0x18 + 0x10, 8);
-  check(level_bytes == 512 && row_pitch == 256 && array_pitch == 512 && layout[0x1b37] == 0,
+  check(level_bytes == 4096 && row_pitch == 64 && array_pitch == 4096 && layout[0x1b37] == 0,
         "texture computers describe their layout (slot 2)");
   reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(computer))[1])(computer);
 
   // Slot 10, resource tiling, in the console's order: a 512x512 BC7 texture
-  // of 10 levels in 2 array slices takes 6 tiles a slice (level 0: 4, level
-  // 1: 1, levels 2-9 in the mip tail: 1), the mip tail first, level 0 last.
+  // of 10 levels in 2 array slices in 64 KiB standard blocks takes 6 tiles a
+  // slice (level 0: 4, level 1: 1, levels 2-9 in the mip tail: 1), the mip
+  // tail first, level 0 last. A layout of 4 KiB blocks has no tiling.
   const uint32_t bc7 = 98;
   const uint64_t size = 512;
   const uint32_t tall = 512;
@@ -504,6 +515,17 @@ void test_texture_layout() {
   std::memcpy(desc + 28, &slices, 2);
   std::memcpy(desc + 30, &levels, 2);
   std::memcpy(desc + 32, &bc7, 4);
+  using TilingProbeFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT*, void*, void*, UINT*, UINT, void*);
+  computer = nullptr;
+  if (create(desc, &computer) == S_OK && computer) {
+    UINT probe_tiles = 0;
+    check(FAILED(reinterpret_cast<TilingProbeFn>((*static_cast<void***>(computer))[10])(
+              computer, &probe_tiles, nullptr, nullptr, nullptr, 0, nullptr)),
+          "resource tiling is refused for layouts of 4 KiB blocks");
+    reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>((*static_cast<void***>(computer))[1])(computer);
+  }
+  const uint32_t standard_64k = 0x109;
+  std::memcpy(desc + 44, &standard_64k, 4);
   computer = nullptr;
   check(create(desc, &computer) == S_OK && computer, "the layout library creates computers for arrays");
   if (!computer) return;

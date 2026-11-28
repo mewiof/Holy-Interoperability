@@ -51,6 +51,8 @@ holy_add_system_library(holy_lib_d3d12_xs
     texture_dump.cpp
     texture_dump.h
     texture_upload.cpp
+    ../gpu_layout.cpp
+    ../gpu_layout.h
     texture_upload.h
     translation_cache.cpp
     translation_cache.h

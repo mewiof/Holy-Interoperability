@@ -30,6 +30,7 @@
 
 #include "core/libs/inflate.h"
 #include "core/libs/support.h"
+#include "core/libs/texture_codec.h"
 #include "core/libs/vtable.h"
 
 namespace {
@@ -190,7 +191,7 @@ const holy::lib::VtableInfo kQueueInfo{kLibrary, "IDStorageQueueX"};
 struct Operation {
   enum Kind { kRequest, kStatus, kSignal } kind = kRequest;
   uint64_t options = 0, destination = 0, page_offset = 0, source = 0, offset = 0;
-  uint32_t destination_size = 0, source_size = 0;
+  uint32_t destination_size = 0, source_size = 0, intermediate_size = 0;
   struct StatusArray* array = nullptr;
   uint32_t index = 0;
   IUnknown* fence = nullptr;
@@ -231,12 +232,15 @@ ULONG STDMETHODCALLTYPE queue_release(Queue* self) {
 // field at 0x10, where the destination is otherwise an address. Observed: the
 // title's texture streaming (bit 21 with zlib streams of 4 KiB, and with the
 // format below) fills the lists after enqueueing, before submitting.
-// Requests with any of bits 1-4 set and bit 0 clear (options 0x200002,
-// 0x20000a, 0x20000e) have sources smaller than their 64 KiB destinations and
-// are not zlib streams: compressed in the console's texture codec, bits 1-4
-// *assumed* the block-compression format number (1, 5 and 7 seen). Not
-// implemented: such requests fail (their status says so) and are counted,
-// rather than leaving compressed bytes where the title expects texels.
+// Requests with any of bits 1-4 set (options 0x200002, 0x20000a, 0x20000c,
+// 0x20000e seen) have sources smaller than their destinations (64 KiB and
+// 1 MiB) and are not zlib streams: the console's texture codec
+// (core/libs/texture_codec.h), bits 1-4 the block format number (1, 5, 6 and
+// 7 seen). With bit 0 as well the source is a zlib stream inflating to the
+// size at 0x34, then decoded (assumed: zlib first). The codec needs the
+// format's constant tables, which this project does not ship: without them
+// such requests fail (their status says so) and are counted, rather than
+// leaving compressed bytes where the title expects texels.
 constexpr uint64_t kSourceMemory = 1ull << 22;
 constexpr uint64_t kPageDestination = 1ull << 21;
 constexpr uint64_t kCompressed = 1ull;
@@ -326,6 +330,7 @@ HRESULT STDMETHODCALLTYPE enqueue_request(Queue* self, const uint8_t* request) {
   std::memcpy(&op.source, request + 0x20, 8);
   std::memcpy(&op.offset, request + 0x28, 8);
   std::memcpy(&op.source_size, request + 0x30, 4);
+  std::memcpy(&op.intermediate_size, request + 0x34, 4);
   if (!op.destination || !op.source) return E_INVALIDARG;
   enqueue(self, op);
   return S_OK;
@@ -411,6 +416,65 @@ HRESULT deliver(const Operation& op, const void* data, size_t size) {
   return written == size ? S_OK : HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
 }
 
+// The codec's constant tables: the file HOLY_TEXTURE_CODEC_TABLES names, else
+// texture-codec-tables.bin in the directory holding the titles' data
+// directories. Read once; null when absent or invalid (said once).
+const holy::lib::codec::Tables* codec_tables() {
+  static const holy::lib::codec::TablesPtr tables = [] {
+    std::wstring path;
+    wchar_t named[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"HOLY_TEXTURE_CODEC_TABLES", named, MAX_PATH)) {
+      path = named;
+    } else if (const wchar_t* data = HolyDataDir(); data && *data) {
+      // <root>/titles/<data key>: the root's file.
+      path = data;
+      for (int up = 0; up < 2 && !path.empty(); ++up) {
+        const size_t slash = path.find_last_of(L"\\/");
+        path.resize(slash == std::wstring::npos ? 0 : slash);
+      }
+      if (!path.empty()) path += L"\\texture-codec-tables.bin";
+    }
+    std::vector<uint8_t> bytes;
+    if (!path.empty()) {
+      const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+      if (file != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER size{};
+        DWORD got = 0;
+        if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart < (1 << 20)) {
+          bytes.resize(static_cast<size_t>(size.QuadPart));
+          if (!ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &got, nullptr) || got != bytes.size()) {
+            bytes.clear();
+          }
+        }
+        CloseHandle(file);
+      }
+    }
+    std::string why;
+    holy::lib::codec::TablesPtr parsed =
+        bytes.empty() ? nullptr : holy::lib::codec::parse_tables(bytes.data(), bytes.size(), &why);
+    if (parsed) {
+      LIB_LOG(holy::lib::kInfo, "dstorage", "the texture codec's tables are loaded (%zu bytes)", bytes.size());
+    } else {
+      LIB_LOG(holy::lib::kWarn, "dstorage",
+              "the texture codec has no tables (%s): its requests fail. The tables are not part of this project; "
+              "name a file holding them (%zu bytes) with HOLY_TEXTURE_CODEC_TABLES",
+              bytes.empty() ? "no file" : why.c_str(), holy::lib::codec::kTablesSize);
+    }
+    return parsed;
+  }();
+  return tables.get();
+}
+
+const holy::lib::Counter& c_codec_bytes() {
+  static const holy::lib::Counter counter("dstorage.texture_codec_bytes");
+  return counter;
+}
+const holy::lib::Counter& c_codec_us() {
+  static const holy::lib::Counter counter("dstorage.texture_codec_us");
+  return counter;
+}
+
 HRESULT carry_out(const Operation& op) {
   const uint64_t options = op.options, destination = op.destination, source = op.source, offset = op.offset;
   const uint32_t destination_size = op.destination_size, source_size = op.source_size;
@@ -443,7 +507,7 @@ HRESULT carry_out(const Operation& op) {
               head[6], head[7], head[8], head[9], head[10], head[11], head[12], head[13], head[14], head[15]);
     }
   }
-  if (!(options & kCompressed) && (options & kOtherFormat)) {
+  if ((options & kOtherFormat) && !codec_tables()) {
     static const holy::lib::Counter unsupported("dstorage.unsupported_format_requests");
     unsupported.add(1);
     static std::mutex logged_lock;
@@ -476,6 +540,44 @@ HRESULT carry_out(const Operation& op) {
       return hr;
     }
     bytes = packed.data();
+  }
+  if (options & kOtherFormat) {
+    // The texture codec, after zlib when the request has both.
+    const uint8_t* packed_blocks = bytes;
+    size_t packed_size = source_size;
+    thread_local std::vector<uint8_t> unzipped;
+    if (options & kCompressed) {
+      size_t produced = 0;
+      unzipped.resize(op.intermediate_size);
+      if (!op.intermediate_size ||
+          !holy::lib::zlib_inflate_into(bytes, source_size, unzipped.data(), unzipped.size(), &produced)) {
+        LIB_LOG(holy::lib::kError, "dstorage", "a zlib stream before the texture codec did not inflate (0x%x into 0x%x)",
+                source_size, op.intermediate_size);
+        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+      }
+      packed_blocks = unzipped.data();
+      packed_size = produced;
+    }
+    thread_local std::vector<uint8_t> blocks;
+    blocks.resize(destination_size);
+    const char* why = nullptr;
+    LARGE_INTEGER t0, t1, frequency;
+    QueryPerformanceCounter(&t0);
+    const bool decoded = holy::lib::codec::decode(*codec_tables(), static_cast<uint32_t>((options >> 1) & 15),
+                                                  packed_blocks, packed_size, blocks.data(), blocks.size(), &why);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&frequency);
+    c_codec_us().add((t1.QuadPart - t0.QuadPart) * 1000000 / frequency.QuadPart);
+    if (!decoded) {
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 16) {
+        LIB_LOG(holy::lib::kError, "dstorage", "texture codec request failed (%s): options 0x%llx, 0x%zx bytes into 0x%x",
+                why ? why : "?", static_cast<unsigned long long>(options), packed_size, destination_size);
+      }
+      return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    }
+    c_codec_bytes().add(destination_size);
+    return deliver(op, blocks.data(), blocks.size());
   }
   if (!(options & kCompressed)) return deliver(op, bytes, source_size);
   // Observed: the streams are zlib (RFC 1950) streams. Inflated into memory of

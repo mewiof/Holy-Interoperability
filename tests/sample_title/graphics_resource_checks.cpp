@@ -711,14 +711,19 @@ double host_commit_left() {
 // view (titles write glyphs into such textures on the CPU); and a physical
 // page mapped at two addresses, the texture placed at one and its texels
 // written through the other (titles place video frame planes at a GPU
-// address and decode into them at a CPU one).
-enum class TextureMemory { Plain, Reserved, Physical, Unmapped, Placed, Aliased };
+// address and decode into them at a CPU one). `Swizzled`: plain memory, the
+// program reading texel (5, 3), written where the console GPU's layout keeps
+// it (the texture leaves the layout to the library: 4 KiB standard blocks;
+// 4-byte texels, x0 x1 y0 y1 y2 x2 in address bits 2-7: byte 180), so the
+// host copy is right only when detiled.
+enum class TextureMemory { Plain, Reserved, Physical, Unmapped, Placed, Aliased, Swizzled };
 
 // The command list interface titles ask for.
 constexpr GUID kListIid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
 
 void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory kind) {
-  const bool after = kind != TextureMemory::Plain;
+  const bool after = kind != TextureMemory::Plain && kind != TextureMemory::Swizzled;
+  const bool swizzled = kind == TextureMemory::Swizzled;
   void* allocator = nullptr;
   void* list = nullptr;
   void* fence = nullptr;
@@ -759,7 +764,7 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   // ran, whatever the texel); s_endpgm.
   const std::vector<uint8_t> container = native_only_container(
       {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE880304u, 0xBE890380u, 0xF40C0304u, 0xFA000000u, 0xBF8CC07Fu,
-       0x7E000280u, 0x7E020280u, 0xF0001F08u, 0x00030200u, 0xBF8C3F70u, 0xBE940305u, 0xBE950306u, 0xB0160040u,
+       swizzled ? 0x7E000285u : 0x7E000280u, swizzled ? 0x7E020283u : 0x7E020280u, 0xF0001F08u, 0x00030200u, 0xBF8C3F70u, 0xBE940305u, 0xBE950306u, 0xB0160040u,
        0xBE970380u, 0xE0780000u, 0x80050200u, 0x7E0C02FFu, 0x12345678u, 0xE0700010u, 0x80050600u,
        0xBF810000u});
   D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
@@ -808,11 +813,13 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
                             : kind == TextureMemory::Physical ? 0x90
                             : kind == TextureMemory::Placed   ? 0x30
                             : kind == TextureMemory::Aliased  ? 0x70
+                            : swizzled                        ? 0xD0
                                                               : 0xC0;
   const uint8_t texel_bytes[4] = {base_byte, static_cast<uint8_t>(base_byte + 0x10),
                                   static_cast<uint8_t>(base_byte + 0x20), 0xFF};
-  auto write_texel = [&writes, &texel_bytes] {
-    for (int i = 0; i < 4; ++i) writes[i] = texel_bytes[i];
+  const uint32_t texel_at = swizzled ? 180 : 0;
+  auto write_texel = [&writes, &texel_bytes, texel_at] {
+    for (int i = 0; i < 4; ++i) writes[texel_at + i] = texel_bytes[i];
   };
   if (!after) write_texel();
   const uint64_t output_address = reinterpret_cast<uint64_t>(output);
@@ -895,6 +902,7 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
                                             "memory"
         : kind == TextureMemory::Aliased  ? "a placed texture shows what the title writes into its physical page at "
                                             "another address"
+        : swizzled                        ? "a texture in title memory is read in the console GPU's layout (texel 5, 3)"
                                           : "a texture viewed before its physical page was mapped shows what the title "
                                             "wrote there");
   if (kind == TextureMemory::Placed || kind == TextureMemory::Aliased) {
@@ -1003,7 +1011,7 @@ void test_native_draw(void* device, void* queue, bool quirks, bool srgb = false)
   };
   struct alignas(void*) DepthSubobject {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
-    D3D12_DEPTH_STENCIL_DESC value{TRUE, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_COMPARISON_FUNC_LESS};
+    D3D12_DEPTH_STENCIL_DESC value{TRUE, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_COMPARISON_FUNC_LESS, FALSE, 0, 0, {}, {}};
   };
   struct alignas(void*) DepthFormatSubobject {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT;
@@ -2556,6 +2564,7 @@ void test_graphics_resources(void* device, void* queue) {
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Unmapped);
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Placed);
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Aliased);
+    test_compute_reads_a_texture_view(device, queue, TextureMemory::Swizzled);
   }
   test_allocation_hooks();
   test_placeholders();

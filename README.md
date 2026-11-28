@@ -14,44 +14,39 @@ virtual machine and no separate runtime process.
 
 ## Progress
 
-_Last updated: 2026-11-27 (night)._ The goal is a reference title running as smoothly as on the console: a correct
+_Last updated: 2026-11-27 (late night)._ The goal is a reference title running as smoothly as on the console: a correct
 picture, sound and input at a stable 30 frames a second or better. The percentages are rough estimates of how
 much of the work toward that goal each area has, not test coverage.
 
-**Overall: about 46%** `█████████▏░░░░░░░░░░`
+**Overall: about 50%** `██████████░░░░░░░░░░`
 
 **Latest** (newest first):
 
-- The title's loading now runs past three minutes (it stopped 20-40 s in). Its texture streaming delivers into
-  physical pages named by a page list (a request option), which the fast-storage library wrote over as if it
-  were the destination; the console's memory size is reported instead of the host's (a pool was sized from it).
-- Physical page numbers are reused once fresh ones would not fit the 21 bits titles keep of them.
-- Found: streamed textures arrive pre-tiled in the console GPU's own layout (64 KiB tiles) and their sizes must
-  match it exactly (the loading now stops at the title's check that a read covers a whole compressed chunk).
-  Next: the console GPU's exact texture layout (sizes, mip placement, swizzle) and detiling on upload, then
-  the console's texture codec for the tiles.
+- Textures in the console GPU's own memory layout: an implementation of the GPU family's surface addressing
+  (sizes, mip tails, swizzle patterns) that matches AMD's public address library on every element of 21 test
+  surfaces; the layout library, allocation sizes and texture uploads (detiled on the CPU) all follow it.
+- The console's texture codec for streamed tiles: a decoder written for this project; its constant tables are
+  not part of it and are supplied by the user (`HOLY_TEXTURE_CODEC_TABLES`). With them, every codec request of
+  the title's first minutes of loading decodes.
+- Loading runs past three and a half minutes: page-list destinations, the console's memory size, console copy
+  methods (command-list slots 85 and 86).
+- Open now: an unimplemented command-list method at about 3.5 minutes into loading (slot 129, by its place the
+  mesh-shader dispatch); one GPU page fault seen in the texture upload queue (diagnostics added).
+
+```mermaid
+pie showData title Work toward the goal (rough estimate)
+  "Done" : 50
+  "Left" : 50
+```
 
 | What is left, in order | Share of the remaining work |
 | --- | --- |
-| Exact console texture layout and detiling (loading stops on it; 3D textures would be scrambled) | large |
-| The console's texture codec for streamed tiles (fails loudly today: textures stay empty) | large |
-| From loading into the game world; then input and menus behaving | medium |
-| Picture correctness in 3D scenes (stencil clears, sRGB, missing symbols) | large |
+| Mesh-shader pipelines and dispatches; the rest of loading into the game world | large |
+| Picture correctness in 3D scenes (stencil clears, sRGB, missing symbols, GPU-written textures read back) | large |
+| Performance at 30 FPS in game: detiling and codec on worker threads or the GPU, GPU reads of title memory, pipeline stalls | large |
 | Audio processor (decoding and mixing) | large |
-| Performance at 30 FPS in game: GPU reads of title memory, CPU copies, pipeline stalls | large |
+| Input and menus behaving | medium |
 | Memory within a 12 GB GPU and the host's commit | medium |
-
-```mermaid
-flowchart LR
-  load[Loads and binds] --> boot[Runtime services] --> gpu[GPU device and pipelines] --> first[First frame after 3 s]
-  first --> stable[Runs for minutes] --> picture[Correct picture] --> menu[Menus and input] --> game[In game] --> fps[Stable 30 FPS]
-  classDef done fill:#2da44e,color:#ffffff,stroke:#1a7f37
-  classDef active fill:#d29922,color:#ffffff,stroke:#9a6700
-  classDef open fill:#f6f8fa,color:#57606a,stroke:#d0d7de
-  class load,boot,gpu,first,stable done
-  class picture,menu active
-  class game,fps open
-```
 
 | Milestone (reference title) | State |
 | --- | --- |
@@ -70,12 +65,12 @@ flowchart LR
 | --- | --- |
 | Loader, sandbox, runtime, import binding | `██████████` 95% |
 | Title memory (`xmem`, commit on demand) | `████████▌░` 85% (physical page numbers reused within the titles' 21 bits) |
-| Fast storage | `███████▌░░` 75% (destinations given as physical page lists; the console's texture codec missing) |
+| Fast storage | `████████▌░` 85% (destinations given as physical page lists; the console's texture codec, with user-supplied tables; one worker per queue) |
 | Game runtime services | `███████░░░` 68% (a local user, game saves on the host, the store offline) |
 | Graphics: device, resources, command recording | `██████░░░░` 62% (committed buffers the CPU reaches in title memory; buffer, texture and resource copies; released memory let go of once the GPU is done; one memory map for translated programs; heaps released with title memory; root arguments in memory the GPU caches, owned by the recordings that use them) |
 | Graphics: shader translation | `██████░░░░` 58% (every one of the reference title's 19,305 saved programs translates, ray intersection included (checked against hand-computed results, not yet against the console's); translations 45% smaller and laid out in program order, so the host compiles them in a third of the time: measured) |
 | Graphics: pipelines and caches | `███████▌░░` 75% (translations cached on disk compressed, 8.7 times smaller; pipeline creation reads only their headers, the bytes are read when compiling: about 11 s of processor time less at every start; host pipelines compiled at first use or, when an earlier run used them, in the background) |
-| Graphics: correct output | `███▊░░░░░░` 38% (typed buffer views read with their format (menu shapes were black); pipelines with an empty geometry subobject or a depth test without a depth format compile; texture tiling reported in the console's layout, mip tail first; rectangle lists drawn whole whichever corner the sides meet at; views and copies kept inside their resources; fence values belong to their fence; textures read with all four channels; texture copies follow the title's writes; native pipelines get their targets, depth tests and vertices right) |
+| Graphics: correct output | `████▌░░░░░` 45% (textures detiled from the console GPU's layout, sized as the console sizes them; typed buffer views read with their format (menu shapes were black); pipelines with an empty geometry subobject or a depth test without a depth format compile; texture tiling reported in the console's layout, mip tail first; rectangle lists drawn whole whichever corner the sides meet at; views and copies kept inside their resources; fence values belong to their fence; textures read with all four channels; texture copies follow the title's writes; native pipelines get their targets, depth tests and vertices right) |
 | Graphics: performance | `████░░░░░░` 40% (host memory queries no longer stall the title: `VirtualQuery` takes up to 10 ms on large committed memory and was asked per timestamp, buffer and reached address (a loading thread spent up to 89 s of 100 in the kernel, 0.4 frames a second), now the allocation record answers in 0.15 us; a growing allocation re-opened its GPU heap with a quadratic walk (1.3-3 s a frame), now 15 ms with room to grow; host shader compile time, the first run's main cost, 3 times lower: 166 s to 56 s for 60 compute programs, measured without the driver's cache answering; page table and root arguments in memory the GPU caches; aligned reads as one load; memory accesses: two page-table reads instead of a scan; no views written per draw; recording a draw of native programs costs 0.3 us of CPU time, 0.4 us with a pipeline and table change each draw, measured over 20,000 draws; translated memory reads now cost the same as the desktop's on the same memory (1.0 times, was 1.5), and the GPU reads title memory over the bus without its second-level cache, about 20 times slower than video memory: measured; copies in video memory of what translated programs read, opt-in for now, make such reads 3 times faster) |
 | Input | `█████░░░░░` 45% (scripted input for unattended runs) |
 | Audio | `██░░░░░░░░` 18% (the title's own engine plays whole through the host: video sound continuous, measured; the console's audio processor, which decodes and mixes the rest, is still silent) |

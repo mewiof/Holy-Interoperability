@@ -36,6 +36,7 @@
 #include "core/libs/d3d12_xs/page_cache.h"
 #include "core/libs/d3d12_xs/pipeline_stream.h"
 #include "core/libs/d3d12_xs/shader/translate.h"
+#include "core/libs/gpu_layout.h"
 #include "core/libs/texture_layout.h"
 #include "core/libs/d3d12_xs/shader_container.h"
 #include "core/libs/d3d12_xs/shader_dump.h"
@@ -400,11 +401,13 @@ void check_host_descs(const char* what, UINT count, const D3D12_RESOURCE_DESC* t
   }
 }
 
-// Sizes and alignments reported to titles for `count` descriptions: the
-// host's answer for the sizing descriptions, each texture taking at least
-// the console layout's size (lib::console_texture_size: titles stream
-// textures in that layout into memory of the size reported), and the
-// resources' offsets in turn when `infos` is given.
+// Sizes and alignments reported to titles for `count` descriptions, and the
+// resources' offsets in turn when `infos` is given: textures take the size of
+// the console GPU's layout of them (gpu_layout.h; titles stream textures in
+// that layout into memory of the size reported and read level ranges out of
+// compressed chunks by it), at the layout's alignment unless the description
+// asks for more (4 KiB for 4 KiB layouts, where the desktop answers 64 KiB).
+// Buffers and textures the layout does not cover get the host's answer.
 D3D12_RESOURCE_ALLOCATION_INFO title_allocation_info(Device* self, UINT count, const D3D12_RESOURCE_DESC* titles,
                                                      const std::vector<D3D12_RESOURCE_DESC>& hosts,
                                                      D3D12_RESOURCE_ALLOCATION_INFO1* infos) {
@@ -416,49 +419,34 @@ D3D12_RESOURCE_ALLOCATION_INFO title_allocation_info(Device* self, UINT count, c
   std::vector<D3D12_RESOURCE_ALLOCATION_INFO1> each(count);
   D3D12_RESOURCE_ALLOCATION_INFO total = device4->GetResourceAllocationInfo1(0, count, hosts.data(), each.data());
   device4->Release();
-  if (total.SizeInBytes == UINT64_MAX) return total;
-  uint64_t offset = 0, alignment = total.Alignment;
+  static const bool trace = GetEnvironmentVariableW(L"HOLY_XG_TRACE", nullptr, 0) > 0;
+  uint64_t offset = 0, alignment = 1;
   for (UINT i = 0; i < count; ++i) {
-    uint64_t size = each[i].SizeInBytes;
-    const uint64_t align = each[i].Alignment ? each[i].Alignment : 1;
     const D3D12_RESOURCE_DESC& d = titles[i];
-    if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-      lib::TextureShape shape;
-      shape.dimension = static_cast<uint32_t>(d.Dimension);
-      shape.width = d.Width;
-      shape.height = d.Height;
-      shape.depth_or_array = d.DepthOrArraySize ? d.DepthOrArraySize : 1;
-      shape.mips = d.MipLevels ? d.MipLevels : 1;
-      shape.format = static_cast<uint32_t>(d.Format);
-      const bool thick = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
-                         lib::console_thick_layout(static_cast<uint32_t>(d.Layout));
-      const uint64_t console = lib::console_texture_size(
-          shape, lib::console_block_log2(static_cast<uint32_t>(d.Layout), d.Alignment), d.SampleDesc.Count, thick);
-      static const bool trace = GetEnvironmentVariableW(L"HOLY_XG_TRACE", nullptr, 0) > 0;
-      if (trace && console && console != size) {
-        LIB_LOG(lib::kInfo, "d3d12", "texture %llux%ux%u, %u mips, format %d, alignment 0x%llx: host 0x%llx, console 0x%llx",
+    uint64_t size = each[i].SizeInBytes;
+    uint64_t align = each[i].Alignment ? each[i].Alignment : 1;
+    lib::gpu::Texture t;
+    static const bool console_sizes = [] {
+      wchar_t text[4] = {};
+      return !(GetEnvironmentVariableW(L"HOLY_CONSOLE_SIZES", text, 4) && text[0] == L'0');
+    }();
+    if (console_sizes && d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        lib::gpu::texture_from_desc(static_cast<uint32_t>(d.Dimension), d.Width, d.Height, d.DepthOrArraySize,
+                                    d.MipLevels, static_cast<uint32_t>(d.Format), d.SampleDesc.Count,
+                                    static_cast<uint32_t>(d.Layout), static_cast<uint32_t>(d.Flags), &t)) {
+      align = std::max<uint64_t>(d.Alignment, t.alignment);
+      size = lib::align_up(t.size, align);
+      if (trace && size != each[i].SizeInBytes) {
+        LIB_LOG(lib::kInfo, "d3d12",
+                "texture %llux%ux%u, %u mips, format %d, layout 0x%x, alignment 0x%llx: host 0x%llx, console 0x%llx "
+                "(swizzle %u)",
                 static_cast<unsigned long long>(d.Width), d.Height, d.DepthOrArraySize, d.MipLevels, d.Format,
-                static_cast<unsigned long long>(d.Alignment), static_cast<unsigned long long>(size),
-                static_cast<unsigned long long>(console));
+                static_cast<unsigned>(d.Layout), static_cast<unsigned long long>(d.Alignment),
+                static_cast<unsigned long long>(each[i].SizeInBytes), static_cast<unsigned long long>(size),
+                t.planes[0].surface.swizzle);
       }
-      // Only where the estimate is known to hold: 2D textures only shaders
-      // read (what titles stream), placed small (alignment 4 KiB), whose
-      // layout takes at most twice the host's size. Elsewhere the console's
-      // driver picks layouts not modelled (smaller blocks where blocks would
-      // waste more, other 3D and 1D layouts, others for written textures),
-      // and larger sizes made a title overrun its pools: 64 KiB-aligned
-      // textures failed its start-up, small 3D, 1D and array textures its
-      // loading (a write past memory it had committed).
-      constexpr D3D12_RESOURCE_FLAGS kWritten = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-                                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-      // And 3D textures only shaders read whose description names a thick
-      // swizzle mode: the layout is then known, block size and shape
-      // (lib::console_thick_layout; a title read half a compressed chunk of
-      // such a texture sized as the host lays it out).
-      const bool modelled = (d.Flags & kWritten) == 0 && console <= 2 * size &&
-                            ((d.Alignment == 4096 && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) || thick);
-      if (modelled && console > size) size = lib::align_up(console, align);
+    } else if (size == UINT64_MAX) {
+      return {UINT64_MAX, 0};
     }
     offset = lib::align_up(offset, align);
     if (infos) infos[i] = {offset, align, size};
@@ -600,6 +588,20 @@ void report_device_removal(Device* device) {
   if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault))) {
     LIB_LOG(lib::kError, "d3d12", "  page fault at GPU address 0x%llx",
             static_cast<unsigned long long>(fault.PageFaultVA));
+    // The objects whose GPU memory held the address: alive, and released
+    // recently (a use after release).
+    int listed = 0;
+    for (const D3D12_DRED_ALLOCATION_NODE* node = fault.pHeadExistingAllocationNode; node && listed < 8;
+         node = node->pNext, ++listed) {
+      LIB_LOG(lib::kError, "d3d12", "    there now: %ls (allocation type %d)",
+              node->ObjectNameW ? node->ObjectNameW : L"unnamed", static_cast<int>(node->AllocationType));
+    }
+    listed = 0;
+    for (const D3D12_DRED_ALLOCATION_NODE* node = fault.pHeadRecentFreedAllocationNode; node && listed < 8;
+         node = node->pNext, ++listed) {
+      LIB_LOG(lib::kError, "d3d12", "    released there recently: %ls (allocation type %d)",
+              node->ObjectNameW ? node->ObjectNameW : L"unnamed", static_cast<int>(node->AllocationType));
+    }
   }
   ID3D12DeviceRemovedExtendedData1* dred1 = nullptr;
   D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbs{};

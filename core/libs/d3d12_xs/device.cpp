@@ -899,8 +899,12 @@ ID3D12RootSignature* translated_root_signature(Device* device) {
   parameters[kRootNggOutput].Descriptor = {0, kNggSpace};
   parameters[kRootNggInput].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
   parameters[kRootNggInput].Descriptor = {0, kNggSpace};
+  // Input layouts allowed: titles give them with native programs, and the
+  // host refuses a pipeline whose vertex program takes the layout's inputs
+  // under a root signature without this flag (observed: a pipeline of a
+  // focused menu item's fill was refused and its draws dropped).
   const D3D12_ROOT_SIGNATURE_DESC desc{kTranslatedRootParameters, parameters, 0, nullptr,
-                                       D3D12_ROOT_SIGNATURE_FLAG_NONE};
+                                       D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
   ID3DBlob* blob = nullptr;
   ID3DBlob* errors = nullptr;
   HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);

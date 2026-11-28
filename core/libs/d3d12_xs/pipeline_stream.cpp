@@ -126,6 +126,20 @@ HRESULT create_pipeline_from_stream(Device* device, const D3D12_PIPELINE_STATE_S
                 e.SemanticName ? e.SemanticName : "?", e.SemanticIndex, static_cast<unsigned>(e.Format), e.InputSlot,
                 e.AlignedByteOffset, static_cast<unsigned>(e.InputSlotClass), e.InstanceDataStepRate);
       }
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY) {
+      UINT topology = 0;
+      std::memcpy(&topology, copy.data() + inner, sizeof(topology));
+      // Observed: type 19 in streams of pipelines titles draw rectangle lists
+      // with (assumed: the console's rectangle type). The host draws those as
+      // triangles (geometry.h), so other types become triangles.
+      if (topology < D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT || topology > D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH) {
+        static std::atomic<int> logged{0};
+        if (topology != 19 && logged.fetch_add(1) < 8) {
+          LIB_LOG(lib::kWarn, "d3d12", "pipeline stream with primitive topology type %u: drawn as triangles", topology);
+        }
+        const UINT triangles = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        std::memcpy(copy.data() + inner, &triangles, sizeof(triangles));
+      }
     } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK) {
       const UINT zero = 0;
       std::memcpy(copy.data() + inner, &zero, sizeof(zero));

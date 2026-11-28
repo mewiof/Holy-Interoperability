@@ -212,6 +212,14 @@ Notes describe the platform, never a title.
   (0x20000, 0x100000, 0x200000), and root signatures flag bits 0x1000000 and 0x2000000.
 - *observed*: slot 62 creates compute pipelines from a `D3D12_COMPUTE_PIPELINE_STATE_DESC`, two null pointers,
   the interface id and the out pointer.
+- *observed*: pipeline streams of pipelines titles draw rectangle lists with name primitive topology type 19 (no
+  desktop type; *assumed* the console's rectangle type), and streams with native programs carry input layouts.
+  *measured* host behaviour: the host refuses a topology type outside 1-4, and an input layout under a root
+  signature without `ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT` when the vertex program takes inputs from it (those
+  pipelines' draws were dropped, 147 in 3,000 frames of a menu). Implementation: other topology types become
+  triangles (rectangle lists are drawn as triangles, geometry.h); the runtime's root signature for translated
+  pipelines allows input layouts. Dropping the input layouts instead made every translated draw empty. Not yet
+  covered by a sample-title check (host pipelines compile at first use).
 - *assumed*: command-list slots 131 and 132 program GPU state by register offset, value and mask; they are
   recorded and not applied, since the host driver owns its GPU's state.
 - *observed*: device slots that keep the desktop arguments: 27 `CreateCommittedResource`, 39

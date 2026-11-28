@@ -360,10 +360,34 @@ void dump_textures(Device* device, ID3D12CommandQueue* queue, uint64_t present) 
                     channels > 2 ? lo[2] : 0.0, channels > 3 ? lo[3] : 0.0, hi[0], channels > 1 ? hi[1] : 0.0,
                     channels > 2 ? hi[2] : 0.0, channels > 3 ? hi[3] : 0.0);
     }
-    LIB_LOG(lib::kInfo, "d3d12", "  texture %zu at 0x%llx: %ux%u format %u (title %u) layout %d flags 0x%x: %s", index,
-            static_cast<unsigned long long>(item.resource->title_va), f.Width, f.Height, static_cast<unsigned>(f.Format),
-            static_cast<unsigned>(item.resource->desc.Format), static_cast<int>(item.layout),
-            static_cast<unsigned>(item.resource->desc.Flags), stats);
+    // Whether the title memory under it holds anything (sampled; reads that
+    // fail count as nothing): tells a texture the title never wrote from a
+    // host copy that missed the title's writes.
+    uint64_t nonzero = 0, sampled = 0;
+    MEMORY_BASIC_INFORMATION protection{};
+    if (item.resource->title_va) {
+      VirtualQuery(reinterpret_cast<const void*>(item.resource->title_va), &protection, sizeof(protection));
+    }
+    if (item.resource->title_va) {
+      const uint64_t span = static_cast<uint64_t>(f.RowPitch) * f.Height;
+      for (uint64_t at = 0; at < span; at += 4093, ++sampled) {
+        uint8_t byte = 0;
+        SIZE_T got = 0;
+        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(item.resource->title_va + at), &byte, 1,
+                              &got) &&
+            byte) {
+          ++nonzero;
+        }
+      }
+    }
+    LIB_LOG(lib::kInfo, "d3d12",
+            "  texture %zu at 0x%llx: %ux%u format %u (title %u) layout %d flags 0x%x: %s; memory: %llu of %llu "
+            "sampled bytes not zero, protection 0x%lx type 0x%lx",
+            index, static_cast<unsigned long long>(item.resource->title_va), f.Width, f.Height,
+            static_cast<unsigned>(f.Format), static_cast<unsigned>(item.resource->desc.Format),
+            static_cast<int>(item.layout), static_cast<unsigned>(item.resource->desc.Flags), stats,
+            static_cast<unsigned long long>(nonzero), static_cast<unsigned long long>(sampled), protection.Protect,
+            protection.Type);
     if (decodable && !dir.empty() && out_height) {
       wchar_t name[96];
       std::swprintf(name, 96, L"\\t%03zu-%ux%u-f%u.bmp", index, f.Width, f.Height, static_cast<unsigned>(f.Format));

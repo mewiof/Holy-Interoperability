@@ -615,6 +615,11 @@ ID3D12Resource* memory_texture(Device* device, const D3D12_RESOURCE_DESC& desc, 
   const uint64_t value = submit_upload(up);
   up->fence->SetEventOnCompletion(value, up->event);
   WaitForSingleObject(up->event, INFINITE);
+  if (size >= (1u << 20)) {
+    LIB_LOG(lib::kDebug, "d3d12", "placed texture %llux%u format %u at %p follows its memory: tracked %d, watched %d",
+            static_cast<unsigned long long>(desc.Width), desc.Height, desc.Format, reinterpret_cast<void*>(address),
+            record->tracked, record->protected_watch);
+  }
   replace(key, record);
   g_largest = std::max(g_largest, size);
   c_live_textures().add(1);

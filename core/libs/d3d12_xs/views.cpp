@@ -454,6 +454,21 @@ struct ViewAtAddress {
 };
 static_assert(offsetof(ViewAtAddress, address) == 40);
 
+// A buffer view's descriptor: typed views (a format, no structure, not raw)
+// as the console's runtime describes them (element stride, element count,
+// format and selects: native typed loads read them); others with their
+// structure stride and element count, or raw (stride 0, bytes).
+void write_typed_or_plain(SIZE_T dest, uint64_t address, bool raw, uint32_t structure, bool typed, uint32_t stride,
+                          uint64_t elements, DXGI_FORMAT format) {
+  if (typed) {
+    write_buffer_descriptor(dest, address, stride, static_cast<uint32_t>(elements), typed_buffer_word3(format));
+  } else if (raw || !structure) {
+    write_buffer_descriptor(dest, address, 0, static_cast<uint32_t>(elements * stride));
+  } else {
+    write_buffer_descriptor(dest, address, structure, static_cast<uint32_t>(elements));
+  }
+}
+
 void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_RESOURCE_DESC* resource,
                                                       const ViewAtAddress* view, SIZE_T dest) {
   if (!resource || !view) return;
@@ -518,9 +533,9 @@ void STDMETHODCALLTYPE create_shader_resource_view_at(Device* self, const D3D12_
   publish_descriptors(dest);
   const bool raw = (view->srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0;
   const uint32_t element = view->srv.Buffer.StructureByteStride;
-  write_buffer_descriptor(dest, view->address + view->srv.Buffer.FirstElement * stride, raw ? 0 : element,
-                          raw || !element ? static_cast<uint32_t>(view->srv.Buffer.NumElements * stride)
-                                          : view->srv.Buffer.NumElements);
+  const bool typed = !raw && !element && view->srv.Format != DXGI_FORMAT_UNKNOWN;
+  write_typed_or_plain(dest, view->address + view->srv.Buffer.FirstElement * stride, raw, element, typed, stride,
+                       view->srv.Buffer.NumElements, view->srv.Format);
 }
 
 // Observed: titles create constant buffer views whose size is not a multiple
@@ -570,10 +585,10 @@ void STDMETHODCALLTYPE create_shader_resource_view(Device* self, void* resource,
       host.Buffer.FirstElement += slack_elements(slack_of(object), stride);
       create_buffer_srv(self->host, host_resource(resource), host, stride, host_cpu_handle(dest));
       publish_descriptors(dest);
-      const bool raw = (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0 || !desc->Buffer.StructureByteStride;
-      write_buffer_descriptor(dest, object->title_va + desc->Buffer.FirstElement * stride,
-                              raw ? 0 : desc->Buffer.StructureByteStride,
-                              raw ? static_cast<uint32_t>(desc->Buffer.NumElements * stride) : desc->Buffer.NumElements);
+      const bool raw = (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0;
+      const bool typed = !raw && !desc->Buffer.StructureByteStride && desc->Format != DXGI_FORMAT_UNKNOWN;
+      write_typed_or_plain(dest, object->title_va + desc->Buffer.FirstElement * stride, raw,
+                           desc->Buffer.StructureByteStride, typed, stride, desc->Buffer.NumElements, desc->Format);
       return;
     }
   }
@@ -650,10 +665,10 @@ void STDMETHODCALLTYPE create_unordered_access_view(Device* self, void* resource
     const UINT stride = desc->Buffer.StructureByteStride ? desc->Buffer.StructureByteStride
                         : (desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) ? 4
                                                                             : format_bytes(desc->Format);
-    const bool raw = (desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0 || !desc->Buffer.StructureByteStride;
-    write_buffer_descriptor(dest, object->title_va + desc->Buffer.FirstElement * stride,
-                            raw ? 0 : desc->Buffer.StructureByteStride,
-                            raw ? static_cast<uint32_t>(desc->Buffer.NumElements * stride) : desc->Buffer.NumElements);
+    const bool raw = (desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
+    const bool typed = !raw && !desc->Buffer.StructureByteStride && desc->Format != DXGI_FORMAT_UNKNOWN;
+    write_typed_or_plain(dest, object->title_va + desc->Buffer.FirstElement * stride, raw,
+                         desc->Buffer.StructureByteStride, typed, stride, desc->Buffer.NumElements, desc->Format);
     // Desktop programs write through the view: its memory's copies are not
     // read again (page_cache.h).
     page_cache_gpu_writes(object->title_va + desc->Buffer.FirstElement * stride,

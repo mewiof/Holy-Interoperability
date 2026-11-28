@@ -417,9 +417,17 @@ Notes describe the platform, never a title.
   clears it (no depth-stencil clear, barrier, copy or dispatch touches the 3840x2160 depth target in a frame; the
   frame's first draw, full screen, tests and writes depth LESS against it too). On the host the stencil is 1
   wherever a shape was drawn once, so the shapes are never drawn again (the focused item shows no fill). Clearing
-  the stencil once a frame (an experiment, not kept) brings the shapes back, black: their colours are wrong as
-  well (the program reads its draw data from title memory). How the console resets the stencil is not
-  established.
+  the stencil once a frame (an experiment, not kept) brought the shapes back, black: their colours came from
+  typed buffer views (below), fixed since; with the stencil cleared they now have their colours (the focused
+  item's fill, the carousel's arrows). How the console resets the stencil is not established; the depth
+  target's optimised clear value is depth 0, stencil 0, and the frame's first draw tests depth LESS against it.
+- *measured*: native programs read typed buffer views (`buffer_load_format_*`) with the element size, format and
+  component selects in the view's descriptor (stride in dword 1, format in bits 12-18 and selects in bits 0-11
+  of dword 3, as in the public RDNA 2 buffer descriptor layout). The runtime wrote typed views' descriptors with
+  no format and no stride: such loads read zero (a menu's shapes came out black). Typed views (a format, no
+  structure, not raw) now get the element size, the element count and the format with selects (missing
+  components 0, alpha 1; BGRA formats swizzled). Sample-title check: a native typed load of element 1 of an
+  R8G8B8A8_UNORM view (read zero before).
 - *measured* (open): a title's intro video comes out too bright: its blacks at 42-53 of 255. Followed through
   a frame's textures (`HOLY_DUMP_TARGETS`): the video's planes and its RGB texture (format 29, sRGB, written
   through a render target view of format 28) hold blacks at 6-9 of 255; the pass that puts the video into the

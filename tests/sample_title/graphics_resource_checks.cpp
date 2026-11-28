@@ -1178,6 +1178,119 @@ void test_native_draw(void* device, void* queue, bool quirks, bool srgb = false)
   VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+// A native compute program reads element 1 of a typed buffer view
+// (R8G8B8A8_UNORM, made with slot 18) with buffer_load_format_xyzw, which
+// takes the element size, format and component selects from the view's
+// descriptor, and stores what it read. Measured on a title: its menus draw
+// their shapes' colours from such views, which read zero (black) while the
+// runtime left those descriptor fields empty.
+void test_compute_reads_a_typed_buffer(void* device, void* queue) {
+  void* allocator = nullptr;
+  void* list = nullptr;
+  void* fence = nullptr;
+  void* heap = nullptr;
+  void* root = nullptr;
+  void* pipeline = nullptr;
+  void* input = nullptr;
+  void* output = nullptr;
+  const uint32_t list_desc[4] = {0, 2, 1, 0};
+  call<HRESULT>(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), &allocator);
+  if (allocator) call<HRESULT>(device, 73, list_desc, allocator, static_cast<void*>(nullptr), kListIid, &list);
+  call<HRESULT>(device, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), &fence);
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 1};
+  call<HRESULT>(device, 14, &heap_desc, __uuidof(ID3D12DescriptorHeap), &heap);
+  // A table (the view) and two constants (the output's address).
+  D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+  D3D12_ROOT_PARAMETER1 parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable = {1, &range};
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants = {0, 0, 2};
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+  root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  root_desc.Desc_1_1.NumParameters = 2;
+  root_desc.Desc_1_1.pParameters = parameters;
+  ID3DBlob* serialized = nullptr;
+  if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&root_desc, &serialized, nullptr)) && serialized) {
+    call<HRESULT>(device, 16, 1u, blob_pointer(serialized), blob_size(serialized), __uuidof(ID3D12RootSignature),
+                  &root);
+  }
+  // s_load_dwordx4 s[4:7], s[0:1] (the table's address, then the output's);
+  // s_mov_b32 s8, s4; s_mov_b32 s9, 0; s_load_dwordx4 s[12:15], s[8:9] (the
+  // view's descriptor); v_mov_b32 v0, 1; buffer_load_format_xyzw v[2:5], v0,
+  // s[12:15] idxen; s[20:23] the output (s5, s6, 0x40 bytes);
+  // buffer_store_dwordx4 v[2:5], off, s[20:23]; s_endpgm.
+  const std::vector<uint8_t> program = native_only_container(
+      {0xF4080100u, 0xFA000000u, 0xBF8CC07Fu, 0xBE880304u, 0xBE890380u, 0xF4080304u, 0xFA000000u, 0xBF8CC07Fu,
+       0x7E000281u, 0xE00C2000u, 0x80030200u, 0xBF8C3F70u, 0xBE940305u, 0xBE950306u, 0xB0160040u, 0xBE970380u,
+       0xE0780000u, 0x80050200u, 0xBF810000u});
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+  pso.CS = {program.data(), program.size()};
+  call<HRESULT>(device, 62, &pso, static_cast<void*>(nullptr), static_cast<void*>(nullptr),
+                __uuidof(ID3D12PipelineState), &pipeline);
+  auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  if (!list || !fence || !heap || !root || !pipeline || !memory) {
+    check(false, "the objects for a typed buffer read exist");
+    if (memory) VirtualFree(memory, 0, MEM_RELEASE);
+    return;
+  }
+  // Element 0 and element 1 (the one read).
+  const uint8_t texels[8] = {0, 0, 0, 0, 64, 128, 192, 255};
+  std::memcpy(memory, texels, sizeof(texels));
+  auto* out = reinterpret_cast<volatile float*>(memory + 0x10000);
+  D3D12_RESOURCE_DESC buffer{};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = 0x10000;
+  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  call<HRESULT>(device, 133, reinterpret_cast<uint64_t>(memory), &buffer, static_cast<UINT>(0xFFFFFFFF),
+                static_cast<const void*>(nullptr), __uuidof(ID3D12Resource), &input);
+  buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  call<HRESULT>(device, 133, reinterpret_cast<uint64_t>(out), &buffer, static_cast<UINT>(0xFFFFFFFF),
+                static_cast<const void*>(nullptr), __uuidof(ID3D12Resource), &output);
+  D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+  view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  view.Buffer.NumElements = 2;
+  if (input) call<void>(device, 18, input, &view, call<uint64_t>(heap, 9));
+
+  bool recorded = call<HRESULT>(list, 139, allocator, static_cast<void*>(nullptr), UINT64{0}) == S_OK;
+  void* heaps[] = {heap};
+  call<void>(list, 32, 1u, static_cast<void* const*>(heaps));
+  call<void>(list, 33, root);
+  call<void>(list, 35, 0u, call<uint64_t>(heap, 10));
+  const uint64_t output_address = reinterpret_cast<uint64_t>(out);
+  const uint32_t constants[2] = {static_cast<uint32_t>(output_address), static_cast<uint32_t>(output_address >> 32)};
+  call<void>(list, 39, 1u, 2u, static_cast<const void*>(constants), 0u);
+  call<void>(list, 25, pipeline);
+  call<void>(list, 14, 1u, 1u, 1u);
+  recorded = recorded && call<HRESULT>(list, 9) == S_OK;
+  void* lists[] = {list};
+  call<void>(queue, 35, 1u, static_cast<void* const*>(lists), UINT64{0}, 0u);
+  call<HRESULT>(queue, 16, fence, UINT64{1});
+  const auto* value = call<const volatile uint64_t*>(fence, 12);
+  for (int i = 0; value && *value < 1 && i < 5000; ++i) Sleep(1);
+  auto close_to = [](float a, float b) { return a > b - 0.01f && a < b + 0.01f; };
+  const float read[4] = {out[0], out[1], out[2], out[3]};
+  std::printf("    (typed buffer element read: %.3f %.3f %.3f %.3f)\n", read[0], read[1], read[2], read[3]);
+  check(recorded && value && *value == 1 && close_to(read[0], 64 / 255.0f) && close_to(read[1], 128 / 255.0f) &&
+            close_to(read[2], 192 / 255.0f) && close_to(read[3], 1.0f),
+        "a native typed load reads an element of a typed buffer view with its format");
+
+  if (output) call<ULONG>(output, 2);
+  if (input) call<ULONG>(input, 2);
+  call<ULONG>(pipeline, 2);
+  call<ULONG>(root, 2);
+  call<ULONG>(heap, 2);
+  call<ULONG>(fence, 2);
+  call<ULONG>(list, 2);
+  call<ULONG>(allocator, 2);
+  VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 // What recording a draw of native programs costs the CPU, as titles record
 // them in a frame: root constants, a root constant buffer and the draw, with a
 // table of 32 buffer views bound; then with the pipeline (one of two) and the
@@ -2424,6 +2537,7 @@ void test_graphics_resources(void* device, void* queue) {
   if (queue) test_native_draw(device, queue, false);
   if (queue) test_native_draw(device, queue, true);
   if (queue) test_native_draw(device, queue, false, true);
+  if (queue) test_compute_reads_a_typed_buffer(device, queue);
   if (queue) test_draw_recording_cost(device, queue);
   if (queue) test_memory_read_cost(device, queue);
   if (queue) test_root_arguments_outlive_later_recording(device, queue);

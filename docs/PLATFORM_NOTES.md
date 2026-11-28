@@ -1112,7 +1112,10 @@ Notes describe the platform, never a title.
 - *observed*: titles play their mixed audio through the desktop's audio stack: title code creates the host's
   `MMDeviceEnumerator` (`CoCreateInstance` at start-up) and renders through WASAPI; the video library a title
   ships imports `XAudio2Create` but never calls it when the title gives it its own sound driver. *measured*
-  (`holy run --record-audio`, tools/audio_report): with the audio processor silent, the sound of a video the
-  title plays reaches the host about two thirds of the time, broken 60 times a second (once per video frame):
-  the title's engine, which the processor normally paces and feeds, starves the stream. Not yet implemented:
-  the audio processor's decoding and mixing.
+  (`holy run --record-audio`, tools/audio_report): the sound of a video the title plays reached the host two
+  thirds of the time, in 30 gaps a second, with texture tracking on or off: the title's engine sleeps between
+  mixing steps of 10.67 ms, and at the host's default timer resolution (15.6 ms) woke 64 times a second. With
+  the title's process at a 1 ms resolution (also while its window is hidden: the host otherwise ignores the
+  request for such processes) the stream is whole: 0% silence and no gaps over the video's 12 s (was 33%).
+  Sample-title check: a one-millisecond sleep lasts about a millisecond. Not yet implemented: the audio
+  processor's decoding and mixing (the sound titles play through it).

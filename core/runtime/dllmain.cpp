@@ -25,6 +25,32 @@ constexpr char kComponent[] = "runtime";
 HMODULE g_self = nullptr;
 BootBlock g_boot{};
 
+// Measured: a title's audio engine sleeps between mixing steps, each making
+// 10.67 ms of sound; at the host's default timer resolution (15.6 ms) it woke
+// 64 times a second and its stream lacked a third of its sound (tools/
+// audio_report: 33% silence in 30 gaps a second, the same with texture
+// tracking off). The console's waits are fine-grained: the title's process
+// runs with a 1 ms timer resolution, also while its window is hidden (the
+// host otherwise ignores the request for such processes). Through ntdll:
+// this runs under the loader lock.
+void use_fine_timer_resolution() {
+  using SetTimerResolutionFn = LONG(NTAPI*)(ULONG, BOOLEAN, ULONG*);
+  using QueryTimerResolutionFn = LONG(NTAPI*)(ULONG*, ULONG*, ULONG*);
+  const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  const auto set = reinterpret_cast<SetTimerResolutionFn>(GetProcAddress(ntdll, "NtSetTimerResolution"));
+  const auto query = reinterpret_cast<QueryTimerResolutionFn>(GetProcAddress(ntdll, "NtQueryTimerResolution"));
+  PROCESS_POWER_THROTTLING_STATE throttling{};
+  throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  throttling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+  throttling.StateMask = 0;  // honour the resolution asked for
+  SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+  ULONG coarsest = 0, finest = 0, before = 0, now = 0;
+  if (query) query(&coarsest, &finest, &before);
+  if (set) set(10000, TRUE, &now);  // 100 ns units
+  LOG_INFO(kComponent, "timer resolution %.2f ms (was %.2f ms; finest %.2f ms)", now / 10000.0, before / 10000.0,
+           finest / 10000.0);
+}
+
 IMAGE_NT_HEADERS64* nt_headers(uint8_t* image_base) {
   auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image_base);
   return reinterpret_cast<IMAGE_NT_HEADERS64*>(image_base + dos->e_lfanew);
@@ -101,6 +127,7 @@ void boot() {
   AddDllDirectory(s.providers.libs_dir.c_str());
 
   install_crash_handlers();
+  use_fine_timer_resolution();
   install_commit_on_demand();
   start_stats_reports(10000);
   install_cpu_compatibility();

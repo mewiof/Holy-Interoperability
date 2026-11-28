@@ -352,6 +352,20 @@ void test_lifecycle() {
   if (registration) UnregisterAppStateChangeNotification(registration);
 }
 
+// Waits are fine-grained, as on the console: titles' audio engines sleep a
+// millisecond or so between mixing steps (at the host's default 15.6 ms
+// resolution one fell a third short of real time).
+void test_timer_resolution() {
+  LARGE_INTEGER frequency{}, start{}, end{};
+  QueryPerformanceFrequency(&frequency);
+  QueryPerformanceCounter(&start);
+  for (int i = 0; i < 50; ++i) Sleep(1);
+  QueryPerformanceCounter(&end);
+  const double ms = 1000.0 * static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+  std::printf("    (50 one-millisecond sleeps took %.1f ms)\n", ms);
+  check(ms < 250.0, "a one-millisecond sleep lasts about a millisecond");
+}
+
 // Physical pages: the same page mapped at two addresses is one piece of memory.
 // Large commits are taken on first touch: they read as zero and accept
 // writes, and title arrays in such memory can be passed to the physical
@@ -812,6 +826,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR command_line, int) {
   test_scratch_storage();
   test_library_loading();
   test_lifecycle();
+  test_timer_resolution();
   test_console_identity();
   test_virtual_memory();
   g_expect_online = command_line && std::strstr(command_line, "--expect-online");

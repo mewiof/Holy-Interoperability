@@ -182,5 +182,20 @@ void test_graphics() {
   reinterpret_cast<InfoFn>((*static_cast<void***>(device))[108])(&info, device, 1, 1, &buffer, &info1);
   check(info.SizeInBytes >= 100000 && info1.SizeInBytes == info.SizeInBytes,
         "GetResourceAllocationInfo1 reports sizes for each description and in total");
+  // A 3D texture in 4 KiB standard swizzle (layout 0x100 + 5) of 2-byte
+  // texels, as a title streams it: 8x16x16 blocks, its 8 slices padded to
+  // 16, 256 KiB (the host lays it out in 128 KiB).
+  D3D12_RESOURCE_DESC volume{};
+  volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  volume.Width = 256;
+  volume.Height = 32;
+  volume.DepthOrArraySize = 8;
+  volume.MipLevels = 1;
+  volume.Format = DXGI_FORMAT_R16_FLOAT;
+  volume.SampleDesc.Count = 1;
+  volume.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+  reinterpret_cast<InfoFn>((*static_cast<void***>(device))[108])(&info, device, 1, 1, &volume, &info1);
+  std::printf("    (3D texture in thick 4 KiB blocks: 0x%llx bytes)\n", static_cast<unsigned long long>(info.SizeInBytes));
+  check(info.SizeInBytes == 0x40000, "a 3D texture in a thick swizzle mode is sized as the console lays it out");
   test_graphics_resources(device, queue);
 }

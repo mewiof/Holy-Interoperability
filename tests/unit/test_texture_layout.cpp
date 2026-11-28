@@ -2,6 +2,8 @@
 #include "tests/unit/test.h"
 
 using holy::lib::console_texture_size;
+using holy::lib::console_thick_block;
+using holy::lib::console_thick_layout;
 using holy::lib::console_tiling;
 using holy::lib::ConsoleTiling;
 using holy::lib::TextureShape;
@@ -82,6 +84,20 @@ TEST(console_block_size_follows_the_swizzle_mode) {
   // Observed sizes: a 128x4 texture of 8-byte texels in 4 KiB blocks (the
   // driver's choice) takes 16 KiB; a linear 256x1 one of 16-byte texels 4 KiB.
   EXPECT(console_texture_size(shape(3, 128, 4, 1, 1, 11), 12) == 0x4000);
+  // Thick 3D blocks (the public addressing library's shapes): 4 KiB at 2-byte
+  // texels is 8x16x16, so 256x32x8 takes 32 by 2 by 1 blocks (its depth padded
+  // to 16): 64 blocks, 256 KiB.
+  uint64_t w = 0, h = 0, d = 0;
+  EXPECT(console_thick_block(1, 12, &w, &h, &d) && w == 8 && h == 16 && d == 16);
+  EXPECT(console_thick_block(0, 16, &w, &h, &d) && w == 64 && h == 32 && d == 32);
+  EXPECT(console_thick_block(4, 16, &w, &h, &d) && w == 16 && h == 16 && d == 16);
+  EXPECT(console_thick_block(2, 12, &w, &h, &d) && w == 8 && h == 16 && d == 8);
+  EXPECT(console_thick_layout(0x105) && console_thick_layout(0x100 + 8) && !console_thick_layout(0x106) &&
+         !console_thick_layout(0) && !console_thick_layout(0x100 + 27));
+  EXPECT(console_texture_size(shape(4, 256, 32, 8, 1, 54), 12, 1, true) == 0x40000);
+  EXPECT(console_texture_size(shape(4, 256, 32, 8, 1, 54), 12) == 0x20000);  // thin: slice by slice
+  // 64 KiB thick at 8-byte texels: 32x16x16 a block, so 32x64x32 takes 8.
+  EXPECT(console_texture_size(shape(4, 32, 64, 32, 1, 10), 16, 1, true) == 8 * 0x10000);
   EXPECT(console_texture_size(shape(3, 256, 1, 1, 1, 2), 0) == 0x1000);
   // 256-byte blocks: no mip tail, each level whole blocks (4x4 of 16 bytes).
   EXPECT(console_texture_size(shape(3, 8, 8, 1, 2, 2), 8) == (4 + 1) * 256);

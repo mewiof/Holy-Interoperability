@@ -430,8 +430,10 @@ D3D12_RESOURCE_ALLOCATION_INFO title_allocation_info(Device* self, UINT count, c
       shape.depth_or_array = d.DepthOrArraySize ? d.DepthOrArraySize : 1;
       shape.mips = d.MipLevels ? d.MipLevels : 1;
       shape.format = static_cast<uint32_t>(d.Format);
+      const bool thick = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                         lib::console_thick_layout(static_cast<uint32_t>(d.Layout));
       const uint64_t console = lib::console_texture_size(
-          shape, lib::console_block_log2(static_cast<uint32_t>(d.Layout), d.Alignment), d.SampleDesc.Count);
+          shape, lib::console_block_log2(static_cast<uint32_t>(d.Layout), d.Alignment), d.SampleDesc.Count, thick);
       static const bool trace = GetEnvironmentVariableW(L"HOLY_XG_TRACE", nullptr, 0) > 0;
       if (trace && console && console != size) {
         LIB_LOG(lib::kInfo, "d3d12", "texture %llux%ux%u, %u mips, format %d, alignment 0x%llx: host 0x%llx, console 0x%llx",
@@ -450,8 +452,12 @@ D3D12_RESOURCE_ALLOCATION_INFO title_allocation_info(Device* self, UINT count, c
       constexpr D3D12_RESOURCE_FLAGS kWritten = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                                                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-      const bool modelled = d.Alignment == 4096 && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                            (d.Flags & kWritten) == 0 && console <= 2 * size;
+      // And 3D textures only shaders read whose description names a thick
+      // swizzle mode: the layout is then known, block size and shape
+      // (lib::console_thick_layout; a title read half a compressed chunk of
+      // such a texture sized as the host lays it out).
+      const bool modelled = (d.Flags & kWritten) == 0 && console <= 2 * size &&
+                            ((d.Alignment == 4096 && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) || thick);
       if (modelled && console > size) size = lib::align_up(console, align);
     }
     offset = lib::align_up(offset, align);

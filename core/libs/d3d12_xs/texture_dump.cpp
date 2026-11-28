@@ -365,7 +365,28 @@ void dump_textures(Device* device, ID3D12CommandQueue* queue, uint64_t present) 
                                ? std::wstring(data_dir) + L"\\frames\\textures-" + std::to_wstring(present)
                                : std::wstring();
   if (!dir.empty()) {
-    CreateDirectoryW((std::wstring(data_dir) + L"\\frames").c_str(), nullptr);
+    const std::wstring frames = std::wstring(data_dir) + L"\\frames";
+    CreateDirectoryW(frames.c_str(), nullptr);
+    // Earlier dumps go first (a dump is gigabytes; measured: a day of runs
+    // left 29 GB of them).
+    WIN32_FIND_DATAW found{};
+    const HANDLE search = FindFirstFileW((frames + L"\\textures-*").c_str(), &found);
+    if (search != INVALID_HANDLE_VALUE) {
+      do {
+        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        const std::wstring old = frames + L"\\" + found.cFileName;
+        WIN32_FIND_DATAW file{};
+        const HANDLE files = FindFirstFileW((old + L"\\*.bmp").c_str(), &file);
+        if (files != INVALID_HANDLE_VALUE) {
+          do {
+            DeleteFileW((old + L"\\" + file.cFileName).c_str());
+          } while (FindNextFileW(files, &file));
+          FindClose(files);
+        }
+        RemoveDirectoryW(old.c_str());
+      } while (FindNextFileW(search, &found));
+      FindClose(search);
+    }
     CreateDirectoryW(dir.c_str(), nullptr);
   }
   LIB_LOG(lib::kInfo, "d3d12", "texture dump at present %llu: %zu textures", static_cast<unsigned long long>(present),

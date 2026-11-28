@@ -163,6 +163,38 @@ inline uint32_t console_block_log2(uint32_t layout, uint64_t alignment) {
   return alignment == 4096 ? 12 : 16;
 }
 
+// Whether a description's layout (0x100 + swizzle mode) names a swizzle mode
+// that lays 3D textures out in thick blocks: the standard (S) and Z-order
+// modes, as the public addressing library for the GPU has it (display and
+// rotated modes, and the variable ones, lay 3D textures out slice by slice).
+inline bool console_thick_layout(uint32_t layout) {
+  if (layout < 0x101 || layout >= 0x120) return false;
+  switch (layout - 0x100) {
+    case 1: case 4: case 5: case 8: case 9: case 16: case 17: case 20: case 21: case 24: case 25:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// A thick block of 2^block_log2 bytes, in elements of 2^element_log2 bytes,
+// as the public addressing library computes it: a 1 KiB block per element
+// size (16x8x8 at 1 byte, 8x8x8 at 2, 8x8x4 at 4, 8x4x4 at 8, 4x4x4 at 16)
+// grown by the block's size over 1 KiB, a third of its doublings to each
+// side and the rest to height (two left) and depth. For 64 KiB blocks this is
+// 2^ceil(n/3) by 2^round(n/3) by 2^floor(n/3) elements, n = log2(65536 / e);
+// for 4 KiB blocks it is not (8x16x16 at 2 bytes, not 16x16x8). False for
+// blocks under 1 KiB.
+inline bool console_thick_block(uint32_t element_log2, uint32_t block_log2, uint64_t* w, uint64_t* h, uint64_t* d) {
+  static const uint8_t kBlock1K[5][3] = {{16, 8, 8}, {8, 8, 8}, {8, 8, 4}, {8, 4, 4}, {4, 4, 4}};
+  if (block_log2 < 10 || element_log2 > 4) return false;
+  const uint32_t in_1k = block_log2 - 10, average = in_1k / 3, rest = in_1k % 3;
+  *w = static_cast<uint64_t>(kBlock1K[element_log2][0]) << average;
+  *h = static_cast<uint64_t>(kBlock1K[element_log2][1]) << (average + rest / 2);
+  *d = static_cast<uint64_t>(kBlock1K[element_log2][2]) << (average + (rest ? 1 : 0));
+  return true;
+}
+
 // The memory the console GPU's layout of a texture takes, for blocks of
 // 2^block_log2 bytes (0: linear); an estimate, the console's own computation
 // is not available. Observed: titles size the memory they stream textures
@@ -181,9 +213,17 @@ inline uint32_t console_block_log2(uint32_t layout, uint64_t alignment) {
 // at 4 bytes, 128x64 at 8, 64x64 compressed blocks at 16). With blocks of
 // 4 KiB or more, the levels that fit in half a block (half its width, its
 // height; at most 9 levels with 4 KiB blocks, 12 with 64 KiB) share one
-// block, the mip tail. 3D textures count each depth slice as a 2D level; zero
+// block, the mip tail. 3D textures count each depth slice as a 2D level,
+// unless `thick` (console_thick_layout): then thick blocks
+// (console_thick_block), whose mip tail is the block halved along one side
+// (height for 4 KiB blocks, width for 64 KiB, as the addressing library has
+// it), with at most 5 levels in it for 4 KiB blocks and 10 for 64 KiB. Zero
 // for formats of unknown or odd element size.
-inline uint64_t console_texture_size(const TextureShape& shape, uint32_t block_log2, uint32_t samples = 1) {
+// Measured: a title streams a 256x32x8 3D texture of 2-byte texels in 4 KiB
+// standard swizzle as 256 KiB (8x16x16 blocks, depth padded to 16); sized at
+// 128 KiB it read half of a compressed chunk and stopped at its own check.
+inline uint64_t console_texture_size(const TextureShape& shape, uint32_t block_log2, uint32_t samples = 1,
+                                     bool thick = false) {
   const FormatInfo f = format_info(shape.format);
   if (!f.block_bytes || (f.block_bytes & (f.block_bytes - 1)) != 0) return 0;  // 12-byte texels: not modelled
   uint32_t element_log2 = 0;
@@ -202,6 +242,34 @@ inline uint64_t console_texture_size(const TextureShape& shape, uint32_t block_l
     return align_up(bytes, 256) * slices * (samples ? samples : 1);
   }
   if (block_log2 <= element_log2) return 0;
+  if (is3d && thick) {
+    uint64_t bw = 0, bh = 0, bd = 0;
+    if (!console_thick_block(element_log2, block_log2, &bw, &bh, &bd)) return 0;
+    uint64_t tw = bw, th = bh, td = bd;
+    const uint32_t shrink = block_log2 % 3;
+    if (shrink == 0) {
+      th /= 2;
+    } else if (shrink == 1) {
+      tw /= 2;
+    } else {
+      td /= 2;
+    }
+    const uint32_t max_thick_tail = block_log2 >= 16 ? 10 : 5;
+    uint64_t thick_blocks = 0;
+    bool thick_tail = false;
+    for (uint32_t mip = 0; mip < mips; ++mip) {
+      const uint64_t w = std::max<uint64_t>(1, shape.width >> mip), h = std::max<uint64_t>(1, shape.height >> mip);
+      const uint64_t d = std::max<uint64_t>(1, shape.depth_or_array >> mip);
+      const uint64_t ew = (w + f.block_size - 1) / f.block_size, eh = (h + f.block_size - 1) / f.block_size;
+      if (mips > 1 && ew <= tw && eh <= th && d <= td && mips - mip <= max_thick_tail) {
+        thick_tail = true;
+        break;
+      }
+      thick_blocks += ((ew + bw - 1) / bw) * ((eh + bh - 1) / bh) * ((d + bd - 1) / bd);
+    }
+    if (thick_tail) thick_blocks += 1;
+    return (thick_blocks << block_log2) * (samples ? samples : 1);
+  }
   const uint32_t n = block_log2 - element_log2;
   const uint64_t block_w = 1ull << ((n + 1) / 2), block_h = 1ull << (n / 2);
   const uint64_t tail_w = block_w / 2, tail_h = block_h;
@@ -266,9 +334,7 @@ inline bool console_tiling(const TextureShape& shape, ConsoleTiling* out) {
   const bool is3d = shape.dimension == 4;
   uint64_t tw, th, td;
   if (is3d) {
-    tw = 1ull << ((n + 2) / 3);
-    th = 1ull << ((n + 1) / 3);
-    td = 1ull << (n / 3);
+    console_thick_block(element_log2, 16, &tw, &th, &td);
   } else {
     tw = 1ull << ((n + 1) / 2);
     th = 1ull << (n / 2);

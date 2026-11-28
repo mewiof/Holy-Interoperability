@@ -461,7 +461,16 @@ Notes describe the platform, never a title.
   the console layout's size for the swizzle mode (linear rows 256-byte aligned; 256-byte, 4 KiB or 64 KiB blocks
   of the documented shapes with the mip tail) reported where it is larger than the host's, only for 2D textures
   without render-target, depth or unordered-access usage at 4 KiB alignment whose layout takes at most twice the
-  host's size (beyond that the console's driver picks smaller blocks, not modelled). Elsewhere the host's size.
+  host's size (beyond that the console's driver picks smaller blocks, not modelled), and for 3D textures without
+  those usages whose layout names a thick swizzle mode (standard or Z-order). Elsewhere the host's size.
+- *measured*: a title streams a 256x32x8 3D texture of 2-byte texels in layout 0x105 (4 KiB standard swizzle)
+  as 256 KiB; sized at the host's 128 KiB it read half of a compressed chunk and stopped at its own check (after
+  its first-run screens, when loading). 3D textures in standard and Z-order modes are thick on this GPU, in
+  blocks of the public addressing library's shapes: a 1 KiB block per element size (16x8x8 at 1 byte, 8x8x8 at
+  2, 8x8x4 at 4, 8x4x4 at 8, 4x4x4 at 16) grown by the block's size, a third of the doublings to each side and
+  the rest to height (two left) and depth: 8x16x16 at 2 bytes in 4 KiB (the earlier rule, 2^ceil(n/3) by
+  2^round(n/3) by 2^floor(n/3), holds for 64 KiB blocks only). The mip tail of a thick block halves its height
+  in 4 KiB blocks and its width in 64 KiB ones. Sample-title check and unit tests.
 - *observed*: titles set texture layout 0x105 on 3D textures (a console swizzle mode, *assumed*); console layouts
   and flag bits above the desktop's are dropped for the host. Depth textures may ask for unordered access, and
   packed 16-bit formats (`B5G6R5`, `B5G5R5A1`, `B4G4R4A4`) for typed unordered access; the desktop allows neither,

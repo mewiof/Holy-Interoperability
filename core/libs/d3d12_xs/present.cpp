@@ -305,12 +305,32 @@ float half_to_float(uint16_t half) {
   return sign ? -value : value;
 }
 
+// Removes the files of `dir` matching `pattern` (captures of earlier runs).
+// Measured: a frames directory grew to 35 GB over a day of runs (a 4K
+// capture is 33 MB), each run's captures only ever added. A run's first
+// capture clears the earlier runs' ones (texture dumps do the same with
+// earlier dumps, texture_dump.cpp).
+void remove_earlier(const std::wstring& dir, const wchar_t* pattern) {
+  WIN32_FIND_DATAW found{};
+  const HANDLE search = FindFirstFileW((dir + L"\\" + pattern).c_str(), &found);
+  if (search == INVALID_HANDLE_VALUE) return;
+  do {
+    if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileW((dir + L"\\" + found.cFileName).c_str());
+  } while (FindNextFileW(search, &found));
+  FindClose(search);
+}
+
 // Writes rows of `format` texels as a 32-bit top-down BMP.
 void write_capture(uint64_t present, DXGI_FORMAT format, UINT width, UINT height, const uint8_t* rows, UINT pitch) {
   const wchar_t* data_dir = HolyDataDir();
   if (!data_dir || !*data_dir) return;
   const std::wstring dir = std::wstring(data_dir) + L"\\frames";
   CreateDirectoryW(dir.c_str(), nullptr);
+  static const bool cleared = [&dir] {
+    remove_earlier(dir, L"present-*.bmp");
+    return true;
+  }();
+  (void)cleared;
   const std::wstring path = dir + L"\\present-" + std::to_wstring(present) + L".bmp";
   std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4);
   for (UINT y = 0; y < height; ++y) {

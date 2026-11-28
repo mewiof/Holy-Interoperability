@@ -419,8 +419,10 @@ Notes describe the platform, never a title.
   wherever a shape was drawn once, so the shapes are never drawn again (the focused item shows no fill). Clearing
   the stencil once a frame (an experiment, not kept) brought the shapes back, black: their colours came from
   typed buffer views (below), fixed since; with the stencil cleared they now have their colours (the focused
-  item's fill, the carousel's arrows). How the console resets the stencil is not established; the depth
-  target's optimised clear value is depth 0, stencil 0, and the frame's first draw tests depth LESS against it.
+  item's fill, the carousel's arrows). How the console resets the stencil is not established. Ruled out
+  (measured): clearing the stencil at the target's first bind in each recording, or at its first bind after
+  each present, makes the shapes come and go from frame to frame; resetting the target to its optimised clear
+  value at its first bind in each recording gives stencil 7 (that target's clear value), and no shapes.
 - *measured*: native programs read typed buffer views (`buffer_load_format_*`) with the element size, format and
   component selects in the view's descriptor (stride in dword 1, format in bits 12-18 and selects in bits 0-11
   of dword 3, as in the public RDNA 2 buffer descriptor layout). The runtime wrote typed views' descriptors with

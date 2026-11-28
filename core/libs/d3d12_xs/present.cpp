@@ -30,10 +30,12 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <cwchar>
 #include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/libs/d3d12_xs/device.h"
@@ -264,13 +266,24 @@ bool ensure_swap_chain(Presenter* p, DXGI_FORMAT format, UINT width, UINT height
 
 // Presents 1, 30 and 300 are captured; later ones every HOLY_CAPTURE_EVERY
 // presents when that is set (a capture of a 4K frame is 33 MB: periodic
-// captures by default would fill the disk over long sessions).
+// captures by default would fill the disk over long sessions), and the
+// presents HOLY_CAPTURE_FROM=<n>[+<count>] names (n and the count-1 after
+// it, 8 by default: consecutive frames, for what changes frame to frame).
 bool capture_due(uint64_t present) {
   static const uint64_t every = [] {
     wchar_t text[32] = {};
     return GetEnvironmentVariableW(L"HOLY_CAPTURE_EVERY", text, 32) ? static_cast<uint64_t>(_wtoi64(text)) : 0ull;
   }();
-  return present == 1 || present == 30 || present == 300 || (every && present % every == 0);
+  static const std::pair<uint64_t, uint64_t> window = [] {
+    wchar_t text[32] = {};
+    if (!GetEnvironmentVariableW(L"HOLY_CAPTURE_FROM", text, 32)) return std::pair<uint64_t, uint64_t>{0, 0};
+    const uint64_t from = static_cast<uint64_t>(_wtoi64(text));
+    const wchar_t* plus = wcschr(text, L'+');
+    const int64_t count = plus ? _wtoi64(plus + 1) : 8;
+    return std::pair<uint64_t, uint64_t>{from, count > 0 ? static_cast<uint64_t>(count) : 8};
+  }();
+  const bool in_window = window.first && present >= window.first && present < window.first + window.second;
+  return present == 1 || present == 30 || present == 300 || (every && present % every == 0) || in_window;
 }
 
 uint8_t to_byte(float value) {

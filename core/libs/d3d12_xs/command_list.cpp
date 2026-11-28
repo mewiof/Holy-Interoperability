@@ -678,6 +678,7 @@ void STDMETHODCALLTYPE list_set_index_buffer(CommandList* self, const D3D12_INDE
     LIB_LOG(lib::kError, "d3d12", "index buffer at %p lies in no GPU memory", reinterpret_cast<void*>(view->BufferLocation));
     return;
   }
+  if (!host.BufferLocation) host.SizeInBytes = 0;  // a null address: an empty view, as for vertex buffers
   self->index_buffer = host;
   self->index_buffer_set = true;
   self->host->IASetIndexBuffer(&host);
@@ -691,6 +692,11 @@ void STDMETHODCALLTYPE list_set_vertex_buffers(CommandList* self, UINT first, UI
     self->vertex_buffers[first + i] = views ? views[i] : D3D12_VERTEX_BUFFER_VIEW{};
     host[i] = self->vertex_buffers[first + i];
     host[i].BufferLocation = translate_gpu_va(self->device, host[i].BufferLocation);
+    // Memory not located (or a null address with a size): an empty view,
+    // which reads zeros, never a size at address 0 (the GPU then reads
+    // address 0 and the host removes the device; measured in a title's
+    // loading as a page fault at 0).
+    if (!host[i].BufferLocation) host[i].SizeInBytes = 0;
   }
   self->host->IASetVertexBuffers(first, n, views ? host : nullptr);
 }

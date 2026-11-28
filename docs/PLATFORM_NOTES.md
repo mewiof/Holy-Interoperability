@@ -1169,7 +1169,9 @@ Notes describe the platform, never a title.
   same lock). The scan now waits ten times its own duration before the next (at least 16 ms) and finds the
   copies over a written page through the address index: loading runs at 6-22 frames a second (was 2-8).
 - *observed* (open): during loading the host device is removed as hung, with device-removed data showing a GPU
-  page fault at address 0 (no breadcrumbs captured); seen in most runs past three minutes.
+  page fault at address 0 (no breadcrumbs captured); seen in most runs past three minutes, about 8 s after the
+  dropped mesh dispatches (lead: later GPU work depends on what they would have written). Vertex and index
+  buffers whose memory is not located are now bound empty (they were bound with their size at address 0).
 - *observed*: command-list slot 129 is `DispatchMesh(x, y, z)` (34 x 1 x 1 seen in a title's loading). Not
   implemented: such dispatches are dropped and counted (`d3d12.mesh_dispatches_dropped`).
 - The graphics library detiles textures out of title memory into its host copies on the CPU (sample-title

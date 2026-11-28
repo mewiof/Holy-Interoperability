@@ -14,11 +14,32 @@ virtual machine and no separate runtime process.
 
 ## Progress
 
-_Last updated: 2026-11-27 (evening)._ The goal is a reference title running as smoothly as on the console: a correct
+_Last updated: 2026-11-27 (night)._ The goal is a reference title running as smoothly as on the console: a correct
 picture, sound and input at a stable 30 frames a second or better. The percentages are rough estimates of how
 much of the work toward that goal each area has, not test coverage.
 
-**Overall: about 44%** `████████▊░░░░░░░░░░░`
+**Overall: about 46%** `█████████▏░░░░░░░░░░`
+
+**Latest** (newest first):
+
+- The title's loading now runs past three minutes (it stopped 20-40 s in). Its texture streaming delivers into
+  physical pages named by a page list (a request option), which the fast-storage library wrote over as if it
+  were the destination; the console's memory size is reported instead of the host's (a pool was sized from it).
+- Physical page numbers are reused once fresh ones would not fit the 21 bits titles keep of them.
+- Found: streamed textures arrive pre-tiled in the console GPU's own layout (64 KiB tiles) and their sizes must
+  match it exactly (the loading now stops at the title's check that a read covers a whole compressed chunk).
+  Next: the console GPU's exact texture layout (sizes, mip placement, swizzle) and detiling on upload, then
+  the console's texture codec for the tiles.
+
+| What is left, in order | Share of the remaining work |
+| --- | --- |
+| Exact console texture layout and detiling (loading stops on it; 3D textures would be scrambled) | large |
+| The console's texture codec for streamed tiles (fails loudly today: textures stay empty) | large |
+| From loading into the game world; then input and menus behaving | medium |
+| Picture correctness in 3D scenes (stencil clears, sRGB, missing symbols) | large |
+| Audio processor (decoding and mixing) | large |
+| Performance at 30 FPS in game: GPU reads of title memory, CPU copies, pipeline stalls | large |
+| Memory within a 12 GB GPU and the host's commit | medium |
 
 ```mermaid
 flowchart LR
@@ -48,8 +69,8 @@ flowchart LR
 | Area | Progress |
 | --- | --- |
 | Loader, sandbox, runtime, import binding | `██████████` 95% |
-| Title memory (`xmem`, commit on demand) | `████████░░` 80% |
-| Fast storage | `███████░░░` 70% |
+| Title memory (`xmem`, commit on demand) | `████████▌░` 85% (physical page numbers reused within the titles' 21 bits) |
+| Fast storage | `███████▌░░` 75% (destinations given as physical page lists; the console's texture codec missing) |
 | Game runtime services | `███████░░░` 68% (a local user, game saves on the host, the store offline) |
 | Graphics: device, resources, command recording | `██████░░░░` 62% (committed buffers the CPU reaches in title memory; buffer, texture and resource copies; released memory let go of once the GPU is done; one memory map for translated programs; heaps released with title memory; root arguments in memory the GPU caches, owned by the recordings that use them) |
 | Graphics: shader translation | `██████░░░░` 58% (every one of the reference title's 19,305 saved programs translates, ray intersection included (checked against hand-computed results, not yet against the console's); translations 45% smaller and laid out in program order, so the host compiles them in a third of the time: measured) |

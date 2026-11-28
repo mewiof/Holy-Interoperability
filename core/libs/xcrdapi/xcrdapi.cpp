@@ -189,7 +189,7 @@ const holy::lib::VtableInfo kQueueInfo{kLibrary, "IDStorageQueueX"};
 // since the previous one), or a fence signal.
 struct Operation {
   enum Kind { kRequest, kStatus, kSignal } kind = kRequest;
-  uint64_t options = 0, destination = 0, source = 0, offset = 0;
+  uint64_t options = 0, destination = 0, page_offset = 0, source = 0, offset = 0;
   uint32_t destination_size = 0, source_size = 0;
   struct StatusArray* array = nullptr;
   uint32_t index = 0;
@@ -221,20 +221,28 @@ ULONG STDMETHODCALLTYPE queue_release(Queue* self) {
 }
 
 // Observed: queue slot 3 EnqueueRequest(const Request*). Request layout
-// (from how titles fill it): options at 0 (bit 22: the source is memory;
-// bit 0: set for the title's format 3, a zlib stream), destination
-// address at 8, destination size at 0x18, source at 0x20 (a file object, or
-// a memory address), file offset at 0x28, source size at 0x30.
-// Observed: requests with bit 1 set and bit 0 clear (options 0x200002,
-// 0x20000a, 0x20000e: bits 2-3 vary), whose sources are smaller than their
-// 64 KiB destinations and are not zlib streams: compressed in another format,
-// *assumed* the console's texture codec (the destinations are 64 KiB texture
-// tiles), which has no public description. Not implemented: such requests
-// fail (their status says so) and are counted, rather than leaving
-// compressed bytes where the title expects texels.
+// (from how titles fill it): options at 0, destination at 8, destination
+// size at 0x18, source at 0x20 (a file object, or a memory address), file
+// offset at 0x28, source size at 0x30.
+// Options: bit 22, the source is memory; bit 0, the source is a zlib
+// (RFC 1950) stream; bit 21, the destination is a list of physical page
+// numbers (one 64-bit number per 64 KiB, as XMemAllocatePhysicalPages hands
+// them out) with the offset into the first page in the low 16 bits of the
+// field at 0x10, where the destination is otherwise an address. Observed: the
+// title's texture streaming (bit 21 with zlib streams of 4 KiB, and with the
+// format below) fills the lists after enqueueing, before submitting.
+// Requests with any of bits 1-4 set and bit 0 clear (options 0x200002,
+// 0x20000a, 0x20000e) have sources smaller than their 64 KiB destinations and
+// are not zlib streams: compressed in the console's texture codec, bits 1-4
+// *assumed* the block-compression format number (1, 5 and 7 seen). Not
+// implemented: such requests fail (their status says so) and are counted,
+// rather than leaving compressed bytes where the title expects texels.
 constexpr uint64_t kSourceMemory = 1ull << 22;
+constexpr uint64_t kPageDestination = 1ull << 21;
 constexpr uint64_t kCompressed = 1ull;
-constexpr uint64_t kOtherFormat = 0xEull;
+constexpr uint64_t kOtherFormat = 0x1Eull;
+constexpr size_t kPhysicalPage = 0x10000;
+constexpr size_t kMaxListPages = 4096;  // 256 MiB of destination
 
 HRESULT read_into(File* file, uint64_t offset, void* destination, uint32_t size) {
   // One event per thread, reused (requests come by the thousand).
@@ -313,6 +321,7 @@ HRESULT STDMETHODCALLTYPE enqueue_request(Queue* self, const uint8_t* request) {
   op.kind = Operation::kRequest;
   std::memcpy(&op.options, request, 8);
   std::memcpy(&op.destination, request + 8, 8);
+  std::memcpy(&op.page_offset, request + 0x10, 8);
   std::memcpy(&op.destination_size, request + 0x18, 4);
   std::memcpy(&op.source, request + 0x20, 8);
   std::memcpy(&op.offset, request + 0x28, 8);
@@ -350,13 +359,66 @@ void STDMETHODCALLTYPE submit(Queue* self) {
   submit_locked(self);
 }
 
+// HolyXMemWritePages (xmem.dll): bytes into physical pages by number.
+using WritePagesFn = size_t (*)(const ULONG_PTR* frames, size_t count, size_t offset, const void* data, size_t size,
+                                void (*shown)(void* context, uintptr_t address, size_t size), void* context,
+                                size_t* skipped);
+
+const holy::lib::Counter& c_page_requests() {
+  static const holy::lib::Counter counter("dstorage.page_destination_requests");
+  return counter;
+}
+const holy::lib::Counter& c_lost_bytes() {
+  static const holy::lib::Counter counter("dstorage.page_bytes_lost");
+  return counter;
+}
+
+// Writes `size` bytes to the request's destination: title memory at an
+// address, or the physical pages its list names (read now: the title fills
+// the lists after enqueueing). Copies of the memory (the graphics library's
+// textures) hear of the write after the bytes are in place, at every address
+// that shows the pages.
+HRESULT deliver(const Operation& op, const void* data, size_t size) {
+  if (!(op.options & kPageDestination)) {
+    HolyEnsureCommitted(reinterpret_cast<void*>(op.destination), size);
+    HolyBeforeWrite(reinterpret_cast<void*>(op.destination), size);
+    std::memcpy(reinterpret_cast<void*>(op.destination), data, size);
+    return S_OK;
+  }
+  static const auto write_pages =
+      reinterpret_cast<WritePagesFn>(GetProcAddress(GetModuleHandleW(L"xmem.dll"), "HolyXMemWritePages"));
+  if (!write_pages) return E_NOTIMPL;
+  const size_t first = static_cast<size_t>(op.page_offset & 0xFFFF);
+  const size_t count = (first + size + kPhysicalPage - 1) / kPhysicalPage;
+  if (count > kMaxListPages) return E_INVALIDARG;
+  ULONG_PTR frames[kMaxListPages];
+  std::memcpy(frames, reinterpret_cast<const void*>(op.destination), count * sizeof(ULONG_PTR));
+  c_page_requests().add(1);
+  size_t lost = 0;
+  const size_t written = write_pages(
+      frames, count, first, data, size,
+      [](void*, uintptr_t address, size_t bytes) { HolyBeforeWrite(reinterpret_cast<void*>(address), bytes); },
+      nullptr, &lost);
+  if (lost) {
+    c_lost_bytes().add(static_cast<int64_t>(lost));
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) {
+      LIB_LOG(holy::lib::kError, "dstorage",
+              "0x%zx of 0x%zx bytes for a page list (first page 0x%llx, offset 0x%zx) had no live page to go to",
+              lost, size, static_cast<unsigned long long>(frames[0]), first);
+    }
+  }
+  return written == size ? S_OK : HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
+}
+
 HRESULT carry_out(const Operation& op) {
   const uint64_t options = op.options, destination = op.destination, source = op.source, offset = op.offset;
   const uint32_t destination_size = op.destination_size, source_size = op.source_size;
   LIB_LOG(holy::lib::kDebug, "dstorage",
-          "request options 0x%llx destination %p (0x%x) source %p offset 0x%llx size 0x%x",
-          static_cast<unsigned long long>(options), reinterpret_cast<void*>(destination), destination_size,
-          reinterpret_cast<void*>(source), static_cast<unsigned long long>(offset), source_size);
+          "request options 0x%llx destination %p+0x%llx (0x%x) source %p offset 0x%llx size 0x%x",
+          static_cast<unsigned long long>(options), reinterpret_cast<void*>(destination),
+          static_cast<unsigned long long>(op.page_offset), destination_size, reinterpret_cast<void*>(source),
+          static_cast<unsigned long long>(offset), source_size);
   if (!destination || !source) return E_INVALIDARG;
   {
     // Each kind of request once (options, and whether the sizes match):
@@ -374,11 +436,11 @@ HRESULT carry_out(const Operation& op) {
         read_into(reinterpret_cast<File*>(source), offset, head, std::min<uint32_t>(16, source_size));
       }
       LIB_LOG(holy::lib::kInfo, "dstorage",
-              "first request of options 0x%llx: 0x%x bytes into 0x%x; source starts %02x %02x %02x %02x %02x %02x "
+              "first request of options 0x%llx: 0x%x bytes into 0x%x%s; source starts %02x %02x %02x %02x %02x %02x "
               "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-              static_cast<unsigned long long>(options), source_size, destination_size, head[0], head[1], head[2],
-              head[3], head[4], head[5], head[6], head[7], head[8], head[9], head[10], head[11], head[12], head[13],
-              head[14], head[15]);
+              static_cast<unsigned long long>(options), source_size, destination_size,
+              options & kPageDestination ? " (pages)" : "", head[0], head[1], head[2], head[3], head[4], head[5],
+              head[6], head[7], head[8], head[9], head[10], head[11], head[12], head[13], head[14], head[15]);
     }
   }
   if (!(options & kCompressed) && (options & kOtherFormat)) {
@@ -395,56 +457,48 @@ HRESULT carry_out(const Operation& op) {
     }
     return E_NOTIMPL;
   }
-  if (options & kCompressed) {
-    // Observed: the streams are zlib (RFC 1950) streams, inflated straight
-    // into the destination.
-    thread_local std::vector<uint8_t> packed;
-    const uint8_t* stream = reinterpret_cast<const uint8_t*>(source + offset);
-    HRESULT hr = S_OK;
-    if (!(options & kSourceMemory)) {
-      if (packed.size() < source_size) packed.resize(source_size);
-      hr = read_into(reinterpret_cast<File*>(source), offset, packed.data(), source_size);
-      stream = packed.data();
-    }
-    if (SUCCEEDED(hr)) {
-      // Inflated into memory of this thread's, then copied: inflating reads
-      // its output back (matches, the checksum), and the destination is title
-      // memory that may not read back what was written (measured: requests
-      // whose streams inflate to exactly their destination's size failed in
-      // place, invalid data, and succeeded into private memory; the title then
-      // used the unwritten memory and crashed during loading).
-      thread_local std::vector<uint8_t> inflated;
-      if (inflated.size() < destination_size) inflated.resize(destination_size);
-      size_t produced = 0;
-      if (!holy::lib::zlib_inflate_into(stream, source_size, inflated.data(), destination_size, &produced)) {
-        hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
-      } else {
-        HolyEnsureCommitted(reinterpret_cast<void*>(destination), destination_size);
-        HolyBeforeWrite(reinterpret_cast<void*>(destination), destination_size);
-        std::memcpy(reinterpret_cast<void*>(destination), inflated.data(), produced);
-      }
-    }
-    if (FAILED(hr)) {
-      uint8_t head[8] = {};
-      if (!(options & kSourceMemory) || stream) std::memcpy(head, stream, std::min<size_t>(8, source_size));
-      LIB_LOG(holy::lib::kError, "dstorage",
-              "compressed request failed (0x%08lX): options 0x%llx, 0x%x bytes at 0x%llx into 0x%x; stream starts "
-              "%02x %02x %02x %02x %02x %02x %02x %02x",
-              static_cast<unsigned long>(hr), static_cast<unsigned long long>(options), source_size,
-              static_cast<unsigned long long>(offset), destination_size, head[0], head[1], head[2], head[3], head[4],
-              head[5], head[6], head[7]);
+  // The source's bytes: the title's memory, or read from the file into memory
+  // of this thread's (straight into the destination for plain reads to an
+  // address, the common case).
+  thread_local std::vector<uint8_t> packed;
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(source + offset);
+  if (!(options & kSourceMemory)) {
+    if (!(options & (kCompressed | kPageDestination))) {
+      const HRESULT hr =
+          read_into(reinterpret_cast<File*>(source), offset, reinterpret_cast<void*>(destination), source_size);
+      if (FAILED(hr)) LIB_LOG(holy::lib::kError, "dstorage", "read failed (0x%08lX)", static_cast<unsigned long>(hr));
       return hr;
     }
-    return S_OK;
+    if (packed.size() < source_size) packed.resize(source_size);
+    const HRESULT hr = read_into(reinterpret_cast<File*>(source), offset, packed.data(), source_size);
+    if (FAILED(hr)) {
+      LIB_LOG(holy::lib::kError, "dstorage", "read failed (0x%08lX)", static_cast<unsigned long>(hr));
+      return hr;
+    }
+    bytes = packed.data();
   }
-  if (options & kSourceMemory) {
-    std::memcpy(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source + offset), source_size);
-    return S_OK;
+  if (!(options & kCompressed)) return deliver(op, bytes, source_size);
+  // Observed: the streams are zlib (RFC 1950) streams. Inflated into memory of
+  // this thread's, then delivered: inflating reads its output back (matches,
+  // the checksum), and the destination is title memory that may not read back
+  // what was written (measured: requests whose streams inflate to exactly
+  // their destination's size failed in place, invalid data, and succeeded into
+  // private memory; the title then used the unwritten memory and crashed
+  // during loading).
+  thread_local std::vector<uint8_t> inflated;
+  if (inflated.size() < destination_size) inflated.resize(destination_size);
+  size_t produced = 0;
+  if (!holy::lib::zlib_inflate_into(bytes, source_size, inflated.data(), destination_size, &produced)) {
+    uint8_t head[8] = {};
+    std::memcpy(head, bytes, std::min<size_t>(8, source_size));
+    LIB_LOG(holy::lib::kError, "dstorage",
+            "compressed request failed: options 0x%llx, 0x%x bytes at 0x%llx into 0x%x; stream starts "
+            "%02x %02x %02x %02x %02x %02x %02x %02x",
+            static_cast<unsigned long long>(options), source_size, static_cast<unsigned long long>(offset),
+            destination_size, head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7]);
+    return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
   }
-  auto* file = reinterpret_cast<File*>(source);
-  const HRESULT hr = read_into(file, offset, reinterpret_cast<void*>(destination), source_size);
-  if (FAILED(hr)) LIB_LOG(holy::lib::kError, "dstorage", "read failed (0x%08lX)", static_cast<unsigned long>(hr));
-  return hr;
+  return deliver(op, inflated.data(), produced);
 }
 
 const auto kQueueVtable = [] {

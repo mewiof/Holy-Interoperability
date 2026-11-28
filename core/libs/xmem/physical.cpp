@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <atomic>
 #include <unordered_map>
+#include <set>
 #include <unordered_set>
 #include <cstring>
 #include <vector>
@@ -157,6 +158,53 @@ void index_remove(ULONG_PTR id, uintptr_t granule) {
   list.erase(std::remove(list.begin(), list.end(), granule), list.end());
   if (list.empty()) granules_of().erase(found);
 }
+// Page numbers. Observed: titles keep a page's number as `number >> 4` (its
+// id here, see to_frame) in 21 bits, so ids stay below 2^21. They are given
+// fresh (the next after the last) while they fit, and after that the ids of
+// pages that are neither allocated nor mapped anywhere any more are given
+// again (fresh first: a title's stale references to a freed page then find
+// nothing rather than another page for as long as possible).
+constexpr ULONG_PTR kIdLimit = ULONG_PTR{1} << 21;
+std::set<ULONG_PTR>& free_ids() {
+  static auto* storage = new std::set<ULONG_PTR>();
+  return *storage;
+}
+// `count` ids for new pages into `ids`, live and without storage. False if
+// there are not that many. Called with g_lock held.
+bool take_ids(ULONG_PTR count, ULONG_PTR* ids) {
+  if (pages().size() + count < kIdLimit) {
+    const ULONG_PTR first = pages().size() + 1;  // ids start at 1
+    pages().resize(pages().size() + count, Page{-1, 0, true, false, 0});
+    for (ULONG_PTR i = 0; i < count; ++i) ids[i] = first + i;
+    return true;
+  }
+  if (free_ids().size() < count) return false;
+  static std::atomic<bool> said{false};
+  if (!said.exchange(true)) {
+    LIB_LOG(holy::lib::kInfo, "xmem", "page numbers reach the 21 bits titles keep: freed ones are given again");
+  }
+  // A run of consecutive ids when there is one, else the lowest free ones.
+  auto start = free_ids().end();
+  ULONG_PTR run = 0, previous = 0;
+  for (auto it = free_ids().begin(); it != free_ids().end() && run < count; ++it) {
+    if (run && *it == previous + 1) {
+      ++run;
+    } else {
+      start = it;
+      run = 1;
+    }
+    previous = *it;
+  }
+  if (run < count) start = free_ids().begin();
+  for (ULONG_PTR i = 0; i < count; ++i) {
+    const ULONG_PTR id = *start;
+    start = free_ids().erase(start);
+    pages()[id - 1] = Page{-1, 0, true, false, 0};
+    ids[i] = id;
+  }
+  return true;
+}
+
 // Granules whose mapping is recorded but not yet backed by a view.
 std::unordered_set<uintptr_t>& pending() {
   static auto* storage = new std::unordered_set<uintptr_t>();
@@ -346,10 +394,13 @@ void split_placeholder(uintptr_t granule) {
 // given the same storage would show through the old mapping. Called with
 // g_lock held.
 void release_if_unused(Page& page) {
-  if (page.live || page.maps != 0 || page.section < 0) return;
-  sections()[page.section].owner[page.index] = 0;
-  page.section = -1;
-  c_pages_stored().add(-1);
+  if (page.live || page.maps != 0) return;
+  if (page.section >= 0) {
+    sections()[page.section].owner[page.index] = 0;
+    page.section = -1;
+    c_pages_stored().add(-1);
+  }
+  free_ids().insert(static_cast<ULONG_PTR>(&page - pages().data()) + 1);
 }
 
 void unmap_granule(uintptr_t granule) {
@@ -558,10 +609,12 @@ LONG CALLBACK back_on_fault(EXCEPTION_POINTERS* info) {
   }
   if (implicit) {
     implicit = false;
-    const ULONG_PTR id = pages().size() + 1;
-    pages().push_back(Page{-1, 0, true, false, 0});
-    if (map_granule(granule, id) && pending().count(granule)) backed = back_granule(granule, id);
-    pages()[id - 1].live = false;  // released once mapped nowhere
+    ULONG_PTR id = 0;
+    if (take_ids(1, &id)) {
+      if (map_granule(granule, id) && pending().count(granule)) backed = back_granule(granule, id);
+      pages()[id - 1].live = false;  // released once mapped nowhere
+      if (!pages()[id - 1].maps) release_if_unused(pages()[id - 1]);
+    }
     implicit = backed;
   }
   unlock();
@@ -659,12 +712,19 @@ HOLY_EXPORT BOOL XMemAllocatePhysicalPages(uint64_t attributes, ULONG_PTR* count
     return FALSE;
   }
   const ULONG_PTR requested = *count;
+  std::vector<ULONG_PTR> ids(requested);
   lock();
-  const ULONG_PTR first = pages().size() + 1;  // ids start at 1
-  pages().resize(pages().size() + requested, Page{-1, 0, true, false});
+  const bool taken = take_ids(requested, ids.data());
   unlock();
+  if (!taken) {
+    LIB_LOG(holy::lib::kError, "xmem", "XMemAllocatePhysicalPages: no page numbers left for %llu pages",
+            static_cast<unsigned long long>(requested));
+    *count = 0;
+    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+    return FALSE;
+  }
   c_pages_live().add(static_cast<int64_t>(requested));
-  for (ULONG_PTR i = 0; i < requested; ++i) page_array[i] = to_frame(first + i);
+  for (ULONG_PTR i = 0; i < requested; ++i) page_array[i] = to_frame(ids[i]);
   LIB_LOG(holy::lib::kDebug, "xmem", "allocated %llu physical pages (attributes 0x%llx)",
           static_cast<unsigned long long>(requested), static_cast<unsigned long long>(attributes));
   return TRUE;
@@ -774,6 +834,116 @@ HOLY_EXPORT ULONG_PTR HolyXMemPhysicalPageAt(const void* address) {
   const ULONG_PTR frame = it == mapped().end() ? 0 : to_frame(it->second);
   unlock();
   return frame;
+}
+
+// Not a console function: lets the fast-storage library deliver into
+// physical pages by number (requests whose destination is a page list).
+// Writes `size` bytes into the pages `frames` names (one per 64 KiB, as
+// XMemAllocatePhysicalPages handed them out), from `offset` into the first
+// page on, through views of the pages' own storage: no title memory is
+// touched, and a page without storage yet gets it (at the slot of a granule
+// it is mapped at, so its mapping stays contiguous). Then calls `shown`
+// (without the lock) for every title address range that shows written
+// bytes, so that copies of that memory can be refreshed. Pages that are not
+// live are skipped and their bytes counted in `*skipped`. Returns the bytes
+// written.
+HOLY_EXPORT size_t HolyXMemWritePages(const ULONG_PTR* frames, size_t count, size_t offset, const void* data,
+                                      size_t size, void (*shown)(void* context, uintptr_t address, size_t size),
+                                      void* context, size_t* skipped) {
+  struct Piece {
+    int32_t section;
+    uint64_t at;   // offset in the section
+    size_t from;   // offset in `data`
+    size_t bytes;  // in this page
+    ULONG_PTR id;
+  };
+  struct Shown {
+    uintptr_t address;
+    size_t bytes;
+  };
+  if (skipped) *skipped = 0;
+  if (!frames || !data || offset >= kPage) return 0;
+  std::vector<Piece> pieces;
+  std::vector<Shown> showing;
+  size_t written = 0, lost = 0;
+  lock();
+  size_t from = 0;
+  for (size_t i = 0; i < count && from < size; ++i) {
+    const size_t begin = i == 0 ? offset : 0;
+    const size_t bytes = std::min<size_t>(kPage - begin, size - from);
+    const ULONG_PTR id = to_id(frames[i]);
+    if (id == 0 || id > pages().size() || !pages()[id - 1].live) {
+      lost += bytes;
+      from += bytes;
+      continue;
+    }
+    if (pages()[id - 1].section < 0) {
+      auto at = granules_of().find(id);
+      materialize(id, at != granules_of().end() && !at->second.empty() ? at->second.front() : 0);
+    }
+    const Page& page = pages()[id - 1];
+    if (page.section < 0) {
+      lost += bytes;
+      from += bytes;
+      continue;
+    }
+    pieces.push_back({page.section, static_cast<uint64_t>(page.index) * kPage + begin, from, bytes, id});
+    from += bytes;
+  }
+  lost += size - std::min(size, from);
+  // Runs of pieces contiguous in one section go through one view.
+  for (size_t first = 0; first < pieces.size();) {
+    size_t last = first;
+    while (last + 1 < pieces.size() && pieces[last + 1].section == pieces[first].section &&
+           pieces[last + 1].at == pieces[last].at + pieces[last].bytes &&
+           pieces[last + 1].from == pieces[last].from + pieces[last].bytes) {
+      ++last;
+    }
+    const uint64_t view_begin = pieces[first].at & ~static_cast<uint64_t>(kPage - 1);
+    const uint64_t view_end = (pieces[last].at + pieces[last].bytes + kPage - 1) & ~static_cast<uint64_t>(kPage - 1);
+    Section& section = sections()[pieces[first].section];
+    auto* view = static_cast<uint8_t*>(MapViewOfFile(section.handle, FILE_MAP_WRITE, static_cast<DWORD>(view_begin >> 32),
+                                                     static_cast<DWORD>(view_begin),
+                                                     static_cast<SIZE_T>(view_end - view_begin)));
+    bool ok = view != nullptr;
+    for (size_t p = first; ok && p <= last; ++p) {
+      Page& page = pages()[pieces[p].id - 1];
+      if (page.committed) continue;
+      // Committing through any view commits the slice for every view.
+      uint8_t* slice = view + (static_cast<uint64_t>(page.index) * kPage - view_begin);
+      if (!VirtualAlloc(slice, kPage, MEM_COMMIT, PAGE_READWRITE)) {
+        ok = false;
+        break;
+      }
+      page.committed = true;
+      c_page_commit().add(static_cast<int64_t>(kPage));
+    }
+    if (ok) {
+      for (size_t p = first; p <= last; ++p) {
+        std::memcpy(view + (pieces[p].at - view_begin), static_cast<const uint8_t*>(data) + pieces[p].from,
+                    pieces[p].bytes);
+        written += pieces[p].bytes;
+        auto at = granules_of().find(pieces[p].id);
+        if (at == granules_of().end()) continue;
+        for (uintptr_t granule : at->second) showing.push_back({granule + (pieces[p].at & (kPage - 1)), pieces[p].bytes});
+      }
+    } else {
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 8) {
+        LIB_LOG(holy::lib::kError, "xmem", "cannot write 0x%llx bytes of physical storage (error %lu)",
+                static_cast<unsigned long long>(view_end - view_begin), GetLastError());
+      }
+      for (size_t p = first; p <= last; ++p) lost += pieces[p].bytes;
+    }
+    if (view) UnmapViewOfFile(view);
+    first = last + 1;
+  }
+  unlock();
+  if (shown) {
+    for (const Shown& s : showing) shown(context, s.address, s.bytes);
+  }
+  if (skipped) *skipped = lost;
+  return written;
 }
 
 HOLY_EXPORT BOOL XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* page_array) {

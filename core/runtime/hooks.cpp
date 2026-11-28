@@ -2,12 +2,14 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
+#include "core/common/boot_block.h"
 #include "core/common/log.h"
 #include "core/common/memory_query.h"
 #include "core/common/strings.h"
@@ -420,6 +422,30 @@ LSTATUS WINAPI hook_RegQueryValueExW(HKEY key, LPCWSTR name, LPDWORD reserved, L
   return ERROR_SUCCESS;
 }
 
+// The console's memory, not the host's. Measured: a title sizes a buddy
+// allocator of 64 KiB blocks for its 24 GiB physical-page pool from the total
+// physical memory; given the host's (31.8 GiB, rounded up by the allocator to
+// 2^20 blocks) it handed out blocks beyond the pool and stopped at its own
+// check during loading. The console has 16 GiB (Series X) or 10 GiB (Series S,
+// public specifications) and no page file: the total is the console's, the
+// available memory the host's capped to it, the page file the same as memory.
+// *assumed*: the console reports its whole memory as the total.
+BOOL WINAPI hook_GlobalMemoryStatusEx(LPMEMORYSTATUSEX status) {
+  const BOOL ok = GlobalMemoryStatusEx(status);
+  if (!ok || !status) return ok;
+  const DWORD error = GetLastError();
+  const uint64_t total = state().console_model == static_cast<uint32_t>(ConsoleModel::SeriesS) ? (10ull << 30)
+                                                                                                : (16ull << 30);
+  const uint64_t available = std::min<uint64_t>(status->ullAvailPhys, total);
+  status->ullTotalPhys = total;
+  status->ullAvailPhys = available;
+  status->ullTotalPageFile = total;
+  status->ullAvailPageFile = available;
+  status->dwMemoryLoad = static_cast<DWORD>(100 - available * 100 / total);
+  SetLastError(error);
+  return ok;
+}
+
 LSTATUS WINAPI hook_RegCloseKey(HKEY key) {
   if (key == oem_key()) return ERROR_SUCCESS;
   return RegCloseKey(key);
@@ -496,6 +522,7 @@ const Override kOverrides[] = {
     HOLY_OVERRIDE(RegOpenKeyExW),
     HOLY_OVERRIDE(RegQueryValueExW),
     HOLY_OVERRIDE(RegCloseKey),
+    HOLY_OVERRIDE(GlobalMemoryStatusEx),
     HOLY_OVERRIDE(SetUnhandledExceptionFilter),
     HOLY_OVERRIDE(exit),
     HOLY_OVERRIDE(_exit),

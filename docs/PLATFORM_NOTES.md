@@ -42,6 +42,12 @@ Notes describe the platform, never a title.
   development kit; `0x60` → current generation, smaller model; `0x64` → current generation, larger model;
   `0x68` → current generation development kit; anything else → unknown.
 - Implementation: the runtime answers this one query with `0x64` or `0x60` (`--console`).
+- *measured*: titles size pools by the total physical memory `GlobalMemoryStatusEx` reports. One sized a buddy
+  allocator of 64 KiB blocks for its physical-page pool from the host's 31.8 GiB (rounded up by the allocator
+  to 2^20 blocks), handed out blocks past the pool and stopped at its own check during loading. The runtime
+  reports the console's memory: 16 GiB (larger model) or 10 GiB (smaller model; public specifications) as the
+  total, the host's available memory capped to it, and the page file the same as memory (the console has
+  none). *assumed*: the console reports its whole memory as the total. Sample-title check.
 
 ## Lifecycle
 
@@ -94,6 +100,10 @@ Notes describe the platform, never a title.
   `value << 4` before mapping them: page numbers are frame numbers in 4 KiB units, so every 64 KiB page's number
   is a multiple of 16 (as the desktop's user physical page frame numbers count 4 KiB frames). Numbers that are
   not are refused. Handing out consecutive numbers made such titles map 16 different pages as one.
+- Consequence: a number's `>> 4` must stay below 2^21. Titles streaming textures allocate and free pages
+  continually (over 100,000 live during loading), so numbers are given fresh while they fit and freed ones
+  (pages neither allocated nor mapped any more) are given again after that, consecutive runs first.
+  Sample-title check over 2.6 million allocations.
 - Implementation: a page gets its storage when first mapped: a 64 KiB slice of a
   reserved pagefile-backed section laid out like the region it is mapped into (one section per chunk of up to
   1 GiB), at the offset of the granule. Pages a title maps side by side are therefore contiguous in one section,
@@ -798,6 +808,18 @@ Notes describe the platform, never a title.
   format 3), destination address at 8, destination size at 0x18, source (file object or memory address) at
   0x20, file offset at 0x28, source size at 0x30. Requests with bit 0 carry zlib streams (RFC 1950 headers
   seen), whose inflated size is the destination size.
+- *observed*: with bit 21 the destination at 8 is not an address but a list of physical page numbers, one
+  64-bit number per 64 KiB of destination (as `XMemAllocatePhysicalPages` hands them out), and the low 16 bits
+  of the field at 0x10 are the offset into the first page. A title's texture streaming uses it for zlib
+  requests of 4 KiB (options 0x200001) and for the texture codec's 64 KiB tiles; it fills the lists after
+  enqueueing and before submitting. Writing a request's bytes at the list's address (as an address) overwrote
+  the title's page lists: its streaming then found destinations far outside its pool, requests with a zero
+  count, and crashed reading what looked like texture blocks as its own records, 20-40 s into loading;
+  with page lists honoured the loading runs past three minutes.
+  Implementation: the bytes are written into the pages' storage through views of the library's own
+  (`HolyXMemWritePages`; a page without storage gets it), and copies of that memory at every address showing
+  the pages hear of the write afterwards. Sample-title check (a list filled after enqueueing, a request
+  crossing a page boundary).
 - *observed* (a title's loading): requests with bit 1 set and bit 0 clear (options 0x200002, 0x20000a,
   0x20000e: bits 2-3 vary; 180 of them in the first 30 s of loading), sources smaller than their 64 KiB
   destinations and no zlib header: another compression format, *assumed* the console's texture codec (64 KiB

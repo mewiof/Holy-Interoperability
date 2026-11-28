@@ -321,6 +321,15 @@ void test_console_identity() {
   check(queried == ERROR_SUCCESS && type == REG_DWORD && (mode == 0x64 || mode == 0x60),
         "the title is told it runs on a current-generation console");
   RegCloseKey(key);
+  // The console's memory, whatever the host has (titles size pools by it).
+  MEMORYSTATUSEX memory{};
+  memory.dwLength = sizeof(memory);
+  SetLastError(1234);
+  const BOOL got = GlobalMemoryStatusEx(&memory);
+  const uint64_t expected = mode == 0x60 ? (10ull << 30) : (16ull << 30);
+  check(got && GetLastError() == 1234 && memory.ullTotalPhys == expected && memory.ullAvailPhys <= expected &&
+            memory.ullTotalPageFile == expected,
+        "GlobalMemoryStatusEx reports the console's memory and no page file");
 }
 
 void test_virtual_memory() {
@@ -582,6 +591,20 @@ void test_physical_pages() {
         "files read straight into untouched physical pages");
   XMemMapPhysicalPages(third, 2, nullptr);
   XMemFreePhysicalPages(2, fresh);
+
+  // Page numbers fit the 21 bits titles keep of `number >> 4`, also after
+  // more pages than that were allocated over time (freed numbers are given
+  // again once fresh ones run out). Pages get no storage until used, so
+  // this costs only their records.
+  std::vector<ULONG_PTR> batch(1 << 16);
+  bool fit = true;
+  for (int round = 0; round < 40 && fit; ++round) {
+    ULONG_PTR n = batch.size();
+    fit = XMemAllocatePhysicalPages(0x280, &n, batch.data()) && n == batch.size();
+    for (ULONG_PTR page : batch) fit = fit && page != 0 && (page & 15) == 0 && (page >> 4) < (1u << 21);
+    XMemFreePhysicalPages(batch.size(), batch.data());
+  }
+  check(fit, "physical page numbers stay within 21 bits as pages are allocated and freed");
 }
 
 // Fast storage: files open through the title's paths.
@@ -726,6 +749,31 @@ void test_fast_storage() {
   reinterpret_cast<SubmitFn>(q[6])(queue);
   check(wait_for(1) && reinterpret_cast<ResultFn>(st[4])(status, 1) == S_OK && std::memcmp(unpacked, "packed", 6) == 0,
         "fast storage inflates zlib requests");
+  // A destination given as physical pages (bit 21): a list of page numbers,
+  // one per 64 KiB, which titles fill in after enqueueing; the offset into
+  // the first page in the field at 0x10. The bytes reach the pages (seen here
+  // through the title's mapping of them), and the list stays as it was.
+  ULONG_PTR pool[2] = {};
+  ULONG_PTR pool_count = 2;
+  auto* shown = static_cast<unsigned char*>(XMemVirtualAlloc(nullptr, 0x20000, 0x20402000, 0x23, PAGE_READWRITE));
+  const bool mapped = XMemAllocatePhysicalPages(0x280, &pool_count, pool) && shown &&
+                      XMemMapPhysicalPages(shown, 2, pool) == shown;
+  check(mapped, "physical pages for a fast-storage destination are mapped");
+  if (mapped) {
+    ULONG_PTR list[2] = {};
+    std::vector<uint8_t> to_pages = request((1ull << 22) | (1ull << 21) | 1, list, 6, packed, 0, sizeof(packed));
+    const uint64_t page_offset = 0xFFFD;  // "pac" at the end of the first page, "ked" in the second
+    std::memcpy(to_pages.data() + 0x10, &page_offset, 8);
+    reinterpret_cast<EnqueueFn>(q[3])(queue, to_pages.data());
+    reinterpret_cast<StatusFn>(q[4])(queue, status, 1);
+    list[0] = pool[0];
+    list[1] = pool[1];
+    reinterpret_cast<SubmitFn>(q[6])(queue);
+    check(wait_for(1) && reinterpret_cast<ResultFn>(st[4])(status, 1) == S_OK &&
+              std::memcmp(shown + 0xFFFD, "packed", 6) == 0 && list[0] == pool[0] && list[1] == pool[1],
+          "fast storage writes into the physical pages a destination list names");
+    XMemMapPhysicalPages(shown, 2, nullptr);
+  }
   // A request in the other compression format titles use (bit 1, not zlib;
   // not implemented): its status reports the failure, and the destination is
   // left as it was rather than given the compressed bytes.

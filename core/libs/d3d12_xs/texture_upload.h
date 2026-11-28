@@ -29,6 +29,10 @@
 // 16 ms, so a texture written just before a submission may show its new
 // contents a frame later. HOLY_TEXTURE_TRACKING=0 turns this off.
 //
+// Physical pages mapped at more than one address are followed through every
+// address: a write or mapping change at an alias marks the textures over the
+// page (write_watch.h for_each_alias).
+//
 // Partial: the CPU's writes to memory titles reserve without xmem are not
 // seen; what the GPU writes into title memory under a texture is not seen;
 // the CPU never sees what the GPU wrote into a placed texture.

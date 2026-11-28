@@ -707,8 +707,11 @@ double host_commit_left() {
 // maps (and writes) only after viewing the texture there; and memory from
 // XMemVirtualAlloc a texture without render-target or unordered-access usage
 // is placed in (CreatePlacedResourceX), written after the placement and the
-// view (titles write glyphs into such textures on the CPU).
-enum class TextureMemory { Plain, Reserved, Physical, Unmapped, Placed };
+// view (titles write glyphs into such textures on the CPU); and a physical
+// page mapped at two addresses, the texture placed at one and its texels
+// written through the other (titles place video frame planes at a GPU
+// address and decode into them at a CPU one).
+enum class TextureMemory { Plain, Reserved, Physical, Unmapped, Placed, Aliased };
 
 // The command list interface titles ask for.
 constexpr GUID kListIid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
@@ -764,8 +767,11 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
                 __uuidof(ID3D12PipelineState), &pipeline);
   volatile uint8_t* memory = nullptr;
   volatile float* output = nullptr;
-  const bool physical = kind == TextureMemory::Physical || kind == TextureMemory::Unmapped;
+  const bool physical =
+      kind == TextureMemory::Physical || kind == TextureMemory::Unmapped || kind == TextureMemory::Aliased;
   ULONG_PTR page = 0;
+  volatile uint8_t* writes = nullptr;  // where the texels are written (the alias, for Aliased)
+  void* alias = nullptr;
   if (physical) {
     ULONG_PTR count = 1;
     XMemAllocatePhysicalPages(0x280, &count, &page);
@@ -773,6 +779,10 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
     if (count == 1 && region &&
         (kind == TextureMemory::Unmapped || XMemMapPhysicalPages(region, 1, &page) == region)) {
       memory = static_cast<volatile uint8_t*>(region);
+    }
+    if (kind == TextureMemory::Aliased && memory) {
+      alias = XMemVirtualAlloc(nullptr, 0x10000, 0x20402000, 0x23, PAGE_READWRITE);
+      if (!alias || XMemMapPhysicalPages(alias, 1, &page) != alias) memory = nullptr;
     }
     output = static_cast<volatile float*>(VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
   } else {
@@ -786,6 +796,7 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
     check(false, "the objects for a compute program reading a texture view exist");
     return;
   }
+  writes = kind == TextureMemory::Aliased ? static_cast<volatile uint8_t*>(alias) : memory;
   if (kind != TextureMemory::Unmapped) {
     for (uint32_t i = 0; i < 0x4000; ++i) memory[i] = 0x40;
   }
@@ -795,11 +806,12 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
                             : kind == TextureMemory::Reserved ? 0x50
                             : kind == TextureMemory::Physical ? 0x90
                             : kind == TextureMemory::Placed   ? 0x30
+                            : kind == TextureMemory::Aliased  ? 0x70
                                                               : 0xC0;
   const uint8_t texel_bytes[4] = {base_byte, static_cast<uint8_t>(base_byte + 0x10),
                                   static_cast<uint8_t>(base_byte + 0x20), 0xFF};
-  auto write_texel = [memory, &texel_bytes] {
-    for (int i = 0; i < 4; ++i) memory[i] = texel_bytes[i];
+  auto write_texel = [&writes, &texel_bytes] {
+    for (int i = 0; i < 4; ++i) writes[i] = texel_bytes[i];
   };
   if (!after) write_texel();
   const uint64_t output_address = reinterpret_cast<uint64_t>(output);
@@ -831,7 +843,7 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
   view.srv.Texture2D.MipLevels = 1;
   view.address = reinterpret_cast<uint64_t>(memory);
   void* placed_texture = nullptr;
-  if (kind == TextureMemory::Placed) {
+  if (kind == TextureMemory::Placed || kind == TextureMemory::Aliased) {
     // Initial state 6: the shader-resource layout titles pass.
     call<HRESULT>(device, 133, reinterpret_cast<uint64_t>(memory), &texture, 6u, static_cast<const void*>(nullptr),
                   __uuidof(ID3D12Resource), &placed_texture);
@@ -880,9 +892,13 @@ void test_compute_reads_a_texture_view(void* device, void* queue, TextureMemory 
                                             "shows the new texels to the GPU"
         : kind == TextureMemory::Placed   ? "a placed texture the GPU does not write shows what the title writes into its "
                                             "memory"
+        : kind == TextureMemory::Aliased  ? "a placed texture shows what the title writes into its physical page at "
+                                            "another address"
                                           : "a texture viewed before its physical page was mapped shows what the title "
                                             "wrote there");
-  if (kind == TextureMemory::Placed) check(placed_texture != nullptr, "a texture is placed in title memory");
+  if (kind == TextureMemory::Placed || kind == TextureMemory::Aliased) {
+    check(placed_texture != nullptr, "a texture is placed in title memory");
+  }
   if (placed_texture) call<ULONG>(placed_texture, 2);
 
   if (placed) call<ULONG>(placed, 2);
@@ -2377,6 +2393,7 @@ void test_graphics_resources(void* device, void* queue) {
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Physical);
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Unmapped);
     test_compute_reads_a_texture_view(device, queue, TextureMemory::Placed);
+    test_compute_reads_a_texture_view(device, queue, TextureMemory::Aliased);
   }
   test_allocation_hooks();
   test_placeholders();

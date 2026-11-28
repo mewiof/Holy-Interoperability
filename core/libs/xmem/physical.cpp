@@ -140,6 +140,23 @@ std::vector<Region>& regions() {
   static auto* storage = new std::vector<Region>();
   return *storage;
 }
+// Page id -> the granules it is mapped at (backed or pending): titles map
+// the same pages at more than one address (a CPU and a GPU range).
+std::unordered_map<ULONG_PTR, std::vector<uintptr_t>>& granules_of() {
+  static auto* storage = new std::unordered_map<ULONG_PTR, std::vector<uintptr_t>>();
+  return *storage;
+}
+void index_add(ULONG_PTR id, uintptr_t granule) {
+  auto& list = granules_of()[id];
+  if (std::find(list.begin(), list.end(), granule) == list.end()) list.push_back(granule);
+}
+void index_remove(ULONG_PTR id, uintptr_t granule) {
+  auto found = granules_of().find(id);
+  if (found == granules_of().end()) return;
+  auto& list = found->second;
+  list.erase(std::remove(list.begin(), list.end(), granule), list.end());
+  if (list.empty()) granules_of().erase(found);
+}
 // Granules whose mapping is recorded but not yet backed by a view.
 std::unordered_set<uintptr_t>& pending() {
   static auto* storage = new std::unordered_set<uintptr_t>();
@@ -338,6 +355,7 @@ void release_if_unused(Page& page) {
 void unmap_granule(uintptr_t granule) {
   auto found = mapped().find(granule);
   if (found == mapped().end()) return;
+  index_remove(found->second, granule);
   if (found->second && found->second <= pages().size()) {
     Page& page = pages()[found->second - 1];
     if (page.maps) --page.maps;
@@ -408,6 +426,7 @@ bool map_granule(uintptr_t granule, ULONG_PTR id) {
     return false;
   }
   ++pages()[id - 1].maps;
+  index_add(id, granule);
   if (pages()[id - 1].section < 0) {
     // No storage yet: backed on first use.
     mapped()[granule] = id;
@@ -714,6 +733,36 @@ HOLY_EXPORT void HolyXMemEnumerateMapped(HANDLE section, uint64_t begin, uint64_
   }
   unlock();
   for (const auto& [granule, offset] : found) visit(context, granule, offset);
+}
+
+// Not a console function: calls `visit` (without the lock) for every other
+// granule showing a page that [address, address + size) shows, with the
+// granule of the range it aliases and whether the alias is backed yet.
+HOLY_EXPORT void HolyXMemEnumerateAliases(const void* address, uint64_t size,
+                                          void (*visit)(void* context, uintptr_t alias, uintptr_t granule,
+                                                        int backed),
+                                          void* context) {
+  struct Found {
+    uintptr_t alias, granule;
+    bool backed;
+  };
+  std::vector<Found> found;
+  const auto begin = reinterpret_cast<uintptr_t>(address) & ~(kPage - 1);
+  const auto end = reinterpret_cast<uintptr_t>(address) + size;
+  lock();
+  if (!granules_of().empty()) {
+    for (uintptr_t granule = begin; granule < end; granule += kPage) {
+      auto mapping = mapped().find(granule);
+      if (mapping == mapped().end()) continue;
+      auto list = granules_of().find(mapping->second);
+      if (list == granules_of().end() || list->second.size() < 2) continue;
+      for (uintptr_t alias : list->second) {
+        if (alias != granule) found.push_back({alias, granule, pending().count(alias) == 0});
+      }
+    }
+  }
+  unlock();
+  for (const Found& f : found) visit(context, f.alias, f.granule, f.backed ? 1 : 0);
 }
 
 // For the graphics library: the page number (as XMemAllocatePhysicalPages

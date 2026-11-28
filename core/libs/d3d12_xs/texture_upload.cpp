@@ -242,6 +242,14 @@ void apply_changes() {
       drop_range(change.begin, change.begin + change.size);
     } else {
       mark_range(change.begin, change.begin + change.size);
+      // Storage that changed under one address changed under its aliases
+      // too (another view of the same physical pages was backed, remapped
+      // or written).
+      for_each_alias(change.begin, change.size, [](uint64_t alias, uint64_t granule, bool) {
+        (void)granule;
+        mark_range(alias, alias + 0x10000);
+        forget_memory(alias, 0x10000);
+      });
     }
     forget_memory(change.begin, change.size);  // the pages lose their watches (refreshed records watch again)
   }

@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 namespace holy::d3d12 {
 
@@ -29,6 +30,13 @@ void start_write_watch(void (*written)(uint64_t begin, uint64_t size));
 // Watches [begin, begin + size) for `token` (an earlier watch of the token
 // goes first); false if no page could be watched.
 bool watch_memory(uint64_t begin, uint64_t size, WatchToken token);
+// Calls `visit` for every other granule (64 KiB) showing a physical page
+// that [begin, begin + size) shows: titles map the same pages at a CPU and a
+// GPU address (observed: video frames written at one, textures placed at the
+// other). Watches cover the backed aliases of their range: a write there is
+// reported as a write to the page it shows.
+void for_each_alias(uint64_t begin, uint64_t size,
+                    const std::function<void(uint64_t alias, uint64_t granule, bool backed)>& visit);
 // Drops `token`'s watch.
 void unwatch(WatchToken token);
 // [begin, begin + size) changed in another way (remapped, released): the

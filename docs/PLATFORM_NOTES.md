@@ -443,6 +443,14 @@ Notes describe the platform, never a title.
   viewed by address (filled from it, refreshed when it is written); they rest in the common layout, which allows
   both copies and shader reads, and the title's barriers on them keep that layout (and never discard). A GPU copy
   into one makes its contents the GPU's: memory no longer overwrites them.
+- *observed*: titles reserve two ranges of 24 GiB 0x600000000 apart, map physical pages into the lower one
+  with `XMemMapPhysicalPagesScatter` and the same pages into the upper one page by page, and convert between
+  them by that offset (CPU and GPU addresses of the same memory). Video frame planes are placed as textures at
+  the upper addresses and decoded on the CPU at the lower ones; with watches over the textures' own addresses
+  only, the planes never followed a frame (the intro video showed green). Implementation: the memory library
+  keeps which granules show each page (`HolyXMemEnumerateAliases`); watches of texture memory also protect the
+  backed aliases, a write there counting as a write to the page it shows, and a change under one address (a
+  page mapped, backed or written) marks the textures over its aliases.
 - *observed*: slot 70 may be called with a description buffer the title left unwritten (dimension zero in the
   title's own texture record); a null view of the requested kind is made. The same is done, and logged, for
   descriptions no texture can have (sizes above 65,536, more than 17 levels, sample counts outside 1-16, formats
